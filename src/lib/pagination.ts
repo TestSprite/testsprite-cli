@@ -32,10 +32,6 @@ export const MAX_AUTO_PAGES = 1000;
  * callers fast feedback that their flag value is out of range. Fractional,
  * sub-1, and NaN values also throw. `maxItems` is validated but not capped
  * (it is a client-side cursor, not a server parameter).
- *
- * NOTE: `runResultHistory` previously did its own silent clamp via
- * `Math.min(Math.max(1, n), 100)` — that was unified to this path by the
- * same fix wave (B-E2E-01 fix 7).
  */
 export function validatePaginationFlags(flags: PaginationFlags): PaginationFlags {
   const out: PaginationFlags = { ...flags };

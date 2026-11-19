@@ -1,5 +1,5 @@
 /**
- * Unit tests for `testsprite init` — all deps injected, no disk or network.
+ * Unit tests for `testsprite setup` — all deps injected, no disk or network.
  */
 
 import {
@@ -23,9 +23,8 @@ import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
 import type * as AgentModule from './agent.js';
 import { runInstall } from './agent.js';
-import { Command } from 'commander';
 import type { InitDeps } from './init.js';
-import { runInit, addSetupOptions } from './init.js';
+import { createSetupCommand, runInit } from './init.js';
 import {
   TARGETS,
   DEFAULT_SKILLS,
@@ -405,7 +404,7 @@ describe('runInit — session-only environment credentials', () => {
       expect(captured.stdout).toEqual([]);
       expect(captured.stderr).toEqual(
         source === 'prompt'
-          ? ['Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey']
+          ? ['Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey']
           : [],
       );
     },
@@ -621,17 +620,17 @@ describe('runInit — happy path (interactive)', () => {
     // Next steps leads with creating a project; no command that fails without --project.
     expect(stdout).toContain('Next steps:');
     expect(stdout).toContain('testsprite project create --type frontend');
-    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).toContain('testsprite run --project <projectId>');
     expect(stdout).toContain('the testsprite-onboard skill is installed');
-    // The agent branch also names the direct generate path, and in the
-    // order that works: generating only stages proposals, so accept must come
-    // before `test run --all` or the run dispatches nothing and exits 5.
-    const generateAt = stdout.indexOf('testsprite test plan generate --project <projectId>');
-    const acceptAt = stdout.indexOf('testsprite test plan accept --project <projectId>');
-    const runAllAt = stdout.indexOf('testsprite test run --all --project <projectId>');
-    expect(generateAt).toBeGreaterThanOrEqual(0);
-    expect(acceptAt).toBeGreaterThan(generateAt);
-    expect(runAllAt).toBeGreaterThan(acceptAt);
+    // The agent branch also names the project's agent, in the order that
+    // works: plan only proposes, so apply must come before `run --project`
+    // or the run dispatches nothing and exits 5.
+    const planAt = stdout.indexOf('testsprite plan --project <projectId>');
+    const applyAt = stdout.indexOf('testsprite apply');
+    const runAllAt = stdout.indexOf('testsprite run --project <projectId>');
+    expect(planAt).toBeGreaterThanOrEqual(0);
+    expect(applyAt).toBeGreaterThan(planAt);
+    expect(runAllAt).toBeGreaterThan(applyAt);
     // No "current project" wording, no bare test list.
     expect(stdout).not.toContain('current project');
     expect(stdout).not.toContain('testsprite test list');
@@ -933,15 +932,14 @@ describe('runInit — --no-agent', () => {
 
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('skipped (--no-agent)');
-    // --no-agent: points at generate -> accept with the hand-authored
-    // fallback; must not claim the skill is installed.
+    // --no-agent: points at the project's agent (plan -> apply); must not
+    // claim the skill is installed.
     expect(stdout).toContain('Next steps:');
     expect(stdout).toContain('testsprite project create --type frontend');
-    expect(stdout).toContain('testsprite test plan generate --project <projectId>');
-    expect(stdout).toContain('testsprite test plan accept --project <projectId>');
-    expect(stdout).toContain('testsprite test create --plan-template');
-    expect(stdout).not.toContain('testsprite test create --project <projectId> ...');
-    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).toContain('testsprite plan --project <projectId>');
+    expect(stdout).toContain('testsprite apply');
+    expect(stdout).toContain('Attach your API spec: --file ./openapi.yaml');
+    expect(stdout).toContain('testsprite run --project <projectId>');
     expect(stdout).not.toContain('skill is installed');
     // No "current project" wording, no bare test list.
     expect(stdout).not.toContain('current project');
@@ -1757,10 +1755,10 @@ describe('runInit — no TTY + no key source → exit 5', () => {
     expect((thrown as CLIError).exitCode).toBe(5);
     const msg = (thrown as CLIError).message;
     expect(msg).toContain('--api-key');
-    expect(msg).toContain('https://www.testsprite.com/dashboard/settings/apikey');
+    expect(msg).toContain('https://www.testsprite.com/dashboard-v3/settings/apikey');
     expect(thrown).toMatchObject({
       nextAction:
-        'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+        'Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey',
     });
   });
 });
@@ -2590,10 +2588,8 @@ describe('runInit -- skipIfConfigured', () => {
       expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
     });
 
-    it('registers --no-gitignore option in addSetupOptions', () => {
-      const cmd = new Command();
-      addSetupOptions(cmd, [], 'claude' as AgentTarget);
-      const opt = cmd.options.find(o => o.long === '--no-gitignore');
+    it('registers --no-gitignore option on setup', () => {
+      const opt = createSetupCommand().options.find(o => o.long === '--no-gitignore');
       expect(opt).toBeDefined();
     });
   });

@@ -1,14 +1,10 @@
 /**
- * `testsprite usage` — show the account's credit balance and plan/entitlement
- * info as a proactive pre-flight before a large `test run` fan-out.
+ * `testsprite usage` — show the caller's organization wallet (balance, plan,
+ * seats) as a proactive pre-flight before a large `run` fan-out.
  *
- * Backend note: `GET /me` now includes the `credits` / `subPlan` projection
- * (this shipped; the CLI's old "requires a backend update"
- * wording is stale and was removed). This command calls `/me` and surfaces
- * the `credits` / `subPlan` / `creditsPerRun` fields when and only when the
- * backend response includes them — kept absent-safe/forward-compat since not
- * every account shape is guaranteed to populate all three (e.g. `creditsPerRun`
- * has no server-side source at all today).
+ * Reads `GET /me`. The wallet is the `activeOrg` block, which the backend
+ * enriches best-effort and omits on a lookup failure; every field beyond the
+ * identity core stays absent-safe.
  */
 
 import { Command } from 'commander';
@@ -26,48 +22,22 @@ import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
 import { formatOrgBinding, formatOrgsSummary } from '../lib/org-render.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { USAGE_RESPONSE_SCHEMA } from '../lib/response-schemas.js';
+import { terminalSafeLine, terminalSafeWriter } from '../lib/terminal-text.js';
 
 /**
- * Usage/balance response from `/me` (when the backend supplies it) or a future
- * `/usage` endpoint.
- *
- * `credits` / `subPlan` now ship on `/me` (live). Still
- * kept optional/absent-safe: `userId`/`keyId`/`env` are the only fields every
- * backend and account shape is guaranteed to populate.
+ * The `/me` projection the `usage` command reads. `userId`/`keyId`/`env` are
+ * the only fields every account shape is guaranteed to populate.
  */
 export interface UsageResponse {
   userId: string;
   keyId: string;
   env: 'development' | 'staging' | 'production';
   /**
-   * Remaining credit balance. Present when the backend /me (or /usage)
-   * includes the User.credits projection (live).
-   */
-  credits?: number;
-  /**
-   * Subscription plan name (e.g. "Free", "Standard", "Pro"). Present when
-   * the backend /me (or /usage) includes the User.subPlan projection (live).
-   */
-  subPlan?: string;
-  /**
-   * Credit cost per test run trigger (informational). Present only when the
-   * backend supplies it.
-   */
-  creditsPerRun?: number;
-  /**
-   * The caller's organization wallet — the billing subject on org-based
-   * accounts. Rendered only together with `v3Enabled: true` (see
-   * `renderUsage`): the org wallet supersedes the legacy `credits`/`subPlan`
-   * pair only for callers whose commands actually bill it. Absent-safe like
-   * every other optional field.
+   * The caller's organization wallet — the billing subject. The backend
+   * resolves it from the key's org binding, else the personal org, and omits
+   * it when that lookup fails.
    */
   activeOrg?: ActiveOrg;
-  /**
-   * Authoritative per-caller routing bit: true when this caller's commands
-   * run (and bill) on the V3 platform. Always present on current backends;
-   * absent on older ones.
-   */
-  v3Enabled?: boolean;
   /**
    * Every organization the underlying user belongs to (account-wide
    * membership list, personal org included). Absent-safe: omitted on a
@@ -113,10 +83,6 @@ export const DRY_RUN_USAGE_SAMPLE: UsageResponse = {
   userId: '11111111-1111-4111-8111-111111111111',
   keyId: 'key_dryrun_2026',
   env: 'development',
-  credits: 42,
-  subPlan: 'Standard',
-  creditsPerRun: 2,
-  v3Enabled: true,
   activeOrg: {
     id: '22222222-2222-4222-8222-222222222222',
     name: 'Dry Run Workspace',
@@ -129,13 +95,11 @@ export const DRY_RUN_USAGE_SAMPLE: UsageResponse = {
 };
 
 /**
- * Run the `usage` command. Calls `GET /me`, surfaces identity + any
- * credits/plan fields the backend supplies. Absent fields are silently
- * omitted (forward-compat in case a given account/backend version doesn't
- * populate them).
+ * Run the `usage` command. Calls `GET /me` and surfaces identity plus the org
+ * wallet when the backend supplies it. Absent fields are silently omitted.
  */
 export async function runUsage(opts: CommonOptions, deps: UsageDeps = {}): Promise<UsageResponse> {
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
   const out = makeOutput(opts.output, deps);
 
   if (opts.dryRun) {
@@ -166,21 +130,14 @@ export async function runUsage(opts: CommonOptions, deps: UsageDeps = {}): Promi
   );
   const billingUrl =
     portalBase !== undefined
-      ? `${portalBase}/dashboard/settings/billing`
-      : 'the portal Billing page (/dashboard/settings/billing)';
+      ? `${portalBase}${BILLING_PAGE_PATH}`
+      : `the portal Billing page (${BILLING_PAGE_PATH})`;
 
-  // /me is the only available source of credits/plan today. If the backend
-  // adds a dedicated /usage endpoint later, this single get call is where
-  // it would be swapped in — no other code change needed in the CLI.
   const me = await client.get<UsageResponse>('/me', { schema: USAGE_RESPONSE_SCHEMA });
 
   out.print(me, data => renderUsage(data as UsageResponse, portalBase));
 
-  // In text mode, emit a note when NO balance was shown at all — neither the
-  // legacy per-user `credits` nor an org wallet. A V3-routed org account can
-  // legitimately have no DDB `credits` field (org-native members never get a
-  // legacy user row), and its balance already rendered in the organization
-  // block — the note would contradict the output right above it.
+  // In text mode, emit a note when no balance was shown at all.
   //
   // "Is this key org-bound" and "do I have a balance number to show" are two
   // different questions and must not be conflated. `me.org` is the key's own
@@ -188,14 +145,10 @@ export async function runUsage(opts: CommonOptions, deps: UsageDeps = {}): Promi
   // authenticated with a membership key (`sk-member-…`). `activeOrg` is the
   // *enriched* org balance: the backend does a best-effort Postgres read for
   // it and swallows the exception on failure, so `org` can be present while
-  // `activeOrg` (and, for a V3-native user with no legacy DynamoDB row,
-  // `credits` too) is absent. Deciding org-boundedness from `activeOrg`
-  // (i.e. `orgWalletShown`) alone means that degraded state falls through to
-  // this personal-billing note — pointing an org-key operator at the wrong
-  // wallet in exactly the situation this whole surface exists to prevent.
+  // `activeOrg` is absent. An org-bound key in that state must be told its
+  // org balance is unavailable, never pointed at a generic billing page.
   const isOrgBound = me.org !== undefined;
-  const orgWalletShown = me.v3Enabled === true && me.activeOrg !== undefined;
-  if (opts.output === 'text' && me.credits === undefined && !orgWalletShown) {
+  if (opts.output === 'text' && me.activeOrg === undefined) {
     stderr(
       isOrgBound
         ? "[note] this key is organization-bound, but the org balance could not be loaded right now. Retry `testsprite usage`, or check the Portal's organization billing settings (ask an org admin if you don't have access)."
@@ -213,66 +166,52 @@ export async function runUsage(opts: CommonOptions, deps: UsageDeps = {}): Promi
  */
 const LOW_ORG_BALANCE_CREDITS = 2;
 
+/**
+ * Org-less Portal billing route: the Portal re-anchors it under the viewer's
+ * active workspace.
+ */
+const BILLING_PAGE_PATH = '/dashboard-v3/settings/billing';
+
 function renderUsage(u: UsageResponse, portalBase?: string): string {
   const lines: string[] = [];
 
   // Identity block (always present)
-  lines.push(`userId: ${u.userId}`);
-  lines.push(`keyId:  ${u.keyId}`);
-  lines.push(`env:    ${u.env}`);
+  lines.push(`userId: ${terminalSafeLine(u.userId)}`);
+  lines.push(`keyId:  ${terminalSafeLine(u.keyId)}`);
+  lines.push(`env:    ${terminalSafeLine(u.env)}`);
   // Org attribution — rendered only when the backend supplies it.
   const orgsSummary = formatOrgsSummary(u.organizations);
-  if (orgsSummary) lines.push(`orgs:   ${orgsSummary}`);
+  if (orgsSummary) lines.push(`orgs:   ${terminalSafeLine(orgsSummary)}`);
   const orgBinding = formatOrgBinding(u.org);
-  if (orgBinding) lines.push(`org binding: ${orgBinding}`);
+  if (orgBinding) lines.push(`org binding: ${terminalSafeLine(orgBinding)}`);
 
   // Whether the CALLING KEY is org-bound — read from `u.org` (the key's own
-  // membership binding: always present, no I/O, populated whenever the
-  // request authenticated with a `sk-member-…` key), NOT from `activeOrg`.
-  // `activeOrg` is the *enriched* org balance: the backend does a best-effort
-  // Postgres read for it and swallows the exception on failure, so a caller
-  // can be genuinely org-bound (`org` present) while `activeOrg` — and, for a
-  // V3-native user with no legacy DynamoDB row, `credits` too — is absent.
-  // "Is this key org-bound" and "do I have a balance number to show" are two
-  // different questions; conflating them (deciding org-boundedness from
-  // `orgWallet`/`activeOrg` alone) sends a degraded-enrichment org caller
-  // down the personal-wallet branches below.
+  // membership binding), NOT from `activeOrg`, which is a best-effort
+  // enrichment the backend omits on a lookup failure (see `runUsage`).
   const isOrgBound = u.org !== undefined;
 
-  // Org wallet block — the billing subject on org-based accounts. Rendered
-  // only when the caller is actually V3-routed: `v3Enabled` is the
-  // authoritative routing bit, so wallet selection never rests on field
-  // presence alone. A V2-routed caller keeps the legacy block below (their
-  // billable commands still charge the legacy wallet); older backends send
-  // neither field and degrade the same way.
-  // `?? undefined` also normalizes a hypothetical explicit `null` from the
-  // wire so the block below can't dereference it.
-  const orgWallet = u.v3Enabled === true ? (u.activeOrg ?? undefined) : undefined;
+  // Org wallet block — the billing subject. `?? undefined` also normalizes a
+  // hypothetical explicit `null` from the wire so the block below can't
+  // dereference it.
+  const orgWallet = u.activeOrg ?? undefined;
   if (orgWallet !== undefined) {
     const org = orgWallet;
     lines.push('');
     lines.push('--- organization ---');
-    lines.push(`org:          ${org.name} (${org.role})`);
-    lines.push(`plan:         ${org.plan}`);
+    lines.push(`org:          ${terminalSafeLine(org.name)} (${terminalSafeLine(org.role)})`);
+    lines.push(`plan:         ${terminalSafeLine(org.plan)}`);
     // A paused workspace cannot spend this balance at all; a payment-pending
     // one keeps spending but gets no refill. Both are worth a line here.
     const standing = formatWorkspaceStatus(org.workspace);
     if (standing) lines.push(`state:        ${standing}`);
-    // Labeled `balance:` (not `credits:`) — `--output json` exposes the
-    // legacy per-user number under `.credits`, and giving the org wallet the
-    // same label in text mode would make one word mean two different values.
     lines.push(`balance:      ${org.remaining} remaining (${org.includedCredits}/mo per seat)`);
     lines.push(`seats:        ${org.seats}`);
-    // No "~N runs" estimate here: org billing prices actions individually and
-    // the API does not expose a per-run rate for the org wallet — an estimate
-    // computed from the legacy frontend rate would be wrong.
+    // No "~N runs" estimate here: org billing prices actions individually,
+    // so a single per-run rate would be wrong for most fan-outs.
   } else if (isOrgBound) {
     // Org-bound key, but the enrichment that would have populated `activeOrg`
-    // degraded (best-effort Postgres read failed server-side, or `v3Enabled`
-    // itself couldn't be resolved). Say so honestly — never fall through to
-    // the legacy per-user blocks below (this key's commands bill the org
-    // wallet, not the personal one, regardless of whether we could load its
-    // number just now), and never fabricate an org-scoped URL.
+    // degraded (best-effort Postgres read failed server-side). Say so
+    // honestly, and never fabricate an org-scoped URL.
     lines.push('');
     lines.push('--- organization ---');
     lines.push(
@@ -280,71 +219,20 @@ function renderUsage(u: UsageResponse, portalBase?: string): string {
     );
   }
 
-  // Legacy balance block — shown only when the backend supplies it, no org
-  // wallet superseded it (older backends / V2-routed accounts), AND the key
-  // isn't org-bound (an org-bound key's commands never charge these numbers,
-  // even if a legacy row happens to still carry them).
-  const hasBalanceData = u.credits !== undefined || u.subPlan !== undefined;
-  if (orgWallet === undefined && !isOrgBound && hasBalanceData) {
-    lines.push('');
-    lines.push('--- credits & plan ---');
-    if (u.subPlan !== undefined) {
-      lines.push(`plan:         ${u.subPlan}`);
-    }
-    if (u.credits !== undefined) {
-      lines.push(`credits:      ${u.credits}`);
-    }
-    if (u.creditsPerRun !== undefined) {
-      lines.push(`cost per frontend run: ${u.creditsPerRun} credit(s)`);
-      // Backend runs DO consume credits (confirmed by design 2026-06-30).
-      // The API exposes no backend-specific per-run cost field, and it differs from
-      // the frontend rate, so state that it bills without asserting a possibly-wrong
-      // number — check your balance before/after, or see the billing page.
-      lines.push(
-        `cost per backend run:  also consumes credits (exact amount not reported by the API)`,
-      );
-    }
-
-    // Pre-flight hint: how many runs the current balance can fund
-    if (u.credits !== undefined && u.creditsPerRun !== undefined && u.creditsPerRun > 0) {
-      const maxRuns = Math.floor(u.credits / u.creditsPerRun);
-      lines.push(`can trigger:  ~${maxRuns} run(s) at current balance`);
-    }
-  }
-
-  // Actionable upgrade line for Free or low-balance keys. Prefer the org
-  // wallet's plan/balance when present. `!isOrgBound` guards the personal
-  // branch of each: an org-bound key with degraded enrichment has no
-  // `orgWallet` to compute from, but must not fall back to reading `u.credits`
-  // / `u.subPlan` either (a legacy row that happens to coexist with an org
-  // binding is not what this key's commands actually bill).
-  const isLowBalance =
-    orgWallet !== undefined
-      ? orgWallet.remaining < LOW_ORG_BALANCE_CREDITS
-      : !isOrgBound &&
-        u.credits !== undefined &&
-        u.creditsPerRun !== undefined &&
-        u.credits < u.creditsPerRun;
-  const isFree =
-    orgWallet !== undefined
-      ? orgWallet.plan.toLowerCase() === 'free'
-      : !isOrgBound && u.subPlan?.toLowerCase() === 'free';
+  // Upgrade line for Free or low-balance wallets.
+  const isLowBalance = orgWallet !== undefined && orgWallet.remaining < LOW_ORG_BALANCE_CREDITS;
+  const isFree = orgWallet !== undefined && orgWallet.plan.toLowerCase() === 'free';
 
   if (isLowBalance) {
     lines.push('');
-    // The org wallet is billed under the ORGANIZATION's own settings, not the
-    // personal `/dashboard/settings/billing` page (that page manages the
-    // legacy per-user DDB balance, a different column entirely) — so the
-    // org branch deliberately does not point at that URL. No org-scoped
-    // settings URL is fabricated here either: the CLI has no confirmed route
-    // for one, so "ask an org admin" is the honest next step.
+    // No URL here: the Portal's org-less billing route re-anchors under the
+    // viewer's ACTIVE workspace in the browser, which need not be the org
+    // this key bills, so "the organization billing settings" is the honest
+    // pointer. Org billing prices actions individually, and cheaper actions
+    // (e.g. a 1-credit backend run) may still succeed below the threshold —
+    // so this is "low", not "cannot run".
     lines.push(
-      orgWallet !== undefined
-        ? // Org billing prices actions individually, and cheaper actions (e.g.
-          // a 1-credit backend run) may still succeed below the threshold —
-          // so this is "low", not "cannot run".
-          `warning: organization balance is low (under the ${LOW_ORG_BALANCE_CREDITS}-credit cost of a generation action). Top up in the Portal's organization billing settings (ask an org admin if you don't have access).`
-        : `warning: credit balance is below the per-run cost. Top up at: ${portalBase !== undefined ? `${portalBase}/dashboard/settings/billing` : 'the portal Billing page (/dashboard/settings/billing)'}`,
+      `warning: organization balance is low (under the ${LOW_ORG_BALANCE_CREDITS}-credit cost of a generation action). Top up in the Portal's organization billing settings (ask an org admin if you don't have access).`,
     );
   } else if (isFree) {
     lines.push('');
@@ -362,7 +250,7 @@ export function createUsageCommand(deps: UsageDeps = {}): Command {
     .alias('credits')
     .summary('Show credit balance and plan info')
     .description(
-      'Show credit balance and plan/entitlement info (proactive pre-flight before a large test run)',
+      'Show credit balance and plan/entitlement info (proactive pre-flight before a large run)',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .addHelpText(
@@ -376,9 +264,8 @@ export function createUsageCommand(deps: UsageDeps = {}): Command {
         '  0   success (or --dry-run)\n' +
         '  3   auth error — run `testsprite setup` to configure credentials\n' +
         '  10  transport/network failure (UNAVAILABLE) — retry the command\n' +
-        "\nNote: if credit balance isn't shown for your account, check your portal's\n" +
-        '  Billing page (/dashboard/settings/billing) for a personal key, or your\n' +
-        '  organization billing settings (ask an org admin) if this key is\n' +
+        "\nNote: if the balance isn't shown, check the portal's Billing page\n" +
+        '  (/dashboard-v3/settings/billing), or ask an org admin if this key is\n' +
         '  organization-bound.',
     )
     .action(async (_cmdOpts, command: Command) => {

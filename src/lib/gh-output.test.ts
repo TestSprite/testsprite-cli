@@ -1,5 +1,5 @@
 /**
- * Unit tests for the CI-native output layer attached to `test run --all`
+ * Unit tests for the CI-native output layer attached to `run --project`
  * (issue #99, reshaped from the withdrawn top-level `ci` command). The heavy
  * lifting (trigger + poll) is the batch command's, already covered by its own
  * suites; these tests cover the presentation seams: payload reduction, the
@@ -15,6 +15,7 @@ import {
   emitCiArtifacts,
   emitGithubOutputs,
   renderJobSummaryMarkdown,
+  reconcileExecutionReportMarkdown,
   summarizeAcceptedPayload,
   summarizeSingleRun,
   type CiSummary,
@@ -25,36 +26,37 @@ const PAYLOAD = JSON.stringify({
   accepted: [
     {
       testId: 'test_a',
-      runId: 'run_a',
+      resultId: 'run_a',
       status: 'passed',
       dashboardUrl: 'https://portal.example.com/a',
     },
     {
       testId: 'test_b',
-      runId: 'run_b',
+      resultId: 'run_b',
       status: 'failed',
       error: { code: 'INTERNAL', message: 'boom', exitCode: 1 },
     },
-    { testId: 'test_c', runId: 'run_c', status: 'timeout' },
+    { testId: 'test_c', resultId: 'run_c', status: 'timeout' },
   ],
   conflicts: [],
 });
 
 describe('summarizeAcceptedPayload', () => {
-  it('CI folds unsupported buckets without changing the lower-level default', () => {
+  it('CI keeps a not_found conflict distinct without changing the lower-level default', () => {
     const payload = JSON.stringify({
       accepted: [{ testId: 'a', status: 'passed' }],
-      skippedFrontend: ['fe'],
-      skippedIntegration: [{ testId: 'integration' }],
+      // Always empty on the wire now (every case runs); never folded into rows.
+      skippedFrontend: [],
+      skippedIntegration: [],
       conflicts: [{ testId: 'gone', reason: 'not_found' }],
     });
     const legacy = summarizeAcceptedPayload(payload);
     expect(legacy).toMatchObject({ total: 2, passed: 1, skipped: 1 });
-    expect(legacy.runs[1]!.status).toBe('conflict');
+    expect(legacy.results[1]!.status).toBe('conflict');
     const ci = summarizeAcceptedPayload(payload, { foldSkippedBuckets: true });
-    expect(ci).toMatchObject({ total: 4, passed: 1, failed: 0, skipped: 3 });
-    expect(ci.runs[1]!.status).toBe('not_found');
-    expect(ci.runs.map(row => row.testId)).toEqual(['a', 'gone', 'fe', 'integration']);
+    expect(ci).toMatchObject({ total: 2, passed: 1, failed: 0, skipped: 1 });
+    expect(ci.results[1]!.status).toBe('not_found');
+    expect(ci.results.map(row => row.testId)).toEqual(['a', 'gone']);
   });
 
   it('CI annotations carry the actual conflict reason and actionable message', () => {
@@ -64,14 +66,14 @@ describe('summarizeAcceptedPayload', () => {
       }),
       { foldSkippedBuckets: true },
     );
-    expect(summary.runs[0]!.error).toBe('Choose a public URL (not dispatched)');
+    expect(summary.results[0]!.error).toBe('Choose a public URL (not dispatched)');
     expect(summary).toMatchObject({ total: 1, failed: 0, skipped: 1 });
   });
 
   it('reduces accepted[] rows into counts and rows', () => {
     const summary = summarizeAcceptedPayload(PAYLOAD);
     expect(summary).toMatchObject({ total: 3, passed: 1, failed: 1, timedOut: 1 });
-    expect(summary.runs[1]).toMatchObject({ testId: 'test_b', status: 'failed', error: 'boom' });
+    expect(summary.results[1]).toMatchObject({ testId: 'test_b', status: 'failed', error: 'boom' });
   });
 
   it('unparseable or non-batch output reduces to an empty summary (never throws)', () => {
@@ -88,15 +90,15 @@ describe('summarizeAcceptedPayload', () => {
       JSON.stringify({ accepted: [null, 42, { testId: 'test_ok', status: 'passed' }] }),
     );
     expect(mixed.total).toBe(1);
-    expect(mixed.runs[0]).toMatchObject({ testId: 'test_ok', status: 'passed' });
+    expect(mixed.results[0]).toMatchObject({ testId: 'test_ok', status: 'passed' });
   });
 
   it('folds deferred/conflicts/notFound into non-passed rows — a partial batch is not green', () => {
     const summary = summarizeAcceptedPayload(
       JSON.stringify({
-        accepted: [{ testId: 'test_a', runId: 'run_a', status: 'passed' }],
+        accepted: [{ testId: 'test_a', resultId: 'run_a', status: 'passed' }],
         deferred: [{ testId: 'test_d' }],
-        conflicts: [{ testId: 'test_c', currentRunId: 'run_x' }],
+        conflicts: [{ testId: 'test_c', currentResultId: 'run_x' }],
         notFound: ['test_nf'],
       }),
     );
@@ -107,22 +109,26 @@ describe('summarizeAcceptedPayload', () => {
     expect(summary).toMatchObject({ total: 4, passed: 1, timedOut: 0 });
     expect(summary.failed).toBe(0);
     expect(summary.skipped).toBe(3);
-    expect(summary.runs.map(r => r.status)).toEqual([
+    expect(summary.results.map(r => r.status)).toEqual([
       'passed',
       'deferred',
       'conflict',
       'not_found',
     ]);
     // conflict carries the in-flight runId; each incomplete row explains itself.
-    expect(summary.runs[2]).toMatchObject({ testId: 'test_c', runId: 'run_x', status: 'conflict' });
-    expect(summary.runs[1]!.error).toContain('deferred');
-    expect(summary.runs[3]).toMatchObject({ testId: 'test_nf', status: 'not_found' });
+    expect(summary.results[2]).toMatchObject({
+      testId: 'test_c',
+      resultId: 'run_x',
+      status: 'conflict',
+    });
+    expect(summary.results[1]!.error).toContain('deferred');
+    expect(summary.results[3]).toMatchObject({ testId: 'test_nf', status: 'not_found' });
   });
 
   it('an all-passed batch with empty buckets is unchanged (backward compatible)', () => {
     const summary = summarizeAcceptedPayload(
       JSON.stringify({
-        accepted: [{ testId: 'test_a', runId: 'run_a', status: 'passed' }],
+        accepted: [{ testId: 'test_a', resultId: 'run_a', status: 'passed' }],
         deferred: [],
         conflicts: [],
         notFound: [],
@@ -137,8 +143,8 @@ describe('summarizeAcceptedPayload', () => {
     // (and possibly the exit code) says nothing failed.
     const summary = summarizeAcceptedPayload(
       JSON.stringify({
-        accepted: [{ testId: 'test_1', runId: 'run_1', status: 'passed' }],
-        conflicts: [{ testId: 'test_2', currentRunId: 'run_2' }],
+        accepted: [{ testId: 'test_1', resultId: 'run_1', status: 'passed' }],
+        conflicts: [{ testId: 'test_2', currentResultId: 'run_2' }],
       }),
     );
     expect(summary).toMatchObject({ total: 2, passed: 1, failed: 0, skipped: 1, timedOut: 0 });
@@ -149,42 +155,42 @@ describe('summarizeSingleRun', () => {
   it('reduces a passed single run to a one-row summary', () => {
     const summary = summarizeSingleRun({
       testId: 'test_a',
-      runId: 'run_a',
+      resultId: 'run_a',
       status: 'passed',
       dashboardUrl: 'https://portal.example.com/a',
       error: null,
     });
     expect(summary).toMatchObject({ total: 1, passed: 1, failed: 0, timedOut: 0 });
-    expect(summary.runs).toHaveLength(1);
-    expect(summary.runs[0]).toMatchObject({
+    expect(summary.results).toHaveLength(1);
+    expect(summary.results[0]).toMatchObject({
       testId: 'test_a',
-      runId: 'run_a',
+      resultId: 'run_a',
       status: 'passed',
       dashboardUrl: 'https://portal.example.com/a',
     });
-    expect(summary.runs[0]!.error).toBeUndefined();
+    expect(summary.results[0]!.error).toBeUndefined();
   });
 
   it('carries the raw error string (RunResponse.error is a string, not {message})', () => {
     const summary = summarizeSingleRun({
       testId: 'test_b',
-      runId: 'run_b',
+      resultId: 'run_b',
       status: 'failed',
       dashboardUrl: null,
       error: 'assertion failed at step 2',
     });
     expect(summary).toMatchObject({ total: 1, passed: 0, failed: 1, timedOut: 0 });
-    expect(summary.runs[0]).toMatchObject({ testId: 'test_b', status: 'failed' });
-    expect(summary.runs[0]!.error).toBe('assertion failed at step 2');
-    expect(summary.runs[0]!.dashboardUrl).toBeUndefined();
+    expect(summary.results[0]).toMatchObject({ testId: 'test_b', status: 'failed' });
+    expect(summary.results[0]!.error).toBe('assertion failed at step 2');
+    expect(summary.results[0]!.dashboardUrl).toBeUndefined();
   });
 
   it('omits empty error / null dashboardUrl and defaults a missing status', () => {
-    const summary = summarizeSingleRun({ testId: 'test_c', runId: 'run_c', error: '' });
-    expect(summary.runs[0]).toMatchObject({ testId: 'test_c', status: 'unknown' });
-    expect(summary.runs[0]!.error).toBeUndefined();
-    // a non-passed, non-timeout status counts as failed
-    expect(summary).toMatchObject({ total: 1, passed: 0, failed: 1 });
+    const summary = summarizeSingleRun({ testId: 'test_c', resultId: 'run_c', error: '' });
+    expect(summary.results[0]).toMatchObject({ testId: 'test_c', status: 'unknown' });
+    expect(summary.results[0]!.error).toBeUndefined();
+    // An unknown verdict is still a gate error.
+    expect(summary).toMatchObject({ total: 1, passed: 0, failed: 0, errors: 1 });
   });
 });
 
@@ -193,7 +199,7 @@ describe('renderJobSummaryMarkdown', () => {
     const md = renderJobSummaryMarkdown(summarizeAcceptedPayload(PAYLOAD));
     expect(md).toContain('**1/3 passed** (1 failed, 0 skipped, 1 timed out)');
     // test_a has dashboardUrl but no executionUrl: the title (id fallback) links
-    // to the test-case page; the Run cell shows the raw runId (no execution link).
+    // to the test-case page; the Result cell shows the raw result id (no link).
     expect(md).toContain('| [test_a](https://portal.example.com/a) | passed | run_a |');
     expect(md).toContain('| test_c | timeout | run_c |');
   });
@@ -205,7 +211,7 @@ describe('renderJobSummaryMarkdown', () => {
       failed: 1,
       skipped: 0,
       timedOut: 0,
-      runs: [
+      results: [
         {
           testId: 'evil|id\n✅ fake passed',
           status: 'failed',
@@ -269,7 +275,7 @@ describe('emitGithubOutputs', () => {
           { testId: 'test_pass', runId: 'r1', status: 'passed' },
           { testId: 'test_fail', runId: 'r2', status: 'failed' },
         ],
-        conflicts: [{ testId: 'test_conf', currentRunId: 'r3' }],
+        conflicts: [{ testId: 'test_conf', currentResultId: 'r3' }],
         notFound: ['test_nf'],
         deferred: [{ testId: 'test_def' }],
       }),
@@ -320,9 +326,9 @@ describe('emitGithubOutputs', () => {
           throw new Error('EROFS');
         },
       },
-      { label: 'testlist run' },
+      { label: 'run --testlist' },
     );
-    expect(labeled.stderr.join('\n')).toContain('[testlist run]');
+    expect(labeled.stderr.join('\n')).toContain('[run --testlist]');
   });
 
   it('force (--gh-output) emits annotations off-Actions; the step summary still needs its env path', () => {
@@ -341,10 +347,10 @@ describe('emitGithubOutputs', () => {
       failed: 1,
       skipped: 0,
       timedOut: 0,
-      runs: [
+      results: [
         {
           testId: 'evil:id,x',
-          runId: 'run_x',
+          resultId: 'run_x',
           status: 'failed',
           error: 'line1\n::add-mask::supersecret\n::stop-commands::abc',
         },
@@ -432,11 +438,11 @@ describe('emitCiArtifacts', () => {
       summary,
       { ghOutput: true, summaryFile: badSummary },
       { env: { GITHUB_STEP_SUMMARY: badStep }, stdout: () => {}, stderr: l => stderr.push(l) },
-      'testlist run',
+      'run --testlist',
     );
     const out = stderr.join('\n');
-    expect(out).toContain('[testlist run] could not write --summary-file');
-    expect(out).toContain('[testlist run] could not append');
+    expect(out).toContain('[run --testlist] could not write --summary-file');
+    expect(out).toContain('[run --testlist] could not append');
   });
 });
 
@@ -454,18 +460,18 @@ describe('test title in CI output', () => {
         ],
       }),
     );
-    expect(s.runs[0]).toMatchObject({ testId: 't-1', title: 'Sign in from the login page' });
+    expect(s.results[0]).toMatchObject({ testId: 't-1', title: 'Sign in from the login page' });
   });
 
   it('summarizeSingleRun maps testTitle → row.title, and null leaves it absent', () => {
     expect(
-      summarizeSingleRun({ testId: 't', testTitle: 'Login', status: 'passed' }).runs[0],
+      summarizeSingleRun({ testId: 't', testTitle: 'Login', status: 'passed' }).results[0],
     ).toMatchObject({
       title: 'Login',
     });
     // A null title (older server) → no title key → renderer falls back to the id.
     expect(
-      summarizeSingleRun({ testId: 't', testTitle: null, status: 'passed' }).runs[0]!.title,
+      summarizeSingleRun({ testId: 't', testTitle: null, status: 'passed' }).results[0]!.title,
     ).toBeUndefined();
   });
 
@@ -476,9 +482,9 @@ describe('test title in CI output', () => {
       failed: 0,
       skipped: 0,
       timedOut: 0,
-      runs: [
-        { testId: 't-1', title: 'Sign in from the login page', status: 'passed', runId: 'r-1' },
-        { testId: 't-2', status: 'passed', runId: 'r-2' }, // no title → id
+      results: [
+        { testId: 't-1', title: 'Sign in from the login page', status: 'passed', resultId: 'r-1' },
+        { testId: 't-2', status: 'passed', resultId: 'r-2' }, // no title → id
       ],
     });
     expect(md).toContain('| Sign in from the login page | passed | r-1 |');
@@ -492,7 +498,7 @@ describe('test title in CI output', () => {
       failed: 1,
       skipped: 0,
       timedOut: 0,
-      runs: [{ testId: 't', title: 'evil|title\nfake', status: 'failed', runId: 'r' }],
+      results: [{ testId: 't', title: 'evil|title\nfake', status: 'failed', resultId: 'r' }],
     });
     const rows = md.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| ---'));
     expect(rows).toHaveLength(2); // header + one data row, no injected line
@@ -506,9 +512,9 @@ describe('test title in CI output', () => {
       failed: 0,
       skipped: 0,
       timedOut: 0,
-      runs: [
-        { testId: 't-1', title: '', status: 'passed', runId: 'r-1' },
-        { testId: 't-2', title: '   ', status: 'passed', runId: 'r-2' },
+      results: [
+        { testId: 't-1', title: '', status: 'passed', resultId: 'r-1' },
+        { testId: 't-2', title: '   ', status: 'passed', resultId: 'r-2' },
       ],
     });
     expect(md).toContain('| t-1 | passed | r-1 |');
@@ -525,9 +531,9 @@ describe('test title in CI output', () => {
         failed: 2,
         skipped: 0,
         timedOut: 0,
-        runs: [
-          { testId: 't-1', title: 'Sign in\nnow', status: 'failed', runId: 'r-1' },
-          { testId: 't-2', title: '  ', status: 'failed', runId: 'r-2' },
+        results: [
+          { testId: 't-1', title: 'Sign in\nnow', status: 'failed', resultId: 'r-1' },
+          { testId: 't-2', title: '  ', status: 'failed', resultId: 'r-2' },
         ],
       },
       {},
@@ -559,33 +565,33 @@ describe('run-scoped execution link in CI output', () => {
         conflicts: [],
       }),
     );
-    expect(summary.runs[0]!.executionUrl).toBe('https://portal.example.com/exec/e1');
+    expect(summary.results[0]!.executionUrl).toBe('https://portal.example.com/exec/e1');
   });
 
   it('summarizeSingleRun maps executionUrl → row.executionUrl (absent when null)', () => {
     expect(
       summarizeSingleRun({ testId: 't1', status: 'passed', executionUrl: 'https://x/exec/e1' })
-        .runs[0]!.executionUrl,
+        .results[0]!.executionUrl,
     ).toBe('https://x/exec/e1');
     expect(
-      summarizeSingleRun({ testId: 't1', status: 'passed', executionUrl: null }).runs[0]!
+      summarizeSingleRun({ testId: 't1', status: 'passed', executionUrl: null }).results[0]!
         .executionUrl,
     ).toBeUndefined();
   });
 
-  it('renders two distinct links: title → test-case page, Run → execution result page', () => {
+  it('renders two distinct links: title → test-case page, Result → the result page', () => {
     const md = renderJobSummaryMarkdown({
       total: 1,
       passed: 1,
       failed: 0,
       skipped: 0,
       timedOut: 0,
-      runs: [
+      results: [
         {
           testId: 't1',
           title: 'Sign in',
           status: 'passed',
-          runId: 'r1',
+          resultId: 'r1',
           dashboardUrl: 'https://portal.example.com/case/t1',
           executionUrl: 'https://portal.example.com/exec/e1',
         },
@@ -603,14 +609,14 @@ describe('run-scoped execution link in CI output', () => {
       failed: 0,
       skipped: 0,
       timedOut: 0,
-      runs: [
+      results: [
         {
           testId: 't1',
           // A `]` would close the markdown link early and point the visible title
           // at the injected URL — realistic for an LLM-authored title.
           title: 'x](https://evil.example) y',
           status: 'passed',
-          runId: 'r1',
+          resultId: 'r1',
           dashboardUrl: 'https://portal.example.com/case/t1',
         },
       ],
@@ -629,14 +635,14 @@ describe('run-scoped execution link in CI output', () => {
       failed: 0,
       skipped: 0,
       timedOut: 0,
-      runs: [
+      results: [
         {
           testId: 't1',
           // The title's own `\` would consume the escape we insert before `]`,
           // re-exposing the bracket — unless backslashes are doubled first.
           title: 'a\\](https://evil.example) y',
           status: 'passed',
-          runId: 'r1',
+          resultId: 'r1',
           dashboardUrl: 'https://portal.example.com/case/t1',
         },
       ],
@@ -657,7 +663,7 @@ describe('run-scoped execution link in CI output', () => {
       skipped: 0,
       timedOut: 0,
       // Plain (unlinked) cell — no dashboardUrl — exercises escapeTableCell alone.
-      runs: [{ testId: 'a\\|b', status: 'passed', runId: 'r1' }],
+      results: [{ testId: 'a\\|b', status: 'passed', resultId: 'r1' }],
     });
     const rows = md.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| ---'));
     // Header + exactly one data row: the `\|` did NOT open a fourth column.
@@ -666,19 +672,19 @@ describe('run-scoped execution link in CI output', () => {
     expect(rows[1]!).toContain('a\\\\\\|b');
   });
 
-  it('no executionUrl (V2 run): Run cell degrades to the raw runId, title still links', () => {
+  it('no executionUrl (V2 run): the Result cell degrades to the raw result id, title still links', () => {
     const md = renderJobSummaryMarkdown({
       total: 1,
       passed: 1,
       failed: 0,
       skipped: 0,
       timedOut: 0,
-      runs: [
+      results: [
         {
           testId: 't1',
           title: 'Sign in',
           status: 'passed',
-          runId: 'r1',
+          resultId: 'r1',
           dashboardUrl: 'https://portal.example.com/case/t1',
         },
       ],
@@ -696,12 +702,12 @@ describe('run-scoped execution link in CI output', () => {
         failed: 1,
         skipped: 0,
         timedOut: 0,
-        runs: [
+        results: [
           {
             testId: 't1',
             title: 'Sign in',
             status: 'failed',
-            runId: 'r1',
+            resultId: 'r1',
             dashboardUrl: 'https://portal.example.com/case/t1',
             executionUrl: 'https://portal.example.com/exec/e1',
           },
@@ -726,7 +732,11 @@ describe('environment batch skips', () => {
       }),
     );
     expect(summary).toMatchObject({ total: 2, passed: 1, skipped: 1, failed: 0 });
-    expect(summary.runs).toContainEqual({ testId: 'b', status: 'skipped', error: 'backend-test' });
+    expect(summary.results).toContainEqual({
+      testId: 'b',
+      status: 'skipped',
+      error: 'backend-test',
+    });
   });
 });
 
@@ -769,7 +779,7 @@ describe('emitExecutionReportOutputs', () => {
   const ready = {
     report: {
       projectId: 'p',
-      executionId: 'exec/1',
+      runId: 'exec/1',
       projectName: 'Shop',
       orgId: null,
       stats: { passed: 1, failed: 0, blocked: 0, total: 1 },
@@ -783,6 +793,21 @@ describe('emitExecutionReportOutputs', () => {
     markdown: '# report\n',
   };
 
+  it('shows an execution cancellation alongside passing results in both job summaries', () => {
+    const summary = summarizeSingleRun({ runId: 'aborted', resultId: 'r1', status: 'passed' });
+    summary.runFailures = [
+      { runId: 'aborted', status: 'cancelled', message: 'Cancelled.\n# note' },
+    ];
+    for (const md of [
+      renderJobSummaryMarkdown(summary),
+      reconcileExecutionReportMarkdown(summary, ready),
+    ]) {
+      expect(md).toContain('> Run `aborted` — cancelled: `Cancelled.# note`');
+      expect(md).not.toContain('\n# note');
+    }
+    expect(reconcileExecutionReportMarkdown(summary, ready)).toContain('> [!WARNING]');
+  });
+
   it('writes both files under RUNNER_TEMP and names them in GITHUB_OUTPUT', () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli-exec-report-'));
     const outputPath = join(dir, 'outputs');
@@ -791,13 +816,17 @@ describe('emitExecutionReportOutputs', () => {
       env: { GITHUB_OUTPUT: outputPath, RUNNER_TEMP: dir },
       stderr: l => stderr.push(l),
     });
-    // The execution id is sanitised into a file name; the real id stays in the JSON.
+    // The launch id is sanitised into a file name; the real id stays in the
+    // JSON, under the name the CLI prints it by.
     expect(written).toEqual({
       jsonPath: join(dir, 'testsprite-execution-report-exec_1.json'),
       markdownPath: join(dir, 'testsprite-execution-report-exec_1.md'),
     });
+    const { runId, ...rest } = ready.report;
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync files.
-    expect(JSON.parse(readFileSync(written!.jsonPath, 'utf8'))).toEqual(ready.report);
+    const writtenJson = readFileSync(written!.jsonPath, 'utf8');
+    expect(JSON.parse(writtenJson)).toEqual({ ...rest, runId });
+    expect(writtenJson).not.toContain('xecutionId');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync files.
     expect(readFileSync(written!.markdownPath, 'utf8')).toBe('# report\n');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync files.
@@ -830,4 +859,83 @@ describe('emitExecutionReportOutputs', () => {
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own mkdtempSync path.
     expect(existsSync(join(dir, 'outputs'))).toBe(false);
   });
+});
+
+// Inside the CLI a summary row keeps the wire names: `runId` is one test's
+// result and `executionId` the launch it belongs to. What is written out
+// calls them `resultId` and `runId`.
+describe('the launch and the result in CI output', () => {
+  const BATCH = JSON.stringify({
+    accepted: [
+      { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+      { testId: 'B', resultId: 'r2', runId: 'e1', status: 'failed' },
+    ],
+    conflicts: [{ testId: 'C', currentResultId: 'r9', currentRunId: 'e9', reason: 'in_flight' }],
+  });
+
+  it('a batch row keeps the launch it was dispatched under; a conflict row the launch holding the test', () => {
+    const { results } = summarizeAcceptedPayload(BATCH);
+    expect(results.map(({ testId, resultId, runId }) => ({ testId, resultId, runId }))).toEqual([
+      { testId: 'A', resultId: 'r1', runId: 'e1' },
+      { testId: 'B', resultId: 'r2', runId: 'e1' },
+      { testId: 'C', resultId: 'r9', runId: 'e9' },
+    ]);
+  });
+
+  it('a single run keeps its launch', () =>
+    expect(
+      summarizeSingleRun({ testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' }).results,
+    ).toEqual([{ testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' }]));
+
+  it('an old server: rows carry no launch', () => {
+    const { results } = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [{ testId: 'A', resultId: 'r1', status: 'passed' }],
+        conflicts: [{ testId: 'C', currentResultId: 'r9', reason: 'in_flight' }],
+      }),
+    );
+    expect(results.some(row => 'executionId' in row)).toBe(false);
+    expect(
+      'executionId' in
+        summarizeSingleRun({ testId: 'A', resultId: 'r1', status: 'passed' }).results[0]!,
+    ).toBe(false);
+  });
+
+  it('the job summary names the launch once and lists each test under Result', () => {
+    const md = renderJobSummaryMarkdown(summarizeAcceptedPayload(BATCH));
+    expect(md).toContain('\nRun `e1`\n');
+    expect(md).toContain('| Test | Status | Result |');
+    expect(md).toContain('| A | passed | r1 |');
+    // The launch holding a test this run did not dispatch is not this run.
+    expect(md).not.toContain('e9');
+  });
+
+  it('several launches are all named', () =>
+    expect(
+      renderJobSummaryMarkdown(
+        summarizeAcceptedPayload(
+          JSON.stringify({
+            accepted: [
+              { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+              { testId: 'B', resultId: 'r2', runId: 'e2', status: 'passed' },
+            ],
+          }),
+        ),
+      ),
+    ).toContain('\nRuns `e1`, `e2`\n'));
+
+  it('an old server: the job summary has no Run line', () => {
+    const md = renderJobSummaryMarkdown(
+      summarizeSingleRun({ testId: 'A', resultId: 'r1', status: 'passed' }),
+    );
+    expect(md).not.toMatch(/^Runs? `/m);
+    expect(md).toContain('| A | passed | r1 |');
+  });
+
+  it('a launch id cannot break out of its code span', () =>
+    expect(
+      renderJobSummaryMarkdown(
+        summarizeSingleRun({ testId: 'A', resultId: 'r1', runId: 'e`1\n# x', status: 'passed' }),
+      ),
+    ).toContain('\nRun `e1# x`\n'));
 });

@@ -1,3 +1,5 @@
+import { projectRun, runListing } from '../helpers/project-run.js';
+import { resultLine } from '../helpers/result-list.js';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -8,17 +10,18 @@ import { describe, expect, it } from 'vitest';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const binary = join(root, 'dist/index.js');
-const batch = {
-  accepted: [{ testId: 'test_new', runId: 'run_new', enqueuedAt: '2026-06-09T10:00:00Z' }],
-  conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'in_flight' }],
-  deferred: [],
-  skippedFrontend: ['test_frontend'],
-  skippedIntegration: [{ testId: 'test_integration' }],
-};
-
+const held = [{ testId: 'test_busy', runId: 'exec_busy', resultId: 'run_busy' }];
+const conflicts = [
+  {
+    testId: 'test_busy',
+    currentRunId: 'exec_busy',
+    currentResultId: 'run_busy',
+  },
+];
 function passedRun(runId: string) {
   return {
-    runId,
+    resultId: runId,
+    runId: runId === 'run_new' ? 'exec_new' : 'exec_busy',
     testId: runId === 'run_new' ? 'test_new' : 'test_busy',
     projectId: 'project_signal',
     userId: 'user_signal',
@@ -29,6 +32,7 @@ function passedRun(runId: string) {
     finishedAt: '2026-06-09T10:00:02Z',
     codeVersion: 'v1',
     targetUrl: 'https://example.com',
+    environment: { id: 'env_default', name: 'default' },
     createdFrom: 'cli',
     failedStepIndex: null,
     failureKind: null,
@@ -44,7 +48,7 @@ async function runBatch(
   stage: Stage,
   signal: 'SIGINT' | 'SIGTERM',
   output: 'json' | 'text',
-  scenario: 'mixed' | 'conflicts-only' | 'stopped-dispatch' = 'mixed',
+  scenario: 'mixed' | 'conflicts-only' = 'mixed',
 ) {
   const directory = mkdtempSync(join(tmpdir(), 'batch-resume-signal-'));
   const preload = join(directory, 'preload.mjs');
@@ -88,7 +92,6 @@ async function runBatch(
     'test_busy',
     ...Array.from({ length: 49 }, (_, i) => `test_${i + 2}`),
   ];
-  let dispatches = 0;
   let ready!: () => void;
   const reached = new Promise<void>(resolveReady => {
     ready = resolveReady;
@@ -98,39 +101,53 @@ async function runBatch(
     const path = url.pathname.replace('/api/cli/v1', '');
     requests.push({ method: req.method!, path: req.url! });
     let body: unknown;
-    if (path === '/projects/project_signal/env') body = { environments: [] };
+    if (path === '/projects/project_signal/env')
+      body = {
+        environments: [
+          { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
+        ],
+      };
     else if (path === '/tests') {
       body = {
         items: filteredIds.map((id, i) => ({
           id,
-          name: `selected ${id}`,
+          title: `selected ${id}`,
           projectId: 'project_signal',
           type: i >= 2 && i < 50 ? 'frontend' : 'backend',
         })),
         nextToken: null,
       };
-    } else if (path === '/tests/batch/run' && req.method === 'POST') {
-      dispatches++;
-      if (scenario === 'stopped-dispatch' && dispatches > 1) {
-        res.writeHead(412, { 'content-type': 'application/json' });
+    } else if (path === '/projects/project_signal/runs' && req.method === 'POST') {
+      if (scenario === 'conflicts-only') {
+        res.writeHead(409, { 'content-type': 'application/json' });
         res.end(
           JSON.stringify({
-            error: {
-              code: 'PRECONDITION_FAILED',
-              message: 'Dispatch stopped',
-              requestId: 'fixture',
+            code: 'CONFLICT',
+            message: 'All selected tests are in flight',
+            nextAction: 'testsprite run wait exec_busy',
+            requestId: 'held',
+            details: {
+              reason: 'run_in_flight',
+              projectId: 'project_signal',
+              currentRunId: 'exec_busy',
+              currentResultId: 'run_busy',
+              conflicts,
             },
           }),
         );
         return;
       }
-      body = {
-        ...batch,
-        ...(scenario === 'conflicts-only' ? { accepted: [] } : {}),
-        ...(scenario === 'stopped-dispatch'
-          ? { skippedFrontend: filteredIds.slice(2, 50), skippedIntegration: [] }
-          : {}),
-      };
+      body = projectRun({ runId: 'exec_new', projectId: 'project_signal', total: 1, held });
+    } else if (path === '/results') {
+      const runId = url.searchParams.get('run')!;
+      body = runListing({ runId, status: 'finished', cancelled: false }, [
+        resultLine({
+          resultId: runId === 'exec_new' ? 'run_new' : 'run_busy',
+          runId,
+          caseKey: runId === 'exec_new' ? 'test_new' : 'test_busy',
+          testStatus: 'PASSED',
+        }),
+      ]);
     } else if (path.startsWith('/runs/')) {
       if (
         path === '/runs/run_busy' &&
@@ -162,13 +179,12 @@ async function runBatch(
       '--import',
       preload,
       binary,
-      'test',
       'run',
-      '--all',
       '--project',
       'project_signal',
       '--wait',
-      ...(scenario === 'stopped-dispatch' ? ['--filter', 'selected'] : []),
+      '--filter',
+      'selected',
       '--timeout',
       '30',
       '--max-concurrency',
@@ -237,90 +253,51 @@ async function runBatch(
 }
 
 // Windows does not deliver POSIX signals to the Node handler.
-describe.skipIf(process.platform === 'win32')('batch conflict metadata signal receipts', () => {
-  for (const stage of ['request', 'body', 'idle'] as const) {
-    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+describe.skipIf(process.platform === 'win32')('native held-result metadata signal receipts', () => {
+  for (const stage of ['request', 'body', 'idle'] as const)
+    for (const signal of ['SIGINT', 'SIGTERM'] as const)
       for (const output of ['json', 'text'] as const) {
-        it(`${stage}, ${signal}, ${output}: preserves acknowledged receipts without cancelling`, async () => {
+        it(`${stage}, ${signal}, ${output}: preserves acknowledged executions without cancelling`, async () => {
           const result = await runBatch(stage, signal, output);
           expect(result.code).toBe(signal === 'SIGINT' ? 130 : 143);
           expect(result.signal).toBeNull();
           if (stage === 'idle') expect(result.idleCritical).toBe(false);
-          if (output === 'json') {
-            expect(JSON.parse(result.stdout)).toEqual({
-              accepted: [{ testId: 'test_new', runId: 'run_new', status: 'running' }],
-              conflicts: batch.conflicts,
-              deferred: [],
-              skippedFrontend: batch.skippedFrontend,
-              skippedIntegration: batch.skippedIntegration,
+          if (output === 'json')
+            expect(JSON.parse(result.stdout)).toMatchObject({
+              runs: [{ runId: 'exec_new', held }],
+              partial: true,
             });
-            expect(result.stderr).toContain('"code": "INTERRUPTED"');
-          } else {
-            expect(result.stdout).toContain('run_new  running');
-          }
+          else expect(result.stdout).toContain('Run exec_new');
           expect(result.stderr).toContain(`Interrupted (${signal})`);
-          expect(result.stderr).toContain('testsprite test wait run_new');
+          expect(result.stderr).toContain('testsprite run wait exec_new');
+          expect(result.stderr).not.toContain('testsprite run wait run_new');
           expect(result.requests.filter(r => r.method !== 'GET')).toEqual([
-            { method: 'POST', path: '/api/cli/v1/tests/batch/run' },
+            { method: 'POST', path: '/api/cli/v1/projects/project_signal/runs' },
           ]);
-          expect(result.requests.some(r => r.path.includes('waitSeconds'))).toBe(false);
-        }, 15_000);
+        }, 15000);
       }
-    }
-  }
-
-  it('completes the normal accepted plus adopted run without changing resume behaviour', async () => {
+  it('waits for owned execution and only the verified held subset', async () => {
     const result = await runBatch('complete', 'SIGINT', 'json');
     expect(result.code).toBe(0);
     const payload = JSON.parse(result.stdout);
     expect(
-      payload.accepted.map((row: { runId: string; status: string }) => [row.runId, row.status]),
+      payload.results.map((row: { resultId: string; runId: string; status: string }) => [
+        row.resultId,
+        row.runId,
+        row.status,
+      ]),
     ).toEqual([
-      ['run_new', 'passed'],
-      ['run_busy', 'passed'],
+      ['run_new', 'exec_new', 'passed'],
+      ['run_busy', 'exec_busy', 'passed'],
     ]);
-    expect(payload.conflicts).toEqual([]);
-    expect(result.stderr).not.toContain('Interrupted');
-  }, 15_000);
-
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    for (const output of ['json', 'text'] as const) {
-      it(`no accepted runs, ${signal}, ${output}: preserves unverified conflict IDs`, async () => {
-        const result = await runBatch('request', signal, output, 'conflicts-only');
-        expect(result.code).toBe(signal === 'SIGINT' ? 130 : 143);
-        expect(result.signal).toBeNull();
-        if (output === 'text') {
-          expect(result.stdout.trim()).toBe('run_busy  unverified (not attached)');
-        } else {
-          expect(JSON.parse(result.stdout)).toMatchObject({
-            accepted: [],
-            conflicts: batch.conflicts,
-          });
-          expect(JSON.parse(result.stdout)).not.toHaveProperty('notRunTestIds');
-        }
-        expect(result.stderr).not.toContain('[auto-resume]');
-        expect(result.requests.filter(r => r.method !== 'GET')).toEqual([
-          { method: 'POST', path: '/api/cli/v1/tests/batch/run' },
-        ]);
-        expect(result.requests.some(r => r.path.includes('waitSeconds'))).toBe(false);
-      }, 15_000);
-    }
-
-    it(`stopped dispatch then metadata ${signal}: JSON names tests never sent`, async () => {
-      const result = await runBatch('request', signal, 'json', 'stopped-dispatch');
+    expect(payload.joinedRuns).toEqual([{ runId: 'exec_busy', resultIds: ['run_busy'] }]);
+    expect(result.requests.filter(r => r.method === 'POST')).toHaveLength(1);
+  }, 15000);
+  for (const signal of ['SIGINT', 'SIGTERM'] as const)
+    it(`all-held ${signal} retains unverified native references`, async () => {
+      const result = await runBatch('request', signal, 'json', 'conflicts-only');
       expect(result.code).toBe(signal === 'SIGINT' ? 130 : 143);
-      expect(result.signal).toBeNull();
-      expect(JSON.parse(result.stdout)).toMatchObject({
-        accepted: [{ testId: 'test_new', runId: 'run_new', status: 'running' }],
-        conflicts: batch.conflicts,
-        notRunTestIds: ['test_50'],
-      });
-      expect(result.stderr).toContain('1 test was not dispatched: test_50');
-      expect(result.requests.filter(r => r.method !== 'GET')).toEqual([
-        { method: 'POST', path: '/api/cli/v1/tests/batch/run' },
-        { method: 'POST', path: '/api/cli/v1/tests/batch/run' },
-      ]);
-      expect(result.requests.some(r => r.path.includes('waitSeconds'))).toBe(false);
-    }, 15_000);
-  }
+      expect(JSON.parse(result.stdout)).toMatchObject({ runs: [], held, partial: true });
+      expect(result.requests.filter(r => r.method !== 'GET')).toHaveLength(1);
+    }, 15000);
 });

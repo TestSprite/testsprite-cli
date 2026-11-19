@@ -1,25 +1,28 @@
+import {
+  projectRun,
+  runListing,
+  projectHarness,
+  resultCard,
+} from '../../test/helpers/project-run.js';
+import { resultLine } from '../../test/helpers/result-list.js';
 /**
- * Unit tests for `test run <test-id>` — M3.3 piece-3.
+ * Unit tests for `run <test-id>` — M3.3 piece-3.
  *
  * All HTTP is mocked via `makeFetch` / `makeCreds`. The polling loop's
  * sleep injection is wired through `TestDeps.sleep` to avoid real delays.
  */
 
-import * as dns from 'node:dns';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ConflictReason } from '../lib/conflict-reason.js';
-import { quoteEnvironmentName } from '../lib/environment-tunnel.js';
-import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
-import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
-import type { FetchImpl } from '../lib/http.js';
-import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
+import { buildInterruptEnvelope } from '../lib/render-error.js';
+import type { RunResponse } from '../lib/runs.types.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
-import { renderRunResponseText, runTestRun, runTestRunAll } from './test.js';
+import { runTestRun, runTestRunAll } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -58,37 +61,6 @@ function makeCreds(
   return { credentialsPath };
 }
 
-const TRIGGER_RESP: TriggerRunResponse = {
-  runId: 'run_abc',
-  status: 'queued',
-  enqueuedAt: '2026-05-15T10:00:00.000Z',
-  codeVersion: 'v1',
-  targetUrl: 'https://example.com',
-};
-
-function makePassedRun(): RunResponse {
-  return {
-    runId: 'run_abc',
-    testId: 'test_xyz',
-    projectId: 'project_1',
-    userId: 'user_1',
-    status: 'passed',
-    source: 'cli',
-    createdAt: '2026-05-15T10:00:00.000Z',
-    startedAt: '2026-05-15T10:00:01.000Z',
-    finishedAt: '2026-05-15T10:00:30.000Z',
-    codeVersion: 'v1',
-    targetUrl: 'https://example.com',
-    environment: { id: 'env_default', name: 'default' },
-    createdFrom: 'cli',
-    failedStepIndex: null,
-    failureKind: null,
-    error: null,
-    videoUrl: null,
-    stepSummary: { total: 5, completed: 5, passedCount: 5, failedCount: 0 },
-  };
-}
-
 const CURRENT_DEFAULT_ENVIRONMENTS = {
   environments: [
     { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
@@ -119,10 +91,6 @@ function ordinaryRunDiscoveryResponse(
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
-}
-
-function makeFailedRun(): RunResponse {
-  return { ...makePassedRun(), status: 'failed', failedStepIndex: 2, failureKind: 'assertion' };
 }
 
 function errorBody(
@@ -167,19 +135,20 @@ function disableExits(cmd: Command): void {
 // Surface test
 // ---------------------------------------------------------------------------
 
-describe('createTestCommand — run + wait subcommands exposed', () => {
+describe('createRunCommand — run + wait subcommands exposed', () => {
   it('exposes run and wait as top-level subcommands', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
+    const { createRunCommand } = await import('./test.js');
+    const test = createRunCommand();
     const names = test.commands.map(c => c.name()).sort();
-    expect(names).toContain('run');
+    expect(test.name()).toBe('run');
+    expect(names).toContain('cancel');
     expect(names).toContain('wait');
   });
 
   it('run subcommand has --wait, --timeout, --target-url, --idempotency-key flags', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
-    const run = test.commands.find(c => c.name() === 'run')!;
+    const { createRunCommand } = await import('./test.js');
+    const test = createRunCommand();
+    const run = test;
     const flagNames = run.options.map(o => o.long);
     expect(flagNames).toContain('--wait');
     expect(flagNames).toContain('--timeout');
@@ -188,8 +157,8 @@ describe('createTestCommand — run + wait subcommands exposed', () => {
   });
 
   it('wait subcommand has --timeout flag', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
+    const { createRunCommand } = await import('./test.js');
+    const test = createRunCommand();
     const wait = test.commands.find(c => c.name() === 'wait')!;
     const flagNames = wait.options.map(o => o.long);
     expect(flagNames).toContain('--timeout');
@@ -214,10 +183,10 @@ describe('runTestRun — no-wait (fire and return)', () => {
     errorSpy.mockRestore();
   });
 
-  it('happy path — fires trigger, returns TriggerRunResponse, exit 0 (no throw)', async () => {
+  it('happy path — fires trigger, returns the project launch receipt, exit 0 (no throw)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(url => {
-      if (url.includes('/runs')) return { body: TRIGGER_RESP };
+      if (url.includes('/runs')) return { body: projectRun() };
       return { status: 404, body: {} };
     });
     const stdout: string[] = [];
@@ -228,14 +197,15 @@ describe('runTestRun — no-wait (fire and return)', () => {
         debug: false,
         dryRun: false,
         testId: 'test_xyz',
+        knownTest: { projectId: 'project_1', type: 'frontend' as const },
         wait: false,
         timeoutSeconds: 60,
       },
       { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
     );
     // Should return TriggerRunResponse (not RunResponse)
-    expect(result).toMatchObject({ runId: 'run_abc', status: 'queued' });
-    expect(stdout.join('')).toContain('run_abc');
+    expect(result).toMatchObject({ runs: [{ runId: 'exec_abc', total: 1 }] });
+    expect(stdout.join('')).toContain('exec_abc');
   });
 
   it('honours TESTSPRITE_REQUEST_TIMEOUT_MS for an ordinary non-wait trigger', async () => {
@@ -251,7 +221,7 @@ describe('runTestRun — no-wait (fire and return)', () => {
           setTimeout(() => {
             abortedAt1250Ms = signal?.aborted === true;
             resolve(
-              new Response(JSON.stringify(TRIGGER_RESP), {
+              new Response(JSON.stringify(projectRun()), {
                 status: 200,
                 headers: { 'content-type': 'application/json' },
               }),
@@ -270,6 +240,7 @@ describe('runTestRun — no-wait (fire and return)', () => {
           output: 'json',
           debug: false,
           testId: 'test_xyz',
+          knownTest: { projectId: 'project_1', type: 'frontend' as const },
           wait: false,
           timeoutSeconds: 60,
         },
@@ -298,12 +269,12 @@ describe('runTestRun — no-wait (fire and return)', () => {
     }
   });
 
-  it('no-wait path sends POST to /tests/{testId}/runs', async () => {
+  it('no-wait path sends POST to /projects/{projectId}/runs', async () => {
     const { credentialsPath } = makeCreds();
     const seenUrls: string[] = [];
     const fetchImpl = makeFetch(url => {
       seenUrls.push(url);
-      return { body: TRIGGER_RESP };
+      return { body: projectRun() };
     });
     await runTestRun(
       {
@@ -312,6 +283,7 @@ describe('runTestRun — no-wait (fire and return)', () => {
         debug: false,
         dryRun: false,
         testId: 'test_xyz',
+        knownTest: { projectId: 'project_1', type: 'frontend' as const },
         wait: false,
         timeoutSeconds: 60,
       },
@@ -322,7 +294,7 @@ describe('runTestRun — no-wait (fire and return)', () => {
         sleep: instantSleep,
       },
     );
-    expect(seenUrls.some(u => u.includes('/tests/test_xyz/runs'))).toBe(true);
+    expect(seenUrls.some(u => u.includes('/projects/project_1/runs'))).toBe(true);
   });
 
   it('sends correct idempotency key header when provided', async () => {
@@ -335,7 +307,7 @@ describe('runTestRun — no-wait (fire and return)', () => {
         entry[k] = v;
       });
       seenHeaders.push(entry);
-      return new Response(JSON.stringify(TRIGGER_RESP), {
+      return new Response(JSON.stringify(projectRun()), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
@@ -347,6 +319,7 @@ describe('runTestRun — no-wait (fire and return)', () => {
         debug: false,
         dryRun: false,
         testId: 'test_xyz',
+        knownTest: { projectId: 'project_1', type: 'frontend' as const },
         wait: false,
         timeoutSeconds: 60,
         idempotencyKey: 'test-idem-key-001',
@@ -364,7 +337,7 @@ describe('runTestRun — no-wait (fire and return)', () => {
 
   it('--output json prints JSON envelope on stdout', async () => {
     const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: TRIGGER_RESP }));
+    const fetchImpl = makeFetch(() => ({ body: projectRun() }));
     const stdout: string[] = [];
     await runTestRun(
       {
@@ -373,114 +346,73 @@ describe('runTestRun — no-wait (fire and return)', () => {
         debug: false,
         dryRun: false,
         testId: 'test_xyz',
+        knownTest: { projectId: 'project_1', type: 'frontend' as const },
         wait: false,
         timeoutSeconds: 60,
       },
       { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
     );
     const parsed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(parsed.runId).toBe('run_abc');
-    expect(parsed.status).toBe('queued');
+    // The launch is `runId`; this test's part of it is `resultId`.
+    expect(parsed.runs).toEqual([projectRun()]);
+    expect(parsed).not.toHaveProperty('accepted');
+    expect(parsed).not.toHaveProperty('resultId');
+    expect(stdout.join('')).not.toContain('executionId');
   });
 });
 
 describe('supported target URL command behavior', () => {
-  it('run forwards a target URL without a deprecation warning', async () => {
-    vi.resetModules();
-    const { createTestCommand } = await import('./test.js');
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const bodies: unknown[] = [];
-    const command = createTestCommand({
-      credentialsPath,
-      fetchImpl: makeFetch((_url, init) => {
-        bodies.push(JSON.parse(String(init.body)));
-        return { body: TRIGGER_RESP };
-      }),
-      stdout: () => {},
-      stderr: line => stderrLines.push(line),
+  async function commandHarness(type: 'frontend' | 'backend', output: 'text' | 'json' = 'text') {
+    const targetUrl = 'https://staging.example.com';
+    const h = projectHarness({
+      launch: projectRun({ targetUrl }),
+      answer: url =>
+        url.pathname.endsWith('/tests/test_xyz')
+          ? new Response(JSON.stringify({ id: 'test_xyz', projectId: 'project_1', type }))
+          : undefined,
     });
+    const { createRunCommand } = await import('./test.js');
+    const command = createRunCommand(h.deps).option('--output <mode>');
     await command.parseAsync(
-      ['run', 'test_xyz', '--target-url', 'https://staging.example.com', '--skip-preflight'],
+      ['test_xyz', '--target-url', targetUrl, '--skip-preflight', '--output', output],
       { from: 'user' },
     );
-    expect(bodies).toContainEqual({ source: 'cli', targetUrl: 'https://staging.example.com' });
-    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
-  });
-
-  it('keeps JSON output parseable without a target URL warning', async () => {
-    vi.resetModules();
-    const { createTestCommand } = await import('./test.js');
-    const { credentialsPath } = makeCreds();
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const command = createTestCommand({
-      credentialsPath,
-      fetchImpl: makeFetch(() => ({ body: TRIGGER_RESP })),
-      stdout: line => stdoutLines.push(line),
-      stderr: line => stderrLines.push(line),
+    return h;
+  }
+  it('forwards the supported target URL without a deprecation warning', async () => {
+    const h = await commandHarness('frontend');
+    expect(h.calls.find(call => call.method === 'POST')?.body).toMatchObject({
+      testIds: ['test_xyz'],
+      targetUrl: 'https://staging.example.com',
     });
-    command.option('--output <mode>');
-    await command.parseAsync(
-      [
-        'run',
-        'test_xyz',
-        '--target-url',
-        'https://staging.example.com',
-        '--skip-preflight',
-        '--output',
-        'json',
-      ],
-      { from: 'user' },
-    );
-    expect(JSON.parse(stdoutLines.join(''))).toMatchObject({ runId: 'run_abc' });
-    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
+    expect(h.stderr.join('\n')).not.toContain('--target-url is deprecated');
   });
-
-  it('does not mark a supported target URL as legacy telemetry', async () => {
-    vi.resetModules();
-    const { createTestCommand } = await import('./test.js');
-    const { takeTelemetryExtras } = await import('../lib/telemetry.js');
-    const { credentialsPath } = makeCreds();
-    const command = createTestCommand({
-      credentialsPath,
-      fetchImpl: makeFetch(() => ({ body: TRIGGER_RESP })),
-      stdout: () => {},
-      stderr: () => {},
+  it.each(['backend', 'frontend'] as const)(
+    'applies the supported target override policy for %s',
+    async type => {
+      const h = await commandHarness(type);
+      expect(h.calls.find(call => call.method === 'POST')?.url.pathname).toBe(
+        '/api/cli/v1/projects/project_1/runs',
+      );
+      expect(h.stderr.join('\n').includes('not applied to a single backend run')).toBe(
+        type === 'backend',
+      );
+      expect(
+        (h.calls.find(call => call.method === 'POST')?.body as Record<string, unknown>).targetUrl,
+      ).toBe(type === 'backend' ? undefined : 'https://staging.example.com');
+    },
+  );
+  it('keeps JSON output parseable and retains the confirmed target URL', async () => {
+    const h = await commandHarness('frontend', 'json');
+    expect(JSON.parse(h.stdout.join(''))).toMatchObject({
+      runs: [{ runId: 'exec_abc', targetUrl: 'https://staging.example.com' }],
     });
-    await command.parseAsync(
-      ['run', 'test_xyz', '--target-url', 'https://staging.example.com', '--skip-preflight'],
-      { from: 'user' },
-    );
-    expect(takeTelemetryExtras()).toEqual({});
+    expect(h.stderr.join('\n')).not.toContain('--target-url is deprecated');
   });
-
-  it('create with a target URL has no deprecation warning', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const stderrLines: string[] = [];
-    const command = createTestCommand({
-      stdout: () => undefined,
-      stderr: line => stderrLines.push(line),
-    });
-    await command.parseAsync(
-      ['create', '--plan-template', '--target-url', 'https://preview.example.com'],
-      { from: 'user' },
-    );
-    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
-  });
-
-  it('create-batch with a target URL has no deprecation warning', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const stderrLines: string[] = [];
-    const command = createTestCommand({
-      stdout: () => undefined,
-      stderr: line => stderrLines.push(line),
-    });
-    disableExits(command);
-    await command
-      .parseAsync(['create-batch', '--target-url', 'https://preview.example.com'], { from: 'user' })
-      .catch(() => undefined);
-    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
+  it('does not mark supported target URL use as legacy telemetry', async () => {
+    takeTelemetryExtras();
+    await commandHarness('frontend');
+    expect(takeTelemetryExtras()).not.toHaveProperty('legacyTargetUrl');
   });
 });
 
@@ -491,12 +423,10 @@ describe('supported target URL command behavior', () => {
 // ---------------------------------------------------------------------------
 // The auto-heal field on the fresh-run wire
 //
-// The CLI only ever sends ONE of the field's three states: `false`, for
-// `--no-auto-heal`. Omission is how the server's protected default ("heal, but
-// replay a user-authored body rather than rewriting it") is requested, and an
-// explicit `true` would mean something different and worse — an unconditional
-// heal that re-authors code the user wrote. So both halves matter: the flag has
-// to reach the wire, and its absence has to leave the key OFF entirely.
+// The CLI never sends it: omission is how the server's protected default
+// ("heal, but replay a user-authored body rather than rewriting it") is
+// requested, and an explicit `true` would mean something different and worse —
+// an unconditional heal that re-authors code the user wrote.
 // ---------------------------------------------------------------------------
 describe('runTestRun / runTestRunAll — autoHeal on the wire', () => {
   function captureBody(bodies: Record<string, unknown>[], resp: unknown): typeof globalThis.fetch {
@@ -507,13 +437,7 @@ describe('runTestRun / runTestRunAll — autoHeal on the wire', () => {
     });
   }
 
-  const EMPTY_BATCH = {
-    accepted: [],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  };
+  const EMPTY_BATCH = projectRun({ projectId: 'project_x', total: 0 });
 
   const baseOpts = {
     profile: 'default' as const,
@@ -528,30 +452,19 @@ describe('runTestRun / runTestRunAll — autoHeal on the wire', () => {
     const { credentialsPath } = makeCreds();
     const bodies: Record<string, unknown>[] = [];
     await runTestRun(
-      { ...baseOpts, testId: 'test_xyz' },
+      {
+        ...baseOpts,
+        testId: 'test_xyz',
+        knownTest: { projectId: 'project_1', type: 'frontend' as const },
+      },
       {
         credentialsPath,
-        fetchImpl: captureBody(bodies, TRIGGER_RESP),
+        fetchImpl: captureBody(bodies, projectRun()),
         stdout: () => undefined,
         sleep: instantSleep,
       },
     );
     expect(bodies[0]).not.toHaveProperty('autoHeal');
-  });
-
-  it('sends autoHeal:false for --no-auto-heal', async () => {
-    const { credentialsPath } = makeCreds();
-    const bodies: Record<string, unknown>[] = [];
-    await runTestRun(
-      { ...baseOpts, testId: 'test_xyz', autoHeal: false },
-      {
-        credentialsPath,
-        fetchImpl: captureBody(bodies, TRIGGER_RESP),
-        stdout: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    expect(bodies[0]).toMatchObject({ autoHeal: false });
   });
 
   // `--all --wait` must resolve the server-controlled default identically.
@@ -571,36 +484,12 @@ describe('runTestRun / runTestRunAll — autoHeal on the wire', () => {
     ).catch(() => undefined);
     expect(bodies[0]).not.toHaveProperty('autoHeal');
   });
-
-  it('sends autoHeal:false on the --all batch dispatch for --no-auto-heal', async () => {
-    const { credentialsPath } = makeCreds();
-    const bodies: Record<string, unknown>[] = [];
-    await runTestRunAll(
-      { ...baseOpts, projectId: 'project_x', maxConcurrency: 5, autoHeal: false },
-      {
-        credentialsPath,
-        fetchImpl: captureBody(bodies, EMPTY_BATCH),
-        stdout: () => undefined,
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(() => undefined);
-    expect(bodies[0]).toMatchObject({ autoHeal: false });
-  });
 });
 
 // ---------------------------------------------------------------------------
-// `--no-auto-heal` has to be falsifiable
-//
-// The backend runs `whitelist: true`, so a CLI sending `autoHeal` to a server
-// that predates the field has it silently STRIPPED: the request succeeds, the
-// run heals, and every surface reports success. Before the server echoed its
-// effective decision there was no signal anywhere — which also made the
-// sequencing this PR's own body contemplates (CLI shipping first) a silent
-// no-op rather than a loud one.
+// The server's heal decision comes back with the launch
 // ---------------------------------------------------------------------------
-describe('runTestRun — --no-auto-heal opt-out advisory', () => {
+describe('runTestRun — the autoHeal echo', () => {
   const baseOpts = {
     profile: 'default' as const,
     output: 'json' as const,
@@ -609,348 +498,201 @@ describe('runTestRun — --no-auto-heal opt-out advisory', () => {
     wait: false,
     timeoutSeconds: 60,
     testId: 'test_xyz',
+    knownTest: { projectId: 'project_1', type: 'frontend' as const },
   };
 
-  function run(respExtra: Record<string, unknown>, autoHeal: false | undefined) {
+  function run(respExtra: Record<string, unknown>) {
     const { credentialsPath } = makeCreds();
     const stderr: string[] = [];
     const fetchImpl = makeFetch(url =>
       url.includes('/runs')
-        ? { body: { ...TRIGGER_RESP, ...respExtra } }
+        ? { body: { ...projectRun(), ...respExtra } }
         : { status: 404, body: {} },
     );
-    return runTestRun(
-      { ...baseOpts, ...(autoHeal === false ? { autoHeal } : {}) },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    ).then(() => stderr.join('\n'));
+    return runTestRun(baseOpts, {
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: line => stderr.push(line),
+      sleep: instantSleep,
+    }).then(() => stderr.join('\n'));
   }
 
   // An older backend: the field never comes back at all. The remedy is a
   // different one (upgrade the endpoint), so the message says so.
-  it('warns when the server echoes nothing back', async () => {
-    const err = await run({}, false);
-    expect(err).toContain('[advisory]');
-    expect(err).toContain('does not support it yet');
+  it('rejects a project launch response missing its required autoHeal decision', async () => {
+    await expect(run({ autoHeal: undefined })).rejects.toMatchObject({ code: 'INTERNAL' });
   });
 
-  // A server that knows the option and declined it.
-  it('warns when the server echoes autoHeal:true against an opt-out', async () => {
-    const err = await run({ autoHeal: true }, false);
-    expect(err).toContain('[advisory]');
-    expect(err).toContain('not applied by the server');
-  });
-
-  it('stays silent when the opt-out was honoured', async () => {
-    const err = await run({ autoHeal: false }, false);
-    expect(err).not.toContain('auto-heal');
-  });
-
-  // The advisory is about a DROPPED opt-out, so a caller who never asked for one
-  // must never see it — including against an old backend, where the absent echo
-  // would otherwise look identical to a drop.
-  it('stays silent when no opt-out was requested, even with no echo', async () => {
-    const err = await run({}, undefined);
-    expect(err).not.toContain('[advisory]');
+  it('says nothing about healing, whatever the server decided', async () => {
+    expect(await run({ autoHeal: true })).not.toContain('auto-heal');
+    expect(await run({ autoHeal: false })).not.toContain('auto-heal');
   });
 });
 
 describe('runTestRun — with --wait', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
+  const opts = {
+    profile: 'default',
+    output: 'json' as const,
+    debug: false,
+    testId: 'test_xyz',
+    wait: true,
+    timeoutSeconds: 30,
+  };
+  const line = (testStatus: string) =>
+    resultLine({ resultId: 'run_abc', runId: 'exec_abc', caseKey: 'test_xyz', testStatus });
 
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('polls until passed and returns RunResponse, exit 0 (no throw)', async () => {
-    const { credentialsPath } = makeCreds();
-    let getCount = 0;
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      getCount++;
-      if (getCount < 2) return { body: { ...makePassedRun(), status: 'running' as const } };
-      return { body: makePassedRun() };
+  it('polls until the execution finishes and returns its native results', async () => {
+    let reads = 0;
+    const h = projectHarness({
+      listing: () =>
+        runListing({ status: ++reads < 2 ? 'running' : 'finished', cancelled: false }, [
+          line(reads < 2 ? 'RUNNING' : 'PASSED'),
+        ]),
     });
-    const stdout: string[] = [];
-    const stderrLines: string[] = [];
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdout.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_abc', status: 'passed' });
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.status).toBe('passed');
+    const result = await runTestRun(opts, h.deps);
+    expect(reads).toBe(2);
+    expect(result).toMatchObject({
+      runs: [{ runId: 'exec_abc' }],
+      results: [{ resultId: 'run_abc', runId: 'exec_abc', status: 'passed' }],
+      summary: { total: 1, passed: 1 },
+    });
   });
 
-  it('a --summary-file in a missing directory is refused before the run is triggered', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-single-preflight-'));
-    const calls: Array<{ url: string; method: string }> = [];
-    const fetchImpl = makeFetch((url, init) => {
-      calls.push({ url, method: init?.method ?? 'GET' });
-      return { body: TRIGGER_RESP };
+  it('keeps an unfinished result separate from failures on interrupt', async () => {
+    const shutdown = new ShutdownController();
+    const h = projectHarness({
+      listing: () => runListing({ status: 'running', cancelled: false }, [line('RUNNING')]),
     });
     await expect(
       runTestRun(
+        { ...opts, output: 'text' },
         {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 60,
-          summaryFile: join(dir, 'no-such-subdir', 'summary.json'),
+          ...h.deps,
+          shutdown,
+          sleep: async () => {
+            shutdown.interrupt('SIGINT');
+            throw shutdown.signal.reason;
+          },
         },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
       ),
-    ).rejects.toMatchObject({ exitCode: 5, details: { field: 'summary-file' } });
-    // Read-only target resolution may run first; the run itself is never triggered.
-    expect(calls.filter(c => c.method !== 'GET')).toEqual([]);
-    rmSync(dir, { recursive: true, force: true });
+    ).rejects.toMatchObject({ exitCode: 130 });
+    expect(h.stdout.join('\n')).toContain('0/1 passed, 0 failed, 0 timed out, 1 still running');
   });
 
-  it('wait path — failed status → throws CLIError with exitCode 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: makeFailedRun() };
+  it('refuses a summary file in a missing directory before dispatch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-summary-path-'));
+    const h = projectHarness();
+    try {
+      await expect(
+        runTestRun({ ...opts, summaryFile: join(dir, 'missing', 'summary.json') }, h.deps),
+      ).rejects.toMatchObject({ exitCode: 5, details: { field: 'summary-file' } });
+      expect(h.calls.filter(call => call.method === 'POST')).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['FAILED', 'BLOCKED', 'CANCELLED'])(
+    'keeps terminal %s results red with native result IDs',
+    async status => {
+      const h = projectHarness({
+        listing: () => runListing({ status: 'finished', cancelled: false }, [line(status)]),
+      });
+      await expect(runTestRun(opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
+      expect(JSON.parse(h.stdout.join('')).results).toMatchObject([
+        { resultId: 'run_abc', runId: 'exec_abc', status: status.toLowerCase() },
+      ]);
+      if (status === 'CANCELLED') expect(h.stderr.join('\n')).not.toContain('result get');
+      else expect(h.stderr.join('\n')).toContain('testsprite result get run_abc');
+    },
+  );
+
+  it('refuses a backend without execution metadata instead of polling a result as a run', async () => {
+    const h = projectHarness({ listing: () => ({ results: [line('PASSED')] }) });
+    await expect(runTestRun(opts, h.deps)).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      exitCode: 7,
     });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toBeDefined();
-    expect(err.exitCode).toBe(1);
-    expect(err.name).toBe('CLIError');
+    expect(h.calls.some(call => /\/runs\/run_abc/.test(call.url.pathname))).toBe(false);
   });
 
-  it('network outage outlasting --timeout → exit 10 (UNAVAILABLE) and {runId, status} still on stdout', async () => {
+  it('rejects an older launch shape without inventing an execution identity', async () => {
+    const h = projectHarness({
+      answer: (_url, init) =>
+        init.method === 'POST'
+          ? new Response(JSON.stringify({ resultId: 'old-result', status: 'queued' }), {
+              headers: { 'content-type': 'application/json' },
+            })
+          : undefined,
+    });
+    await expect(runTestRun(opts, h.deps)).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(h.calls.filter(call => call.url.pathname === '/api/cli/v1/results')).toEqual([]);
+    expect(h.stdout.join('')).not.toContain('old-result');
+  });
+
+  it.each(['json', 'text'] as const)(
+    'reports an outage past the deadline honestly in %s output',
+    async output => {
+      vi.useFakeTimers();
+      try {
+        const h = projectHarness({
+          answer: url => {
+            if (url.pathname.endsWith('/results')) throw new TypeError('fetch failed');
+            return undefined;
+          },
+        });
+        const pending = runTestRun({ ...opts, output }, { ...h.deps, sleep: undefined }).catch(
+          err => err,
+        );
+        await vi.advanceTimersByTimeAsync(35_000);
+        const failure = await pending;
+        expect(failure).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+        expect(failure.nextAction).toContain('Service is temporarily unavailable');
+        expect(h.stderr.join('\n')).toContain('testsprite run wait exec_abc');
+        expect(h.stderr.join('\n')).toContain('Run exec_abc');
+        if (output === 'json')
+          expect(JSON.parse(h.stdout.join(''))).toMatchObject({
+            runs: [{ runId: 'exec_abc' }],
+            partial: true,
+          });
+        else expect(h.stdout.join('\n')).toContain('exec_abc');
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('a deadline preserves run IDs and offers whole-run wait/cancel commands', async () => {
     vi.useFakeTimers();
     try {
-      const { credentialsPath } = makeCreds();
-      // The trigger answers; every poll read after it hits a dead network.
-      const fetchImpl = makeFetch(url => {
-        if (url.includes('/runs/run_abc')) throw new TypeError('fetch failed');
-        return { body: TRIGGER_RESP };
+      const h = projectHarness({
+        listing: () => runListing({ status: 'running', cancelled: false }, [line('RUNNING')]),
       });
-      const stdout: string[] = [];
       const pending = runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 30,
-        },
-        { credentialsPath, fetchImpl, stdout: line => stdout.push(line), stderr: () => {} },
-      ).catch((caught: unknown) => caught);
-      await vi.advanceTimersByTimeAsync(60_000);
-
-      expect(await pending).toMatchObject({
-        code: 'UNAVAILABLE',
-        exitCode: 10,
-        details: { runId: 'run_abc', timeoutSeconds: 30 },
-      });
-      expect(JSON.parse(stdout.join(''))).toMatchObject({ runId: 'run_abc', status: 'running' });
+        { ...opts, timeoutSeconds: 1 },
+        { ...h.deps, sleep: undefined },
+      ).catch(err => err);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const failure = await pending;
+      expect(failure).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
+      expect(failure.nextAction).toContain('testsprite run wait exec_abc');
+      expect(h.stderr.join('\n')).toContain('testsprite run wait exec_abc');
+      expect(failure.nextAction).toContain('testsprite run cancel exec_abc');
+      expect(JSON.parse(h.stdout.join('')).results).toMatchObject([
+        { resultId: 'run_abc', runId: 'exec_abc', status: 'timeout' },
+      ]);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('wait timeout → UNSUPPORTED error (exit 7) with nextAction containing run-id', async () => {
-    const { credentialsPath } = makeCreds();
-    let elapsedMs = 0;
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      if (url.endsWith('/tests/test_xyz'))
-        return { body: { type: 'frontend', projectId: 'project_1' } };
-      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-      // The first running poll advances the clock past the deadline.
-      elapsedMs = 2000;
-      return { body: { ...makePassedRun(), status: 'running' as const } };
+  it('JSON output keeps ANSI ticker sequences off stderr', async () => {
+    const h = projectHarness({
+      listing: () => runListing({ status: 'finished', cancelled: false }, [line('PASSED')]),
     });
-
-    // Keep discovery and trigger setup outside the polling deadline advance.
-    const base = Date.now();
-    const realDateNow = Date.now;
-    Date.now = () => base + elapsedMs;
-
-    try {
-      const err = await runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 1,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => {},
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ).catch(e => e);
-      expect(err).toBeInstanceOf(ApiError);
-      expect((err as ApiError).code).toBe('UNSUPPORTED');
-      expect((err as ApiError).exitCode).toBe(7);
-      expect((err as ApiError).nextAction).toContain('test wait');
-    } finally {
-      Date.now = realDateNow;
-    }
-  });
-
-  it('wait path — --output json disables ticker (stderr stays clean)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: makePassedRun() };
-    });
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json', // disables ticker
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    // With --output json, no ticker noise goes to stderr
-    // (artifact hint still goes to stderr if non-passed, but passed = no hint)
-    const hasAnsiEscape = stderrLines.some(l => l.includes('\x1b['));
-    expect(hasAnsiEscape).toBe(false);
-  });
-
-  it('blocked status → CLIError exit 1 with artifact hint on stderr', async () => {
-    const { credentialsPath } = makeCreds();
-    const blockedRun = { ...makePassedRun(), status: 'blocked' as const };
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: blockedRun };
-    });
-    const stderrLines: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-    expect(stderrLines.some(l => l.includes('artifact'))).toBe(true);
-  });
-
-  // B3 — cancelled must NOT emit the artifact hint (no artifacts to download)
-  it('B3 — cancelled status → CLIError exit 1 with NO artifact hint on stderr', async () => {
-    const { credentialsPath } = makeCreds();
-    const cancelledRun = { ...makePassedRun(), status: 'cancelled' as const };
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: cancelledRun };
-    });
-    const stderrLines: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    // Must still exit 1
-    expect(err.exitCode).toBe(1);
-    expect(err.name).toBe('CLIError');
-    // Must NOT emit artifact hint for cancelled (no artifacts were captured)
-    expect(stderrLines.some(l => l.includes('artifact'))).toBe(false);
+    await runTestRun(opts, h.deps);
+    expect(h.stderr.join('\n')).not.toContain('\x1b[');
   });
 });
 
@@ -1093,201 +835,62 @@ describe('runTestRun — error scenarios', () => {
 // ---------------------------------------------------------------------------
 
 describe('runTestRun — dry-run', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  // P3-14: test run --dry-run now emits a TriggerRunResponse shape (same as
-  // a real trigger response) rather than the HTTP-descriptor envelope. This
-  // makes `test run --dry-run --output json` consistent with `test rerun --dry-run`.
-
-  it('dry-run keeps credentialless previews offline and prints TriggerRunResponse shape', async () => {
-    const credentialsPath = join(
-      mkdtempSync(join(tmpdir(), 'run-dry-no-creds-')),
-      'missing-credentials',
-    );
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network');
-    });
+  it('keeps credentialless previews offline and prints the strict project descriptor', async () => {
     const stdout: string[] = [];
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('must remain offline');
+    });
     await runTestRun(
+      { ...heldRunOptions, dryRun: true, wait: false },
       {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
+        credentialsPath: join(mkdtempSync(join(tmpdir(), 'run-dry-no-creds-')), 'missing'),
+        env: {},
+        fetchImpl,
         stdout: line => stdout.push(line),
-        sleep: instantSleep,
+        stderr: () => {},
       },
     );
     expect(fetchImpl).not.toHaveBeenCalled();
-    const response = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    // Dry-run now returns TriggerRunResponse shape (runId, status, enqueuedAt)
-    // rather than the HTTP-descriptor envelope (method, path, body).
-    expect(response.runId).toBeDefined();
-    expect(response.status).toBeDefined();
-  });
-
-  it('dry-run with --target-url: does not throw on valid public URL', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdout: string[] = [];
-    // With the new sample-based dry-run, --target-url is validated (must be
-    // a public URL) but is not reflected in the canned sample response.
-    await expect(
-      runTestRun(
+    expect(JSON.parse(stdout.join(''))).toMatchObject({
+      dryRun: true,
+      requests: [
         {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: true,
-          testId: 'test_xyz',
-          wait: false,
-          timeoutSeconds: 60,
-          targetUrl: 'https://staging.example.com',
+          method: 'POST',
+          path: '/api/cli/v1/projects/%3Cproject-id%3E/runs',
+          body: { testIds: ['test_xyz'], maxConcurrency: 5 },
         },
-        {
-          credentialsPath,
-          fetchImpl: makeFetch(() => ({ body: {} })),
-          stdout: line => stdout.push(line),
-          sleep: instantSleep,
-        },
-      ),
-    ).resolves.toBeDefined();
+      ],
+    });
   });
-
-  it('dry-run with --wait: emits the descriptor envelope with a thenPoll hint (codex #128 P2-A)', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdout: string[] = [];
+  it('includes a valid public --target-url in the preview without dispatching', async () => {
+    const h = projectHarness();
     await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: {} })),
-        stdout: line => stdout.push(line),
-        sleep: instantSleep,
-      },
+      { ...heldRunOptions, dryRun: true, targetUrl: 'https://staging.example.com' },
+      h.deps,
     );
-    const response = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    // With --wait, dry-run falls through to the descriptor envelope so the
-    // requested wait/poll is represented honestly — a queued TriggerRunResponse
-    // sample would hide it. The envelope carries method/path + a thenPoll hint.
-    expect(response.method).toBe('POST');
-    expect(response.path).toBe('/api/cli/v1/tests/test_xyz/runs');
-    expect(response.thenPoll).toBeDefined();
-    // Not the queued-trigger sample shape.
-    expect(response.runId).toBeUndefined();
+    expect(h.calls).toEqual([]);
+    expect(JSON.parse(h.stdout.join(''))).toMatchObject({
+      requests: [{ body: { targetUrl: 'https://staging.example.com' } }],
+    });
   });
-
-  it('dry-run chained (createContext set): merges created-test fields with the run sample (codex #128 P2-A)', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdout: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        createContext: {
-          testId: 'test_xyz',
-          type: 'frontend',
-          codeVersion: 'v1',
-          createdAt: '2026-05-13T00:00:00.000Z',
-        },
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: {} })),
-        stdout: line => stdout.push(line),
-        sleep: instantSleep,
-      },
-    );
-    const response = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    // The merged chain envelope keeps the created-test fields at top level
-    // (these would be dropped if the dry-run sample short-circuited
-    // printRunOrChain) and nests the run sample under `run`.
-    expect(response.testId).toBe('test_xyz');
-    expect(response.codeVersion).toBe('v1');
-    const run = response.run as Record<string, unknown> | undefined;
-    expect(run).toBeDefined();
-    expect(run?.runId).toBeDefined();
+  it('describes whole-run polling when --wait is requested', async () => {
+    const h = projectHarness();
+    await runTestRun({ ...heldRunOptions, dryRun: true }, h.deps);
+    expect(JSON.parse(h.stdout.join(''))).toMatchObject({
+      dryRun: true,
+      thenPoll: '/api/cli/v1/results?run=<run-id>&status=passed,failed,running,blocked,cancelled',
+    });
+    expect(h.calls.every(call => call.method === 'GET')).toBe(true);
   });
-
-  it('dry-run: response has runId and status fields', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdout: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: {} })),
-        stdout: line => stdout.push(line),
-        sleep: instantSleep,
-      },
-    );
-    const response = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(typeof response.runId).toBe('string');
-    expect(typeof response.status).toBe('string');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// runTestRun — target-url with allowed values
-// ---------------------------------------------------------------------------
-
-describe('runTestRun — target-url guard: allowed URLs pass through', () => {
-  it('allows https://example.com (public URL)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: TRIGGER_RESP }));
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://example.com',
-        skipPreflight: true,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
-    );
-    expect(result).toMatchObject({ runId: 'run_abc' });
+  it('does not invent dispatched execution or result IDs', async () => {
+    const h = projectHarness();
+    await runTestRun({ ...heldRunOptions, dryRun: true, wait: false }, h.deps);
+    const output = JSON.parse(h.stdout.join(''));
+    expect(output.runId).toBeUndefined();
+    expect(output.resultId).toBeUndefined();
+    expect(output.requests).toHaveLength(1);
+    expect(output).toMatchObject({ runs: [], results: [] });
+    expect(output).not.toHaveProperty('summary');
   });
 });
 
@@ -1296,185 +899,263 @@ describe('runTestRun — target-url guard: allowed URLs pass through', () => {
 // CONFLICT + --wait auto-resume on currentRunId
 // ---------------------------------------------------------------------------
 
+const heldRunOptions = {
+  profile: 'default',
+  output: 'json' as const,
+  debug: false,
+  testId: 'test_xyz',
+  wait: true,
+  timeoutSeconds: 30,
+};
+function heldRunHarness(
+  config: {
+    card?: Partial<RunResponse>;
+    conflicts?: unknown[];
+    multiple?: boolean;
+    reason?: string;
+    status?: string;
+    cancelled?: boolean;
+    environments?: unknown[];
+    environmentStatus?: number;
+    interruptAt?: 'card' | 'environment' | 'listing';
+    shutdown?: ShutdownController;
+  } = {},
+) {
+  const error = {
+    code: 'CONFLICT',
+    message: config.multiple
+      ? 'A run is already in flight for 2 of the targeted test cases.'
+      : 'Test case test_xyz already has run exec_held in flight.',
+    nextAction:
+      'Another run is already in flight. Poll it with: testsprite run wait exec_held — or wait for it to finish before triggering again. Do not retry immediately; the trigger will keep being refused until the run completes.',
+    requestId: 'req-held',
+    details: {
+      reason: config.reason ?? 'run_in_flight',
+      projectId: 'project_1',
+      currentRunId: 'exec_held',
+      currentResultId: 'result_held',
+      conflicts: config.conflicts ?? [
+        {
+          testId: 'test_xyz',
+          currentRunId: 'exec_held',
+          currentResultId: 'result_held',
+        },
+        ...(config.multiple
+          ? [{ testId: 'test_second', currentRunId: 'exec_held', currentResultId: 'result_second' }]
+          : []),
+      ],
+    },
+  };
+  let launched = false;
+  const answer = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const interrupt = (stage: 'card' | 'environment' | 'listing') => {
+    if (stage === config.interruptAt && config.shutdown) {
+      config.shutdown.interrupt('SIGINT');
+      throw config.shutdown.signal.reason;
+    }
+  };
+  const h = projectHarness({
+    answer: (url, init) => {
+      if (init.method === 'POST') {
+        launched = true;
+        return answer({ error }, 409);
+      }
+      if (url.pathname.endsWith('/tests/test_second'))
+        return answer({ id: 'test_second', type: 'frontend', projectId: 'project_1' });
+      if (url.pathname.endsWith('/runs/result_second'))
+        return answer(
+          resultCard({
+            resultId: 'result_second',
+            runId: 'exec_held',
+            testId: 'test_second',
+            ...config.card,
+          }),
+        );
+      if (url.pathname.endsWith('/runs/result_held')) {
+        interrupt('card');
+        return answer(resultCard({ resultId: 'result_held', runId: 'exec_held', ...config.card }));
+      }
+      if (url.pathname.endsWith('/env')) {
+        if (launched) interrupt('environment');
+        return config.environmentStatus
+          ? answer({ error: { ...error, code: 'AUTH_FORBIDDEN' } }, config.environmentStatus)
+          : answer({
+              environments: config.environments ?? CURRENT_DEFAULT_ENVIRONMENTS.environments,
+            });
+      }
+      return undefined;
+    },
+    listing: () => {
+      interrupt('listing');
+      return runListing(
+        {
+          runId: 'exec_held',
+          status: config.cancelled ? 'finished' : 'running',
+          cancelled: config.cancelled ?? false,
+        },
+        [
+          resultLine({
+            runId: 'exec_held',
+            resultId: 'result_held',
+            caseKey: 'test_xyz',
+            testStatus: config.status ?? 'PASSED',
+          }),
+          ...(config.multiple
+            ? [
+                resultLine({
+                  runId: 'exec_held',
+                  resultId: 'result_second',
+                  caseKey: 'test_second',
+                  testStatus: config.status ?? 'PASSED',
+                }),
+              ]
+            : []),
+          resultLine({
+            runId: 'exec_held',
+            resultId: 'unrelated',
+            caseKey: 'other',
+            testStatus: 'FAILED',
+          }),
+        ],
+      );
+    },
+  });
+  return { ...h, error };
+}
+
+describe('actual all-held project contract', () => {
+  const bulk = { ...heldRunOptions, projectId: 'project_1', maxConcurrency: 2 };
+  it.each([false, true])('joins all-held bulk work without allow-empty (named=%s)', async named => {
+    const h = heldRunHarness({ multiple: named });
+    await runTestRunAll(
+      { ...bulk, ...(named ? { testIds: ['test_xyz', 'test_second'] } : {}) },
+      h.deps,
+    );
+    const output = JSON.parse(h.stdout.join(''));
+    expect(output).toMatchObject({
+      runs: [{ runId: 'exec_held', joined: true }],
+      joinedRuns: [
+        {
+          runId: 'exec_held',
+          resultIds: named ? ['result_held', 'result_second'] : ['result_held'],
+        },
+      ],
+      summary: { passed: named ? 2 : 1, failed: 0 },
+    });
+    expect(h.calls.filter(c => c.method === 'POST')).toHaveLength(1);
+    expect(h.calls.some(c => c.url.pathname.endsWith('/cancel'))).toBe(false);
+    expect(output).not.toHaveProperty('partial');
+  });
+  it('retains a failed joined bulk verdict', async () => {
+    const h = heldRunHarness({ status: 'FAILED' });
+    await expect(runTestRunAll(bulk, h.deps)).rejects.toMatchObject({ exitCode: 1 });
+    expect(JSON.parse(h.stdout.join('')).summary.failed).toBe(1);
+  });
+  it.each([
+    { allowEmpty: false, failOnSkipped: false, exitCode: 5 },
+    { allowEmpty: true, failOnSkipped: false, exitCode: 0 },
+    { allowEmpty: true, failOnSkipped: true, exitCode: 1 },
+  ])(
+    'keeps incompatible-only gates $allowEmpty/$failOnSkipped',
+    async ({ allowEmpty, failOnSkipped, exitCode }) => {
+      const h = heldRunHarness({ card: { projectId: 'other-project' } });
+      const error = await runTestRunAll(
+        { ...bulk, allowEmpty, ci: { executionReport: false, failOnSkipped } },
+        h.deps,
+      ).then(
+        () => undefined,
+        e => e,
+      );
+      expect(error?.exitCode ?? 0).toBe(exitCode);
+      const output = JSON.parse(h.stdout.join(''));
+      expect(output.skipped).toHaveLength(1);
+      expect(output).not.toHaveProperty('joinedRuns');
+      expect(h.calls.some(c => c.url.pathname.endsWith('/results'))).toBe(false);
+    },
+  );
+  it.each([false, true])('keeps truly empty project policy allowEmpty=%s', async allowEmpty => {
+    const h = projectHarness({
+      launch: projectRun({ total: 0 }),
+      listing: () => runListing({ status: 'finished', cancelled: false }, []),
+    });
+    const error = await runTestRunAll({ ...bulk, allowEmpty }, h.deps).then(
+      () => undefined,
+      e => e,
+    );
+    expect(error?.exitCode ?? 0).toBe(allowEmpty ? 0 : 5);
+    expect(JSON.parse(h.stdout.join('')).summary.total).toBe(0);
+  });
+  it('refuses an unrelated top-level conflict without rewriting its envelope', async () => {
+    const h = heldRunHarness({ reason: 'idempotency_body_mismatch' });
+    await expect(runTestRunAll(bulk, h.deps)).rejects.toMatchObject(h.error);
+    expect(h.calls.some(c => c.url.pathname.endsWith('/runs/result_held'))).toBe(false);
+  });
+});
+
 describe('runTestRun — CONFLICT + --wait auto-resume (dogfood round-4)', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('--wait + CONFLICT with currentRunId: auto-resumes polling, no CONFLICT envelope emitted', async () => {
-    // The POST /run returns 409 CONFLICT with currentRunId=run_inflight.
-    // With --wait, the CLI should silently attach to run_inflight's poll
-    // loop rather than surfacing exit 6.
-    const { credentialsPath } = makeCreds();
-    const conflictBody = {
-      error: {
-        code: 'CONFLICT',
-        message: 'Test test_xyz already has run run_inflight in flight.',
-        nextAction: 'Wait for the run to finish.',
-        requestId: 'req_conflict',
-        details: { reason: 'run_in_flight', currentRunId: 'run_inflight' },
-      },
-    };
-    const inflightRun: ReturnType<typeof makePassedRun> = {
-      ...makePassedRun(),
-      runId: 'run_inflight',
-    };
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs')) {
-        return { status: 409, body: conflictBody };
-      }
-      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-      // GET /runs/run_inflight — return terminal
-      return { body: inflightRun };
+  it('joins the native held result in its execution without launching again', async () => {
+    const h = heldRunHarness();
+    const result = await runTestRun(heldRunOptions, h.deps);
+    expect(result).toMatchObject({
+      runs: [{ runId: 'exec_held', joined: true }],
+      joinedRuns: [{ runId: 'exec_held', resultIds: ['result_held'] }],
+      results: [{ resultId: 'result_held', runId: 'exec_held', status: 'passed' }],
     });
-    const stdout: string[] = [];
-    const stderrLines: string[] = [];
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdout.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    // Should resolve successfully — no CONFLICT exit 6
-    expect(result).toMatchObject({ runId: 'run_inflight', status: 'passed' });
-    // Advisory must mention the in-flight runId on stderr
-    expect(stderrLines.some(l => l.includes('run_inflight'))).toBe(true);
-    // Stdout should carry the final run result, not an error envelope
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.runId).toBe('run_inflight');
-    expect(printed.status).toBe('passed');
+    expect(h.calls.filter(call => call.method === 'POST')).toHaveLength(1);
+    expect(h.stderr.join('\n')).toContain('joined');
   });
-
-  it('--wait + CONFLICT without currentRunId: surfaces exit 6 (cannot auto-resume without a target runId)', async () => {
-    const { credentialsPath } = makeCreds();
-    const conflictBodyNoRunId = {
-      error: {
-        code: 'CONFLICT',
-        message: 'Test test_xyz already has a run in flight.',
-        nextAction: 'Wait for the run to finish.',
-        requestId: 'req_conflict2',
-        details: { reason: 'run_in_flight' }, // no currentRunId
-      },
-    };
-    const fetchImpl = makeFetch(() => ({ status: 409, body: conflictBodyNoRunId }));
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('CONFLICT');
-    expect((err as ApiError).exitCode).toBe(6);
-  });
-
-  it('no --wait + CONFLICT: always surfaces exit 6 (auto-resume is wait-only behavior)', async () => {
-    // Without --wait, CONFLICT should always propagate — the caller
-    // explicitly did not ask for polling.
-    const { credentialsPath } = makeCreds();
-    const conflictBody = {
-      error: {
-        code: 'CONFLICT',
-        message: 'Test test_xyz already has run run_existing in flight.',
-        nextAction: 'Check currentRunId.',
-        requestId: 'req_c3',
-        details: { reason: 'run_in_flight', currentRunId: 'run_existing' },
-      },
-    };
-    const fetchImpl = makeFetch(() => ({ status: 409, body: conflictBody }));
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('CONFLICT');
-    expect((err as ApiError).exitCode).toBe(6);
-  });
-
-  it('--wait + CONFLICT auto-resume: polling loop uses the conflict currentRunId, not a stale one', async () => {
-    const { credentialsPath } = makeCreds();
-    const seenGetRunIds: string[] = [];
-    const inflightPassedRun: ReturnType<typeof makePassedRun> = {
-      ...makePassedRun(),
-      runId: 'run_specific_inflight',
-    };
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs')) {
-        return {
-          status: 409,
-          body: {
-            error: {
-              code: 'CONFLICT',
-              message: 'in flight',
-              nextAction: '',
-              requestId: 'r1',
-              details: { reason: 'run_in_flight', currentRunId: 'run_specific_inflight' },
-            },
-          },
-        };
-      }
-      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-      // Extract runId from GET /runs/<runId>
-      const match = /\/runs\/([^?/]+)/.exec(url);
-      if (match?.[1]) seenGetRunIds.push(match[1]);
-      return { body: inflightPassedRun };
+  it.each([
+    {
+      label: 'missing test ID',
+      conflicts: [{ currentRunId: 'exec_held', currentResultId: 'result_held' }],
+    },
+    {
+      label: 'non-string execution ID',
+      conflicts: [{ testId: 'test_xyz', currentRunId: 42, currentResultId: 'result_held' }],
+    },
+    { label: 'null conflict row', conflicts: [null] },
+    {
+      label: 'missing execution ID',
+      conflicts: [{ testId: 'test_xyz', reason: 'in_flight', currentResultId: 'result_held' }],
+    },
+    {
+      label: 'missing result ID',
+      conflicts: [{ testId: 'test_xyz', reason: 'in_flight', currentRunId: 'exec_held' }],
+    },
+    {
+      label: 'unrelated conflict reason',
+      reason: 'idempotency_body_mismatch',
+      conflicts: [
+        {
+          testId: 'test_xyz',
+          reason: 'idempotency_body_mismatch',
+          currentRunId: 'exec_held',
+          currentResultId: 'result_held',
+        },
+      ],
+    },
+  ])('does not join a conflict with $label', async ({ conflicts, reason }) => {
+    const h = heldRunHarness({ conflicts, reason });
+    await expect(runTestRun(heldRunOptions, h.deps)).rejects.toMatchObject({
+      code: 'CONFLICT',
+      exitCode: 6,
     });
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
+    expect(h.calls.some(call => call.url.pathname.endsWith('/results'))).toBe(false);
+  });
+  it('does not join without --wait and preserves the entire server error', async () => {
+    const h = heldRunHarness();
+    await expect(runTestRun({ ...heldRunOptions, wait: false }, h.deps)).rejects.toMatchObject(
+      h.error,
     );
-    // All GET calls must be on run_specific_inflight (not some stale uuid)
-    expect(seenGetRunIds.length).toBeGreaterThan(0);
-    expect(seenGetRunIds.every(id => id === 'run_specific_inflight')).toBe(true);
+    expect(h.calls.some(call => call.url.pathname.endsWith('/runs/result_held'))).toBe(false);
+  });
+  it('uses the conflict execution and result IDs instead of the usual fixture launch IDs', async () => {
+    const h = heldRunHarness();
+    await runTestRun(heldRunOptions, h.deps);
+    const reads = h.calls.filter(call => call.url.pathname.endsWith('/results'));
+    expect(reads.map(call => call.url.searchParams.get('run'))).toEqual(['exec_held']);
+    expect(JSON.parse(h.stdout.join('')).results).toHaveLength(1);
   });
 });
 
@@ -1483,1389 +1164,216 @@ describe('runTestRun — CONFLICT + --wait auto-resume (dogfood round-4)', () =>
 // ---------------------------------------------------------------------------
 
 describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding-3)', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('409 refuses to adopt an in-flight run on a different environment', async () => {
-    const { credentialsPath } = makeCreds();
-    let runReads = 0;
-    const fetchImpl = makeFetch((url, init) => {
-      if (init.method === 'POST') {
-        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_other' });
-      }
-      if (url.endsWith('/projects/project_1/env'))
-        return {
-          body: {
-            environments: [
-              {
-                id: 'env_staging',
-                name: 'staging',
-                url: 'https://staging.example.com',
-                isDefault: false,
-              },
-              { id: 'env_other', name: 'production', url: 'https://example.com', isDefault: true },
-            ],
-          },
-        };
-      if (url.includes('/runs/run_other')) {
-        runReads++;
-        return {
-          body: {
-            ...makePassedRun(),
-            runId: 'run_other',
-            environment: { id: 'env_other', name: 'production' },
-          },
-        };
-      }
-      throw new Error(`unexpected request ${url}`);
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        environment: 'staging',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.message).toContain('run_other');
-    expect(err.message).toContain('does not match the requested environment');
-    expect(err.nextAction).toContain('run_other');
-    expect(runReads).toBe(1);
-  });
-
-  it('409 attaches to an in-flight run without environment information when --env is omitted', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((url, init) =>
-      init.method === 'POST'
-        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
-        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
-    );
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdout.push(line),
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_old', status: 'passed' });
-    expect(JSON.parse(stdout.join(''))).toMatchObject({ runId: 'run_old', status: 'passed' });
-    expect(stderr.some(line => line.includes('[advisory]') && line.includes('run_old'))).toBe(true);
-    // No environment was recorded to name, so the advisory must not invent one.
-    const advisory = stderr.find(line => line.includes('[advisory]'));
-    expect(advisory).toMatch(/then re-trigger\.$/);
-    expect(advisory).not.toContain('--env');
-  });
-
-  it('409 attaches to a failed in-flight run without environment information and preserves its exit code', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) =>
-      init.method === 'POST'
-        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_failed' })
-        : { body: { ...makeFailedRun(), runId: 'run_failed', environment: undefined } },
-    );
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdout.push(line),
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(CLIError);
-    expect(err).toMatchObject({ exitCode: 1 });
-    expect(JSON.parse(stdout.join(''))).toMatchObject({ runId: 'run_failed', status: 'failed' });
-    expect(stderr.some(line => line.includes('[advisory]') && line.includes('run_failed'))).toBe(
-      true,
-    );
-  });
-
-  it('409 fails closed on a null (explicitly unrecorded) environment even when --env is omitted', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) =>
-      init.method === 'POST'
-        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_failed' })
-        : { body: { ...makeFailedRun(), runId: 'run_failed', environment: null } },
-    );
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.message).toContain('its environment could not be verified');
-  });
-
-  it('409 fails closed on a null environment even with an explicit --env', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) =>
-      init.method === 'POST'
-        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_failed' })
-        : { body: { ...makeFailedRun(), runId: 'run_failed', environment: null } },
-    );
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        environment: 'staging',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.message).toContain('its environment could not be verified');
-  });
-
-  it('409 without environment information still rejects a different --target-url', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) =>
-      init.method === 'POST'
-        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
-        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
-    );
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        targetUrl: 'https://other.example.com',
-        skipPreflight: true,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.message).toContain('different target URL');
-    expect(err.nextAction).toContain('run_old');
-  });
-
-  it('409 without environment information and a matching --target-url attaches', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) =>
-      init.method === 'POST'
-        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
-        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
-    );
-    const stderr: string[] = [];
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        targetUrl: 'https://example.com', // matches makePassedRun()'s targetUrl
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_old', status: 'passed' });
-    expect(stderr.some(line => line.includes('[advisory]') && line.includes('run_old'))).toBe(true);
-  });
-
-  it('409 without environment information fails closed when --env is explicit', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) =>
-      init.method === 'POST'
-        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
-        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
-    );
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        environment: 'staging',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.message).toContain('its environment could not be verified');
-  });
-
-  it('409 with no requested name adopts a run on the listed default environment', async () => {
-    const { credentialsPath } = makeCreds();
-    let envReads = 0;
-    const fetchImpl = makeFetch((url, init) => {
-      if (init.method === 'POST') {
-        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_default' });
-      }
-      if (url.endsWith('/projects/project_1/env')) {
-        envReads++;
-        return {
-          body: {
-            environments: [
-              { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
-            ],
-          },
-        };
-      }
-      return {
-        body: {
-          ...makePassedRun(),
-          runId: 'run_default',
-          environment: { id: 'env_default', name: 'default' },
-        },
-      };
-    });
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    );
-    expect(result).toMatchObject({ runId: 'run_default', status: 'passed' });
-    expect(envReads).toBe(2);
-  });
-
-  it('409 adopts a named run only when the current environment id matches', async () => {
-    const { credentialsPath } = makeCreds();
-    let envReads = 0;
-    const fetchImpl = makeFetch((url, init) => {
-      if (init.method === 'POST')
-        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_staging' });
-      if (url.endsWith('/projects/project_1/env')) {
-        envReads++;
-        return {
-          body: {
-            environments: [
-              {
-                id: 'env_staging',
-                name: 'staging',
-                url: 'https://staging.example.com',
-                isDefault: false,
-              },
-            ],
-          },
-        };
-      }
-      return {
-        body: {
-          ...makePassedRun(),
-          runId: 'run_staging',
-          environment: { id: 'env_staging', name: 'staging' },
-        },
-      };
-    });
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        environment: 'staging',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    );
-    expect(result).toMatchObject({ runId: 'run_staging', status: 'passed' });
-    expect(envReads).toBe(2);
-  });
-
   it.each([
-    ['in-flight run', (url: string) => url.includes('/runs/run_staging')],
-    ['environment list', (url: string) => url.endsWith('/projects/project_1/env')],
-  ])('409 keeps an interrupt while reading the %s', async (_label, interruptsOn) => {
-    const { credentialsPath } = makeCreds();
-    const interrupt = new InterruptError('SIGINT');
-    const fetchImpl = makeFetch((url, init) => {
-      if (init.method === 'POST')
-        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_staging' });
-      if (interruptsOn(url)) throw interrupt;
-      if (url.endsWith('/projects/project_1/env')) {
-        return {
-          body: {
-            environments: [
-              {
-                id: 'env_staging',
-                name: 'staging',
-                url: 'https://staging.example.com',
-                isDefault: false,
-              },
-            ],
-          },
-        };
-      }
-      return {
-        body: {
-          ...makePassedRun(),
-          runId: 'run_staging',
-          environment: { id: 'env_staging', name: 'staging' },
-        },
-      };
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        environment: 'staging',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toBe(interrupt);
-  });
-
-  it('409 refuses a run on a deleted environment whose name was reused', async () => {
-    const { credentialsPath } = makeCreds();
-    let runReads = 0;
-    const fetchImpl = makeFetch((url, init) => {
-      if (init.method === 'POST')
-        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' });
-      if (url.endsWith('/projects/project_1/env'))
-        return {
-          body: {
-            environments: [
-              { id: 'env_new', name: 'staging', url: 'https://new.example.com', isDefault: false },
-            ],
-          },
-        };
-      if (url.includes('/runs/run_old')) {
-        runReads++;
-        return {
-          body: {
-            ...makePassedRun(),
-            runId: 'run_old',
-            environment: { id: 'env_deleted', name: 'staging' },
-          },
-        };
-      }
-      throw new Error(`unexpected request ${url}`);
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        environment: 'staging',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.message).toContain('run_old');
-    expect(err.message).toContain('does not match the requested environment');
-    expect(err.nextAction).toContain('run_old');
-    expect(runReads).toBe(1);
-  });
-
-  it('409 refuses an in-flight run on the previous default after the default changed', async () => {
-    const { credentialsPath } = makeCreds();
-    let runReads = 0;
-    const fetchImpl = makeFetch((url, init) => {
-      if (init.method === 'POST')
-        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' });
-      if (url.endsWith('/projects/project_1/env'))
-        return {
-          body: {
-            environments: [
-              { id: 'env_old', name: 'old', url: 'https://old.example.com', isDefault: false },
-              { id: 'env_new', name: 'new', url: 'https://new.example.com', isDefault: true },
-            ],
-          },
-        };
-      if (url.includes('/runs/run_old')) {
-        runReads++;
-        return {
-          body: {
-            ...makePassedRun(),
-            runId: 'run_old',
-            environment: { id: 'env_old', name: 'old', isDefault: true },
-          },
-        };
-      }
-      throw new Error(`unexpected request ${url}`);
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.message).toContain('run_old');
-    expect(err.message).toContain('does not match the requested environment');
-    expect(err.nextAction).toContain('run_old');
-    expect(runReads).toBe(1);
-  });
-
-  it.each([
-    // Either side lacking a usable id, or the listing failing outright, means
-    // the environments could not be COMPARED at all — that is a distinct
-    // reason from a verified, definite mismatch (covered separately below).
+    { label: 'different environment', environment: { id: 'env_other', name: 'other' } },
+    { label: 'missing environment', environment: undefined },
+    { label: 'null environment', environment: null },
+    { label: 'empty environment identity', environment: { id: '', name: 'default' } },
     {
-      label: 'missing run id',
-      runId: null,
-      listStatus: 200,
-      expectedReason: 'its environment could not be verified',
+      label: 'deleted and recreated environment name',
+      environment: { id: 'env_deleted', name: 'default' },
+    },
+  ])('refuses $label without substituting another run verdict', async ({ environment }) => {
+    const h = heldRunHarness({ card: { environment } });
+    await expect(runTestRun(heldRunOptions, h.deps)).rejects.toMatchObject(h.error);
+    expect(h.calls.some(call => call.url.pathname.endsWith('/results'))).toBe(false);
+  });
+  it.each([undefined, null])(
+    'fails closed on environment %s when --env is explicit',
+    async environment => {
+      const h = heldRunHarness({ card: { environment } });
+      await expect(
+        runTestRun({ ...heldRunOptions, environment: 'default' }, h.deps),
+      ).rejects.toMatchObject({ exitCode: 6 });
+    },
+  );
+  it.each([
+    {
+      label: 'default environment changed',
+      environments: [
+        { id: 'env_new', name: 'default', url: 'https://example.com', isDefault: true },
+      ],
     },
     {
-      label: 'missing current id',
-      runId: 'env_default',
-      listStatus: 200,
-      currentId: '',
-      expectedReason: 'its environment could not be verified',
+      label: 'current environment ID missing',
+      environments: [{ id: '', name: 'default', url: 'https://example.com', isDefault: true }],
     },
-    {
-      label: 'failed lookup',
-      runId: 'env_default',
-      listStatus: 403,
-      expectedReason: 'its environment could not be verified',
-    },
-  ])('409 fails closed on $label', async ({ runId, listStatus, currentId, expectedReason }) => {
-    const { credentialsPath } = makeCreds();
-    let runReads = 0;
-    const fetchImpl = makeFetch((url, init) => {
-      if (init.method === 'POST')
-        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_pending' });
-      if (url.endsWith('/projects/project_1/env'))
-        return listStatus === 200
-          ? {
-              body: {
-                environments: [
-                  { id: currentId ?? 'env_default', name: 'default', isDefault: true },
-                ],
-              },
-            }
-          : errorBody('AUTH_FORBIDDEN');
-      if (url.includes('/runs/run_pending')) {
-        runReads++;
-        return {
-          body: {
-            ...makePassedRun(),
-            runId: 'run_pending',
-            environment: { id: runId, name: 'default' },
-          },
-        };
-      }
-      throw new Error(`unexpected request ${url}`);
+    { label: 'environment list empty', environments: [] },
+  ])('fails closed when $label', async ({ environments }) => {
+    const h = heldRunHarness({ environments });
+    await expect(runTestRun(heldRunOptions, h.deps)).rejects.toMatchObject(h.error);
+    expect(h.calls.some(call => call.url.pathname.endsWith('/results'))).toBe(false);
+  });
+  it('preserves an authentication failure during environment verification', async () => {
+    const h = heldRunHarness({ environmentStatus: 403 });
+    await expect(runTestRun(heldRunOptions, h.deps)).rejects.toMatchObject({
+      code: 'AUTH_FORBIDDEN',
+      exitCode: 3,
     });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
-    expect(err.nextAction).toContain('run_pending');
-    expect(err.message).toContain(expectedReason);
-    expect(runReads).toBe(1);
   });
-
-  it('CONFLICT reason=run_in_flight + --target-url matching in-flight run → auto-resume succeeds', async () => {
-    // Arrange: POST → 409 run_in_flight; GET /runs/run_inflight → targetUrl matches
-    const { credentialsPath } = makeCreds();
-    const conflictBody = {
-      error: {
-        code: 'CONFLICT',
-        message: 'Test already has a run in flight.',
-        nextAction: '',
-        requestId: 'req_c10',
-        details: { reason: 'run_in_flight', currentRunId: 'run_inflight_url_match' },
-      },
-    };
-    const inFlightRun: RunResponse = {
-      ...makePassedRun(),
-      runId: 'run_inflight_url_match',
-      targetUrl: 'https://staging.example.com',
-    };
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs')) {
-        return { status: 409, body: conflictBody };
-      }
-      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-      // GET /runs/run_inflight_url_match  (fetch for URL verification + poll)
-      return { body: inFlightRun };
-    });
-    const stderrLines: string[] = [];
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        targetUrl: 'https://staging.example.com', // matches in-flight
-        timeoutSeconds: 60,
-        skipPreflight: true, // this test exercises conflict resolution, not the reachability probe
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_inflight_url_match', status: 'passed' });
-    // Advisory should be emitted and mention the runId
-    expect(stderrLines.some(l => l.includes('run_inflight_url_match'))).toBe(true);
-  });
-
-  it('CONFLICT reason=run_in_flight + --target-url X but in-flight runs against Y → exit 6, no poll', async () => {
-    // Arrange: POST → 409 run_in_flight; GET /runs/run_inflight → different targetUrl
-    const { credentialsPath } = makeCreds();
-    const conflictBody = {
-      error: {
-        code: 'CONFLICT',
-        message: 'Test already has a run in flight.',
-        nextAction: '',
-        requestId: 'req_c11',
-        details: { reason: 'run_in_flight', currentRunId: 'run_inflight_url_mismatch' },
-      },
-    };
-    const inFlightRun: RunResponse = {
-      ...makePassedRun(),
-      runId: 'run_inflight_url_mismatch',
-      targetUrl: 'https://prod.other-team.example.com', // different from requested
-    };
-    const seenGetRunIds: string[] = [];
-    // Track which run IDs the poll loop hits (should be none for this case)
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs')) {
-        return { status: 409, body: conflictBody };
-      }
-      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-      // GET /runs/run_inflight_url_mismatch — for URL verification only
-      const match = /\/runs\/([^?/]+)/.exec(url);
-      if (match?.[1]) seenGetRunIds.push(match[1]);
-      return { body: inFlightRun };
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        targetUrl: 'https://my-staging.example.com', // mismatches in-flight
-        timeoutSeconds: 60,
-        skipPreflight: true, // this test exercises conflict resolution, not the reachability probe
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    // Must exit 6 with a CONFLICT error, not auto-resume
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('CONFLICT');
-    expect((err as ApiError).exitCode).toBe(6);
-    // Message must mention the mismatch
-    expect((err as ApiError).message).toContain('different target URL');
-    expect((err as ApiError).message).toContain('prod.other-team.example.com');
-    // nextAction must point at 'test wait <runId>'
-    expect((err as ApiError).nextAction).toContain('run_inflight_url_mismatch');
-    // The poll loop must NOT have been entered (only the URL-verification GET)
-    // seenGetRunIds has exactly one entry (the verification GET), not multiple polls
-    expect(seenGetRunIds).toHaveLength(1);
-    expect(seenGetRunIds[0]).toBe('run_inflight_url_mismatch');
-  });
-
-  it('CONFLICT reason=idempotency_body_mismatch → exit 6, never auto-resume', async () => {
-    // IDEMPOTENCY_BODY_MISMATCH uses code 'IDEMPOTENCY_BODY_MISMATCH' (409),
-    // and must never trigger auto-resume regardless of --wait.
-    const { credentialsPath } = makeCreds();
-    const mismatchBody = {
-      error: {
-        code: 'IDEMPOTENCY_BODY_MISMATCH',
-        message: 'Idempotency key reused with a different request body.',
-        nextAction: 'Mint a new idempotency key and retry.',
-        requestId: 'req_c12',
-        details: { reason: 'body_hash_mismatch' },
-      },
-    };
-    const fetchImpl = makeFetch(() => ({ status: 409, body: mismatchBody }));
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('IDEMPOTENCY_BODY_MISMATCH');
-    expect((err as ApiError).exitCode).toBe(6);
-  });
-
   it.each([
-    { name: 'staging', url: 'https://default.example.com' },
-    { name: 'local-dev', url: 'http://127.0.0.1:5173' },
-    { name: 'local-http', url: 'http://127.0.0.1:80' },
-    { name: 'local-ipv6', url: 'http://[::1]:5173' },
-    { name: 'local-https', url: 'https://localhost:8443' },
-    { name: 'QA West', url: 'https://qa-west.example.com' },
-    { name: "Owner's QA", url: 'https://owners-qa.example.com' },
-  ])('auto-resume advice uses the resolved $name environment', async ({ name, url }) => {
-    // Finding D (codex round-2): when --target-url is not supplied, the CLI now
-    // fetches GET /runs/{currentRunId} to bind the REAL targetUrl to the
-    // synthesised triggerResponse (instead of ''). The advisory must include the
-    // actual target URL and the cancel hint.
-    const { credentialsPath } = makeCreds();
-    const conflictBody = {
-      error: {
-        code: 'CONFLICT',
-        message: 'Test already has a run in flight.',
-        nextAction: '',
-        requestId: 'req_c13',
-        details: { reason: 'run_in_flight', currentRunId: 'run_default_target' },
-      },
-    };
-    const inFlightRun: RunResponse = {
-      ...makePassedRun(),
-      runId: 'run_default_target',
-      targetUrl: url,
-      environment: { id: 'env_requested', name },
-    };
-    let envReads = 0;
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs')) {
-        return { status: 409, body: conflictBody };
-      }
-      if (url.endsWith('/projects/project_1/env')) {
-        if (++envReads === 1)
-          return {
-            status: 403,
-            body: {
-              error: {
-                code: 'FORBIDDEN',
-                message: 'preflight unavailable',
-                nextAction: 'Retry',
-                requestId: 'r',
-                details: {},
-              },
-            },
-          };
-        return {
-          body: {
-            environments: [
-              { id: 'env_requested', name, url: inFlightRun.targetUrl, isDefault: false },
-            ],
-          },
-        };
-      }
-      return { body: inFlightRun };
+    'staging',
+    'QA West',
+    "Owner's QA",
+    'local-dev',
+    'local-http',
+    'local-ipv6',
+    'local-https',
+  ])('joins the requested %s environment only when its current ID matches', async name => {
+    const h = heldRunHarness({
+      card: { environment: { id: 'env_named', name } },
+      environments: [{ id: 'env_named', name, url: 'https://example.com', isDefault: false }],
     });
-    const stderrLines: string[] = [];
-    const result = await runTestRun(
+    await runTestRun(
       {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
+        ...heldRunOptions,
         environment: name,
-        // No targetUrl supplied
-        timeoutSeconds: 60,
+        targetUrl: 'https://example.com',
+        skipPreflight: true,
       },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
+      h.deps,
     );
-    expect(result).toMatchObject({ runId: 'run_default_target', status: 'passed' });
-    // Advisory must mention the actual target URL (not '') and the cancel hint
-    const advisory = stderrLines.join(' ');
-    expect(advisory).toContain('run_default_target');
-    expect(advisory).toContain(url);
-    expect(advisory).toContain(`testsprite test run test_xyz --env ${quoteEnvironmentName(name)}`);
-    expect(advisory).not.toContain('--local');
-    expect(advisory).not.toContain('--target-url');
+    expect(JSON.parse(h.stdout.join('')).results).toMatchObject([
+      { resultId: 'result_held', status: 'passed' },
+    ]);
   });
-});
-
-// ---------------------------------------------------------------------------
-// Backend testId fallback (dogfood L1888)
-//
-// BE run rows never finalize server-side, so `test run --wait` falls back to
-// the testId-scoped verdict so a passing BE test exits 0 instead of timing out.
-// ---------------------------------------------------------------------------
-
-interface BeResult {
-  testId: string;
-  status: string;
-  startedAt: string | null;
-  finishedAt: string | null;
-  videoUrl: string | null;
-  failureAnalysisUrl: string | null;
-  snapshotId: string;
-  runIdIfAvailable: string | null;
-  codeVersion: string | null;
-  targetUrl: string | null;
-  failedStepIndex: number | null;
-  failureKind: string | null;
-  summary: { passed: number; failed: number; skipped: number };
-}
-
-function makeBeResult(overrides: Partial<BeResult> = {}): BeResult {
-  return {
-    testId: 'test_be',
-    status: 'passed',
-    startedAt: '2026-05-15T10:00:01.000Z',
-    finishedAt: '2026-05-15T10:00:30.000Z',
-    videoUrl: null,
-    failureAnalysisUrl: null,
-    snapshotId: 'snap_1',
-    runIdIfAvailable: 'run_abc',
-    codeVersion: 'v1',
-    targetUrl: 'https://example.com',
-    failedStepIndex: null,
-    failureKind: null,
-    summary: { passed: 1, failed: 0, skipped: 0 },
-    ...overrides,
-  };
-}
-
-function beRunRouter(args: {
-  type?: string;
-  runStatus?: RunResponse['status'];
-  result: () => BeResult;
-}) {
-  const counts = { trigger: 0, type: 0, result: 0, run: 0 };
-  const handler = (url: string) => {
-    if (url.includes('/tests/test_be/runs')) {
-      counts.trigger += 1;
-      return { body: TRIGGER_RESP };
-    }
-    if (url.includes('/tests/test_be/result')) {
-      counts.result += 1;
-      return { body: args.result() };
-    }
-    if (url.includes('/runs/run_abc')) {
-      counts.run += 1;
-      // A realistic BE run row: real correlation metadata (testId === the
-      // triggered test, project/user populated) but stuck non-terminal.
-      return {
-        body: {
-          ...makePassedRun(),
-          testId: 'test_be',
-          projectId: 'project_be',
-          userId: 'user_be',
-          status: args.runStatus ?? 'running',
-          finishedAt: null,
-        },
-      };
-    }
-    if (url.includes('/tests/test_be')) {
-      counts.type += 1;
-      return {
-        body: {
-          id: 'test_be',
-          projectId: 'p1',
-          name: 'BE test',
-          type: args.type ?? 'backend',
-          createdFrom: 'mcp',
-          status: 'running',
-          createdAt: '2026-05-15T10:00:00.000Z',
-          updatedAt: '2026-05-15T10:00:00.000Z',
-        },
-      };
-    }
-    return { status: 404, body: {} };
-  };
-  return { handler, counts };
-}
-
-describe('runTestRun — backend testId fallback (L1888)', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  it('uses the currently listed default when no environment name was requested', async () => {
+    const h = heldRunHarness();
+    await runTestRun(heldRunOptions, h.deps);
+    expect(JSON.parse(h.stdout.join('')).summary).toMatchObject({ total: 1, passed: 1 });
   });
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('passing backend test resolves via testId result (exit 0) + advisory', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beRunRouter({ result: () => makeBeResult({ status: 'passed' }) });
-    const stderr: string[] = [];
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_be',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: l => stderr.push(l),
-        sleep: instantSleep,
-      },
-    );
-    const run = result as RunResponse;
-    expect(run.status).toBe('passed');
-    expect(router.counts.type).toBeGreaterThan(0);
-    expect(router.counts.result).toBeGreaterThan(0);
-    expect(stderr.join(' ')).toContain('test record');
-    // codex round-2: real correlation metadata from the polled run row is
-    // preserved (not fabricated blank).
-    expect(run.runId).toBe('run_abc');
-    expect(run.testId).toBe('test_be');
-    expect(run.projectId).toBe('project_be');
-    expect(run.userId).toBe('user_be');
-  });
-
-  it('failing backend test resolves via fallback (CLIError exit 1) + testId artifact hint', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beRunRouter({
-      result: () =>
-        makeBeResult({
-          status: 'failed',
-          failureKind: 'assertion',
-          failedStepIndex: 1,
-          summary: { passed: 0, failed: 1, skipped: 0 },
-        }),
-    });
-    const stderr: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_be',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: l => stderr.push(l),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-    expect(err.name).toBe('CLIError');
-    expect(stderr.join(' ')).toContain('test failure get test_be');
-  });
-
-  it('terminal frontend run resolves without backend result fallback', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beRunRouter({
-      type: 'frontend',
-      runStatus: 'passed',
-      result: () => makeBeResult(),
-    });
-    // run row reports terminal on the first poll → fallback never engaged.
-    const handler = (url: string) => {
-      if (url.includes('/tests/test_be/runs')) return { body: TRIGGER_RESP };
-      if (url.includes('/runs/run_abc')) return { body: makePassedRun() };
-      if (url.includes('/tests/test_be/result')) {
-        router.counts.result += 1;
-        return { body: makeBeResult() };
-      }
-      if (url.includes('/tests/test_be')) {
-        router.counts.type += 1;
-        return { body: { id: 'test_be', type: 'frontend' } };
-      }
-      return { status: 404, body: {} };
-    };
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_be',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(handler),
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect((result as RunResponse).status).toBe('passed');
-    expect(router.counts.type).toBe(1);
-    expect(router.counts.result).toBe(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// C2 — BE steps text renders as n/a (backend)
-// ---------------------------------------------------------------------------
-
-describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
-  it('renders "steps: n/a (backend)" when the BE fallback resolved the run', async () => {
-    // Simulates a backend test where:
-    //  - the run row stays non-terminal (orphaned, dogfood L1888)
-    //  - the testId result row becomes terminal → fallback fires
-    const { credentialsPath } = makeCreds();
-    const beResult = {
-      testId: 'test_be_c2',
-      status: 'passed',
-      startedAt: '2026-05-15T10:00:01.000Z',
-      finishedAt: '2026-05-15T10:00:10.000Z',
-      videoUrl: null,
-      failureAnalysisUrl: null,
-      snapshotId: 'snap_c2',
-      runIdIfAvailable: 'run_c2',
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
-      failedStepIndex: null,
-      failureKind: null,
-      summary: { passed: 1, failed: 0, skipped: 0 },
-    };
-    const handler = (url: string) => {
-      if (url.includes('/tests/test_be_c2/runs')) {
-        return {
-          body: {
-            runId: 'run_c2',
-            status: 'queued',
-            enqueuedAt: '2026-05-15T10:00:00.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://example.com',
-          },
-        };
-      }
-      if (url.includes('/runs/run_c2')) {
-        // Return non-terminal so the fallback reads the result instead
-        return {
-          body: {
-            runId: 'run_c2',
-            testId: 'test_be_c2',
-            projectId: 'p1',
-            userId: 'u1',
-            status: 'queued',
-            source: 'cli',
-            createdAt: '2026-05-15T10:00:00.000Z',
-            startedAt: null,
-            finishedAt: null,
-            codeVersion: 'v1',
-            targetUrl: 'https://example.com',
-            createdFrom: null,
-            failedStepIndex: null,
-            failureKind: null,
-            videoUrl: null,
-            stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
-          },
-        };
-      }
-      if (url.includes('/tests/test_be_c2/result')) {
-        // Return terminal result so fallback resolves
-        return { body: beResult };
-      }
-      if (url.includes('/tests/test_be_c2')) {
-        return { body: { id: 'test_be_c2', type: 'backend' } };
-      }
-      return { status: 404, body: {} };
-    };
-    const stdoutLines: string[] = [];
+  it.each(['https://other.example.com', null])(
+    'rejects a held target %s that does not match the override',
+    async targetUrl => {
+      const h = heldRunHarness({ card: { targetUrl } });
+      await expect(
+        runTestRun(
+          { ...heldRunOptions, targetUrl: 'https://example.com', skipPreflight: true },
+          h.deps,
+        ),
+      ).rejects.toMatchObject(h.error);
+      expect(h.calls.some(call => call.url.pathname.endsWith('/results'))).toBe(false);
+    },
+  );
+  it('joins a held target matching the override', async () => {
+    const h = heldRunHarness();
     await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_be_c2',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(handler),
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
+      { ...heldRunOptions, targetUrl: 'https://example.com', skipPreflight: true },
+      h.deps,
     );
-    const out = stdoutLines.join('\n');
-    // BE fallback used → steps line should be n/a (backend)
-    expect(out).toContain('steps       n/a (backend)');
-    // Must NOT show confusing "0/0 (passed=0, failed=0)"
-    expect(out).not.toContain('0/0');
+    expect(JSON.parse(h.stdout.join('')).summary.passed).toBe(1);
   });
-
-  it('FE terminal run row still renders real step counts', async () => {
-    const { credentialsPath } = makeCreds();
-    const feRun: RunResponse = {
-      runId: 'run_fe_c2',
-      testId: 'test_fe_c2',
-      projectId: 'p1',
-      userId: 'u1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-05-15T10:00:00.000Z',
-      startedAt: '2026-05-15T10:00:01.000Z',
-      finishedAt: '2026-05-15T10:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
-      createdFrom: null,
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 3, completed: 3, passedCount: 3, failedCount: 0 },
-    };
-    const handler = (url: string) => {
-      if (url.includes('/tests/test_fe_c2/runs')) {
-        return {
-          body: {
-            runId: 'run_fe_c2',
-            status: 'queued',
-            enqueuedAt: '2026-05-15T10:00:00.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://example.com',
-          },
-        };
-      }
-      if (url.includes('/runs/run_fe_c2')) return { body: feRun };
-      return { status: 404, body: {} };
-    };
-    const stdoutLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_fe_c2',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(handler),
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    const out = stdoutLines.join('\n');
-    // FE run: real step counts rendered
-    expect(out).toContain('steps       3/3 (passed=3, failed=0)');
-    // Not the backend placeholder
-    expect(out).not.toContain('n/a (backend)');
+  it('preserves a held failure verdict while excluding unrelated results', async () => {
+    const h = heldRunHarness({ status: 'FAILED' });
+    await expect(runTestRun(heldRunOptions, h.deps)).rejects.toMatchObject({ exitCode: 1 });
+    expect(JSON.parse(h.stdout.join('')).results).toHaveLength(1);
   });
-
-  it('FE run with an all-zero stepSummary renders n/a, not 0/0 (#335)', async () => {
-    // A passing frontend run whose summary comes back zeroed. Rendering it
-    // verbatim prints `steps 0/0 (passed=0, failed=0)` beside `status passed`,
-    // which reads as "nothing executed, and it passed" — the same no-op wording
-    // the backend branch already guards against. The zeros are not a breakdown
-    // of zero steps; they are an absent breakdown.
-    const { credentialsPath } = makeCreds();
-    const feRun: RunResponse = {
-      runId: 'run_fe_zero',
-      testId: 'test_fe_zero',
-      projectId: 'p1',
-      userId: 'u1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-05-15T10:00:00.000Z',
-      startedAt: '2026-05-15T10:00:01.000Z',
-      finishedAt: '2026-05-15T10:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
-      createdFrom: null,
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
-    };
-    const handler = (url: string) => {
-      if (url.includes('/tests/test_fe_zero/runs')) {
-        return {
-          body: {
-            runId: 'run_fe_zero',
-            status: 'queued',
-            enqueuedAt: '2026-05-15T10:00:00.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://example.com',
-          },
-        };
-      }
-      if (url.includes('/runs/run_fe_zero')) return { body: feRun };
-      return { status: 404, body: {} };
-    };
-    const stdoutLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_fe_zero',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(handler),
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    const out = stdoutLines.join('\n');
-    expect(out).toContain('steps       n/a (no per-step breakdown reported)');
-    // The string the backend branch exists to avoid must not appear here either.
-    expect(out).not.toContain('0/0');
-    // It is a frontend run, so it must not claim to be a backend one.
-    expect(out).not.toContain('n/a (backend)');
+  it('scopes a joined wait to its held result even if the execution was cancelled', async () => {
+    const h = heldRunHarness({ cancelled: true });
+    await runTestRun(heldRunOptions, h.deps);
+    expect(JSON.parse(h.stdout.join('')).summary).toMatchObject({ total: 1, passed: 1 });
   });
-
-  it('BE run terminal on first poll (opts.type=backend) renders steps: n/a via type hint (Fix 2)', async () => {
-    // Simulates a fast backend run that is already terminal on the FIRST poll,
-    // so `beFallbackUsed` is false (resolveAlternate is never called).
-    // The only BE signal is `opts.type === 'backend'` from the create-chain.
-    const { credentialsPath } = makeCreds();
-    const passedBeRun: RunResponse = {
-      runId: 'run_fast_be',
-      testId: 'test_fast_be',
-      projectId: 'p1',
-      userId: 'u1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-05-15T10:00:00.000Z',
-      startedAt: '2026-05-15T10:00:01.000Z',
-      finishedAt: '2026-05-15T10:00:02.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
-      createdFrom: null,
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      // RunResponse has no per-step breakdown for BE runs; backend may send zeros.
-      stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
-    };
-    const handler = (url: string) => {
-      if (url.includes('/tests/test_fast_be/runs')) {
-        return {
-          body: {
-            runId: 'run_fast_be',
-            status: 'queued',
-            enqueuedAt: '2026-05-15T10:00:00.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://example.com',
-          },
-        };
-      }
-      // Run row is terminal on first GET — resolveAlternate never fires.
-      if (url.includes('/runs/run_fast_be')) return { body: passedBeRun };
-      return { status: 404, body: {} };
-    };
-    const stdoutLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_fast_be',
-        // type hint supplied by the create-chain (or the caller when type is known)
-        type: 'backend',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(handler),
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    const out = stdoutLines.join('\n');
-    // Fast BE: type hint → n/a (backend) even though beFallbackUsed is false
-    expect(out).toContain('steps       n/a (backend)');
-    expect(out).not.toContain('0/0');
-  });
-
-  it('standalone backend run renders n/a in text and preserves the JSON step summary', async () => {
-    // Standalone `test run <id>` supplies NO type hint, and the run row is
-    // terminal on the first poll (BE rows finalize server-side now), so
-    // `beFallbackUsed` stays false. In TEXT mode the card must still read
-    // `n/a (backend)`, resolved via a one-time `GET /tests/{id}` probe; in JSON
-    // mode the output is already correct and must NOT pay for that round-trip.
-    const { credentialsPath } = makeCreds();
-    const passedBeRun: RunResponse = {
-      runId: 'run_282',
-      testId: 'be_282',
-      projectId: 'p1',
-      userId: 'u1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-05-15T10:00:00.000Z',
-      startedAt: '2026-05-15T10:00:01.000Z',
-      finishedAt: '2026-05-15T10:00:02.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
-      createdFrom: null,
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
-    };
-    const makeHandler = (urls: string[]) => (url: string) => {
-      urls.push(url);
-      if (url.includes('/tests/be_282/runs')) {
-        return {
-          body: {
-            runId: 'run_282',
-            status: 'queued',
-            enqueuedAt: '2026-05-15T10:00:00.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://example.com',
-          },
-        };
-      }
-      if (url.includes('/runs/run_282')) return { body: passedBeRun };
-      // Bare type probe: GET /tests/be_282 (no /runs, no /result suffix).
-      if (/\/tests\/be_282$/.test(url)) return { body: { id: 'be_282', type: 'backend' } };
-      return { status: 404, body: {} };
-    };
-    const runOnce = async (output: 'text' | 'json') => {
-      const urls: string[] = [];
-      const stdoutLines: string[] = [];
-      await runTestRun(
-        {
-          profile: 'default',
-          output,
-          debug: false,
-          dryRun: false,
-          testId: 'be_282',
-          wait: true,
-          timeoutSeconds: 60,
-        },
-        {
-          credentialsPath,
-          fetchImpl: makeFetch(makeHandler(urls)),
-          stdout: line => stdoutLines.push(line),
-          stderr: () => {},
-          sleep: instantSleep,
-        },
+  it.each(['card', 'environment'] as const)(
+    'preserves interrupt during the held %s read',
+    async interruptAt => {
+      const shutdown = new ShutdownController();
+      const h = heldRunHarness({ interruptAt, shutdown });
+      await expect(runTestRun(heldRunOptions, { ...h.deps, shutdown })).rejects.toBeInstanceOf(
+        InterruptError,
       );
-      return { urls, out: stdoutLines.join('\n') };
-    };
+      expect(h.calls.some(call => call.url.pathname.endsWith('/cancel'))).toBe(false);
+    },
+  );
+  it('an interrupted joined wait warns that whole-run cancellation stops borrowed work', async () => {
+    const shutdown = new ShutdownController();
+    const h = heldRunHarness({ interruptAt: 'listing', shutdown });
+    const error = await runTestRun(heldRunOptions, { ...h.deps, shutdown }).catch(err => err);
+    expect(error).toBeInstanceOf(InterruptError);
+    expect(buildInterruptEnvelope(error).error.nextAction).toContain('joined');
+    expect(h.calls.some(call => call.url.pathname.endsWith('/cancel'))).toBe(false);
+  });
+  it('an interrupted owned wait offers plain whole-run commands', async () => {
+    const shutdown = new ShutdownController();
+    const h = projectHarness({
+      listing: () => {
+        shutdown.interrupt('SIGINT');
+        throw shutdown.signal.reason;
+      },
+    });
+    const error = await runTestRun(heldRunOptions, { ...h.deps, shutdown }).catch(err => err);
+    const hint = buildInterruptEnvelope(error).error.nextAction;
+    expect(hint).toContain('testsprite run wait exec_abc');
+    expect(hint).not.toContain('joined');
+  });
+});
 
-    // Text mode: probes the type and renders the honest backend placeholder.
-    const text = await runOnce('text');
-    expect(text.out).toContain('steps       n/a (backend)');
-    expect(text.out).not.toContain('0/0');
-    expect(text.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(true);
-
-    // JSON mode performs discovery, then ships the wire stepSummary verbatim.
-    const json = await runOnce('json');
-    expect(json.urls.filter(u => /\/tests\/be_282$/.test(u))).toHaveLength(1);
-    const parsed = JSON.parse(json.out);
-    expect(parsed.status).toBe('passed');
-    expect(parsed.stepSummary).toEqual({ total: 0, completed: 0, passedCount: 0, failedCount: 0 });
+describe('runTestRun — backend runs resolve from their own execution listing', () => {
+  const options = {
+    profile: 'default',
+    output: 'json' as const,
+    debug: false,
+    testId: 'test_xyz',
+    wait: true,
+    timeoutSeconds: 1,
+  };
+  it.each(['backend', 'frontend'] as const)(
+    'a passing %s execution never reads the latest test result',
+    async type => {
+      const h = projectHarness({
+        answer: url =>
+          url.pathname.endsWith('/tests/test_xyz')
+            ? new Response(JSON.stringify({ id: 'test_xyz', projectId: 'project_1', type }))
+            : undefined,
+        listing: () =>
+          runListing({ status: 'finished', cancelled: false }, [
+            resultLine({
+              runId: 'exec_abc',
+              resultId: 'result_current',
+              caseKey: 'test_xyz',
+              testStatus: 'PASSED',
+            }),
+          ]),
+      });
+      const result = await runTestRun(options, h.deps);
+      expect(result.results).toMatchObject([
+        { resultId: 'result_current', runId: 'exec_abc', status: 'passed' },
+      ]);
+      expect(h.calls.some(call => call.url.pathname.endsWith('/result'))).toBe(false);
+    },
+  );
+  it('an execution that never finalizes times out instead of borrowing a latest test verdict', async () => {
+    let now = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const h = projectHarness({
+      listing: () => {
+        now += 1000;
+        return runListing({ status: 'running', cancelled: false }, [
+          resultLine({
+            runId: 'exec_abc',
+            resultId: 'result_current',
+            caseKey: 'test_xyz',
+            testStatus: 'PASSED',
+          }),
+        ]);
+      },
+    });
+    await expect(runTestRun(options, h.deps)).rejects.toMatchObject({ exitCode: 7 });
+    expect(h.calls.some(call => call.url.pathname.endsWith('/result'))).toBe(false);
+  });
+  it('a failed execution result exits 1 without reading the latest test verdict', async () => {
+    const h = projectHarness({
+      listing: () =>
+        runListing({ status: 'finished', cancelled: false }, [
+          resultLine({
+            runId: 'exec_abc',
+            resultId: 'result_current',
+            caseKey: 'test_xyz',
+            testStatus: 'FAILED',
+          }),
+        ]),
+    });
+    await expect(runTestRun(options, h.deps)).rejects.toMatchObject({ exitCode: 1 });
+    expect(h.calls.some(call => call.url.pathname.endsWith('/result'))).toBe(false);
   });
 });
 
@@ -2874,5872 +1382,69 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Fix 3 — test run idempotency-key emitted under --verbose (was --debug only)
+// Fix 3 — run idempotency-key emitted under --verbose (was --debug only)
 // ---------------------------------------------------------------------------
 
-describe('Fix 3 — test run idempotency-key emission', () => {
-  it('does NOT emit idempotency-key by default (text mode, no --verbose/--debug)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: TRIGGER_RESP }));
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_idem',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.startsWith('idempotency-key:'))).toBe(false);
-  });
-
-  it('emits idempotency-key under --verbose', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: TRIGGER_RESP }));
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        verbose: true,
-        dryRun: false,
-        testId: 'test_idem',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.startsWith('idempotency-key:'))).toBe(true);
-  });
-
-  it('emits idempotency-key in JSON output mode (Fix 1: JSON-mode regression)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: TRIGGER_RESP }));
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_idem',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    // JSON mode: idempotency-key must still appear on stderr (stderr is never
-    // the JSON stream; suppressing it was a silent regression).
-    expect(stderrLines.some(l => l.startsWith('idempotency-key:'))).toBe(true);
-  });
-});
-
-describe('C3 — requestId trailer gated behind --verbose', () => {
-  it('does NOT emit requestId to stderr by default (no-wait path)', async () => {
-    const { credentialsPath } = makeCreds();
-    // Inject a request-id header in the response so the CLI can surface it.
-    const fetchImpl: typeof globalThis.fetch = async () =>
-      new Response(
-        JSON.stringify({
-          runId: 'run_c3',
-          status: 'queued',
-          enqueuedAt: '2026-05-15T10:00:00.000Z',
-          codeVersion: 'v1',
-          targetUrl: 'https://example.com',
-        }),
-        {
-          status: 200,
-          headers: { 'content-type': 'application/json', 'x-request-id': 'req_c3_hidden' },
-        },
-      );
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_c3',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.startsWith('requestId:'))).toBe(false);
-  });
-
-  it('emits requestId to stderr under --verbose (no-wait path)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl: typeof globalThis.fetch = async () =>
-      new Response(
-        JSON.stringify({
-          runId: 'run_c3',
-          status: 'queued',
-          enqueuedAt: '2026-05-15T10:00:00.000Z',
-          codeVersion: 'v1',
-          targetUrl: 'https://example.com',
-        }),
-        {
-          status: 200,
-          headers: { 'content-type': 'application/json', 'x-request-id': 'req_c3_visible' },
-        },
-      );
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        verbose: true,
-        dryRun: false,
-        testId: 'test_c3',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.startsWith('requestId:'))).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Fix 3 — D4: RequestTimeoutError under --wait emits partial stdout + exit 7
-// ---------------------------------------------------------------------------
-
-describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON to stdout', () => {
-  it('exit 7 AND stdout contains {runId, status:"running"} when poll throws RequestTimeoutError', async () => {
-    const { credentialsPath } = makeCreds();
-    let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      callCount += 1;
-      if (callCount === 1) {
-        // Trigger succeeds
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      // Polling call throws RequestTimeoutError (simulates per-request timeout)
-      throw new RequestTimeoutError(120000, 'req_timeout_test');
-    };
-
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    await expect(
-      runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          verbose: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 600,
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as FetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: line => stderrLines.push(line),
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-
-    // Stdout must contain the partial object with runId + status:"running"
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-      runId: string;
-      status: string;
-      targetUrl: string;
-    };
-    expect(stdoutJson.runId).toBe(TRIGGER_RESP.runId);
-    expect(stdoutJson.status).toBe('running');
-    expect(stdoutJson.targetUrl).toBe(TRIGGER_RESP.targetUrl);
-
-    // Stderr should mention the runId and suggest test wait
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toContain(TRIGGER_RESP.runId);
-    expect(stderrBlock).toContain('test wait');
-    // Detach-message honesty: a client-side request timeout is still
-    // executing (and billing) server-side, same as every other detach path.
-    expect(stderrBlock).toContain('(and billing)');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// TimeoutError on --wait: partial stdout + exit 7
-// ---------------------------------------------------------------------------
-
-describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => {
-  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
-    const { credentialsPath } = makeCreds();
-    let elapsedMs = 0;
-    let fetchCallCount = 0;
-    const base = Date.now();
-    const realDateNow = Date.now;
-    Date.now = () => base + elapsedMs;
-
-    try {
-      const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-        const discovery = ordinaryRunDiscoveryResponse(input, init);
-        if (discovery) return discovery;
-        ++fetchCallCount;
-        if (fetchCallCount === 1) {
-          return new Response(JSON.stringify(TRIGGER_RESP), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
-        }
-        elapsedMs = 2000;
-        const runningRun: RunResponse = { ...makePassedRun(), status: 'running' };
-        return new Response(JSON.stringify(runningRun), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      };
-
-      const stdoutLines: string[] = [];
-      const stderrLines: string[] = [];
-
-      await expect(
-        runTestRun(
-          {
-            profile: 'default',
-            output: 'json',
-            debug: false,
-            verbose: false,
-            dryRun: false,
-            testId: 'test_xyz',
-            wait: true,
-            timeoutSeconds: 1,
-          },
-          {
-            credentialsPath,
-            fetchImpl: fetchImpl as unknown as FetchImpl,
-            stdout: line => stdoutLines.push(line),
-            stderr: line => stderrLines.push(line),
-            sleep: instantSleep,
-          },
-        ),
-      ).rejects.toMatchObject({
-        exitCode: 7,
-        // Detach-message honesty: a plain --timeout expiry is the most
-        // common of the four detach reasons in practice, and its thrown
-        // error message must say the run is still executing (and billing)
-        // server-side, same as the other three detach paths.
-        message: expect.stringContaining('(and billing)'),
-      });
-
-      const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-        runId: string;
-        status: string;
-        targetUrl: string;
-      };
-      expect(stdoutJson.runId).toBe(TRIGGER_RESP.runId);
-      expect(stdoutJson.status).toBe('running');
-      expect(stdoutJson.targetUrl).toBe(TRIGGER_RESP.targetUrl);
-    } finally {
-      Date.now = realDateNow;
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Fix 5 — B2(c): --timeout hint fires on default, not on explicit timeout
-// ---------------------------------------------------------------------------
-
-describe('runTestRun --wait: Fix 5 — first-run timeout hint', () => {
-  function makeTriggerThenPassedFetch(): typeof globalThis.fetch {
-    let callCount = 0;
-    return (async (input, init) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      callCount += 1;
-      if (callCount === 1) {
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      return new Response(JSON.stringify(makePassedRun()), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }) as typeof globalThis.fetch;
-  }
-
-  it('emits the hint to stderr when timeoutIsDefault is true and output=text', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 600,
-        timeoutIsDefault: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeTriggerThenPassedFetch() as unknown as FetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('[hint]') && l.includes('--timeout'))).toBe(true);
-  });
-
-  it('does NOT emit the hint when timeoutIsDefault is false (explicit --timeout)', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 600,
-        timeoutIsDefault: false,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeTriggerThenPassedFetch() as unknown as FetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('[hint]') && l.includes('--timeout'))).toBe(false);
-  });
-
-  it('does NOT emit the hint in json output mode', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 600,
-        timeoutIsDefault: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeTriggerThenPassedFetch() as unknown as FetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('[hint]') && l.includes('--timeout'))).toBe(false);
-  });
-});
-
-// Note: Finding B (advisory dup-name lookup short deadline) tests live in
-// test.test.ts which has the makeFetch + runCreate helpers needed for
-// lightweight code-file-based create tests without OOM-prone AbortController
-// race setups.
-
-// ---------------------------------------------------------------------------
-// Finding C (codex round-2) — timeout partial routes through renderer
-// ---------------------------------------------------------------------------
-
-describe('[finding-C] runTestRun --wait RequestTimeoutError — text mode renders human-readable', () => {
-  it('text mode: stdout contains runId label line (not raw JSON) on RequestTimeoutError', async () => {
-    const { credentialsPath } = makeCreds();
-    let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      callCount++;
-      if (callCount === 1) {
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      throw new RequestTimeoutError(120000, 'req_c_test');
-    };
-
-    const stdoutLines: string[] = [];
-
-    await expect(
-      runTestRun(
-        {
-          profile: 'default',
-          output: 'text', // TEXT MODE — the fix ensures this renders readable
-          debug: false,
-          verbose: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 600,
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as FetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-
-    const stdoutBlock = stdoutLines.join('\n');
-    // Must contain the human-readable label (not '{"runId":')
-    expect(stdoutBlock).toContain('runId');
-    expect(stdoutBlock).toContain('running');
-    expect(stdoutBlock).not.toMatch(/^\{/); // not a raw JSON object at the start
-  });
-
-  it('json mode: stdout has merged create-chain envelope when createContext supplied', async () => {
-    const { credentialsPath } = makeCreds();
-    let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      callCount++;
-      if (callCount === 1) {
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      throw new RequestTimeoutError(120000, 'req_c_chain_test');
-    };
-
-    const stdoutLines: string[] = [];
-    const createContext = {
-      testId: 'test_c_chain',
-      codeVersion: 'v1',
-      createdAt: '2026-06-07T00:00:00.000Z',
-      projectId: 'project_abc',
-      type: 'frontend' as const,
-      name: 'Chain Test',
-    };
-
-    await expect(
-      runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          verbose: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 600,
-          createContext,
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as FetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-      testId: string;
-      run: { runId: string; status: string };
-    };
-    // Merged envelope: create context + run partial
-    expect(stdoutJson.testId).toBe('test_c_chain');
-    expect(stdoutJson.run.runId).toBe(TRIGGER_RESP.runId);
-    expect(stdoutJson.run.status).toBe('running');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// RATE_LIMITED during --wait polling — partial stdout + honest hint, exit 11
-// kept (never reclassified to 7). Mirrors the RequestTimeoutError coverage
-// above; the 429 must be returned as a real HTTP response (not thrown
-// directly) so it exercises http.ts's own RATE_LIMITED retry-then-throw path.
-// ---------------------------------------------------------------------------
-
-function rateLimitedResponse(retryAfterSeconds?: number): Response {
-  return new Response(
-    JSON.stringify({
-      error: {
-        code: 'RATE_LIMITED',
-        message: 'Run trigger rate limit exceeded: too many requests from this IP.',
-        nextAction: '',
-        requestId: 'req_rl_test',
-        details: {},
-      },
-    }),
-    {
-      status: 429,
-      headers: {
-        'content-type': 'application/json',
-        ...(retryAfterSeconds !== undefined ? { 'retry-after': String(retryAfterSeconds) } : {}),
-      },
-    },
-  );
-}
-
-describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps exit 11', () => {
-  it('exit 11 (NOT reclassified to 7) AND stdout contains {runId, status:"running"} when poll exhausts RATE_LIMITED retries', async () => {
-    const { credentialsPath } = makeCreds();
-    let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      callCount += 1;
-      if (callCount === 1) {
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      // retry-after: 0 keeps http.ts's internal retry-then-throw budget fast.
-      return rateLimitedResponse(0);
-    };
-
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('RATE_LIMITED');
-    expect((err as ApiError).exitCode).toBe(11);
-
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-      runId: string;
-      status: string;
-      targetUrl: string;
-    };
-    expect(stdoutJson.runId).toBe(TRIGGER_RESP.runId);
-    expect(stdoutJson.status).toBe('running');
-    expect(stdoutJson.targetUrl).toBe(TRIGGER_RESP.targetUrl);
-
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toContain(TRIGGER_RESP.runId);
-    expect(stderrBlock).toContain('test wait');
-    expect(stderrBlock).toContain('test cancel');
-    expect(stderrBlock).toContain('Rate limited');
-  });
-
-  it('text mode: renders human-readable partial (not raw JSON), still exit 11', async () => {
-    const { credentialsPath } = makeCreds();
-    let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      callCount += 1;
-      if (callCount === 1) {
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      return rateLimitedResponse(0);
-    };
-
-    const stdoutLines: string[] = [];
-
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-
-    expect((err as ApiError).exitCode).toBe(11);
-    const stdoutBlock = stdoutLines.join('\n');
-    expect(stdoutBlock).toContain('runId');
-    expect(stdoutBlock).toContain('running');
-    expect(stdoutBlock).not.toMatch(/^\{/);
-  });
-
-  it('honors Retry-After in the stderr hint when present', async () => {
-    const { credentialsPath } = makeCreds();
-    let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      callCount += 1;
-      if (callCount === 1) {
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      // A non-zero Retry-After still keeps the internal retry-then-throw
-      // budget fast (only 2 real sleeps of retryAfterSeconds*1000ms), so keep
-      // this small.
-      return rateLimitedResponse(1);
-    };
-
-    const stderrLines: string[] = [];
-
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        verbose: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toMatch(/retry after ~\d+s/);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Finding D (codex round-2) — 409 conflict auto-resume without --target-url
-//   → timeout partial carries the real in-flight targetUrl (not '')
-// ---------------------------------------------------------------------------
-
-describe('[finding-D] 409 conflict auto-resume no --target-url + RequestTimeoutError → partial has real targetUrl', () => {
-  it('timeout partial carries in-flight run targetUrl (not null or "")', async () => {
-    // Regression: before the fix, the synthesised triggerResponse.targetUrl was ''
-    // (empty string) when no --target-url was supplied. The timeout partial then
-    // published '' as the environment provenance. After the fix, the CLI fetches
-    // GET /runs/{currentRunId} and binds the real URL.
-    const { credentialsPath } = makeCreds();
-    const conflictBody = {
-      error: {
-        code: 'CONFLICT',
-        message: 'Run already in flight.',
-        nextAction: '',
-        requestId: 'req_d01',
-        details: { reason: 'run_in_flight', currentRunId: 'run_inflight_d01' },
-      },
-    };
-    const inFlightRun: RunResponse = {
-      ...makePassedRun(),
-      runId: 'run_inflight_d01',
-      targetUrl: 'https://real-env.example.com',
-      status: 'running' as const,
-    };
-
-    // Track which calls have been made so each call serves a distinct role.
-    const calls: string[] = [];
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const url = typeof input === 'string' ? input : (input as Request).url;
-      const method = (init?.method ?? 'GET').toUpperCase();
-      calls.push(`${method} ${url}`);
-
-      // First call: trigger POST /tests/{id}/runs → 409 conflict
-      if (method === 'POST' && url.includes('/tests/') && url.endsWith('/runs')) {
-        return new Response(JSON.stringify(conflictBody), {
-          status: 409,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      if (method === 'GET' && url.endsWith('/projects/project_1/env')) {
-        return new Response(JSON.stringify(CURRENT_DEFAULT_ENVIRONMENTS), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      // Second call: GET /runs/{id} (getRun to fetch in-flight run details)
-      // This is used BOTH by the 409 handler (to get targetUrl) and by polling.
-      // We differentiate: the first GET /runs/{id} is the advisory lookup;
-      // subsequent GET /runs/{id} calls are polling → throw RequestTimeoutError.
-      if (method === 'GET' && url.includes('/runs/run_inflight_d01')) {
-        const runGetCalls = calls.filter(
-          c => c === `GET ${url.split('?')[0]}` || c.startsWith(`GET ${url.split('?')[0]}`),
-        ).length;
-        if (runGetCalls <= 1) {
-          // First GET /runs/{id} — advisory lookup
-          return new Response(JSON.stringify(inFlightRun), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
-        }
-        // Second+ GET /runs/{id} — polling → simulate per-request timeout
-        throw new RequestTimeoutError(120000, 'req_d_timeout');
-      }
-      // Any other call → timeout
-      throw new RequestTimeoutError(120000, 'req_d_fallback');
-    };
-
-    const stdoutLines: string[] = [];
-
-    await expect(
-      runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          verbose: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 600,
-          // No --target-url supplied
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as FetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-      runId: string;
-      status: string;
-      targetUrl: string | null;
-    };
-
-    // The partial must carry the REAL in-flight targetUrl — not '' or null.
-    expect(stdoutJson.runId).toBe('run_inflight_d01');
-    expect(stdoutJson.status).toBe('running');
-    expect(stdoutJson.targetUrl).toBe('https://real-env.example.com');
-    expect(stdoutJson.targetUrl).not.toBe('');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// M4 piece-2 — `test run --all --project <id>` (fresh wave-ordered batch run)
-// ---------------------------------------------------------------------------
-
-describe('runTestRunAll — batch fresh run', () => {
-  const BATCH_FRESH_RESP: BatchRunFreshResponse = {
-    accepted: [
-      { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-      { testId: 'test_be_02', runId: 'run_fresh_02', enqueuedAt: '2026-06-09T10:00:01.000Z' },
-    ],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  };
-
-  function makePassedRun(runId: string, testId: string): RunResponse {
-    return {
-      runId,
-      testId,
-      projectId: 'project_be',
-      userId: 'user_1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-06-09T10:00:00.000Z',
-      startedAt: '2026-06-09T10:00:01.000Z',
-      finishedAt: '2026-06-09T10:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://api.example.com',
-      createdFrom: 'cli',
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 3, completed: 3, passedCount: 3, failedCount: 0 },
-    };
-  }
-
-  it.each(['SIGINT', 'SIGTERM'] as const)(
-    'names unverified conflicts in text when no runs were accepted on %s',
-    async signal => {
-      const { credentialsPath } = makeCreds();
-      const shutdown = new ShutdownController();
-      const stdout: string[] = [];
-      const stderr: string[] = [];
-      const methods: string[] = [];
-      const error: unknown = await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          shutdown,
-          fetchImpl: makeFetch((url, init) => {
-            methods.push(init.method ?? 'GET');
-            if (init.method === 'POST') {
-              return {
-                body: {
-                  ...BATCH_FRESH_RESP,
-                  accepted: [],
-                  conflicts: [
-                    { testId: 'test_busy', currentRunId: 'run_busy' },
-                    { testId: 'test_busy_2', currentRunId: 'run_busy_2' },
-                    { testId: 'test_unknown', reason: 'in_flight' },
-                  ],
-                },
-              };
-            }
-            if (url.includes('/runs/')) {
-              shutdown.interrupt(signal);
-              throw shutdown.signal.reason;
-            }
-            return { body: { environments: [] } };
-          }),
-          stdout: line => stdout.push(line),
-          stderr: line => stderr.push(line),
-        },
-      ).catch((caught: unknown) => caught);
-      expect(error).toBe(shutdown.signal.reason);
-      expect(shutdown.isArmed).toBe(false);
-      expect(stdout.join('\n')).toBe(
-        'run_busy  unverified (not attached)\nrun_busy_2  unverified (not attached)',
-      );
-      expect(stderr.join('\n')).not.toContain('[auto-resume]');
-      expect(methods.filter(method => method !== 'GET')).toEqual(['POST']);
-    },
-  );
-
-  it.each(['SIGINT', 'SIGTERM'] as const)(
-    'keeps unsent filtered test IDs when dispatch stops before metadata interruption on %s',
-    async signal => {
-      const { credentialsPath } = makeCreds();
-      const shutdown = new ShutdownController();
-      const stdout: string[] = [];
-      const methods: string[] = [];
-      const tests = Array.from({ length: 51 }, (_, i) => ({
-        id: `test_${i}`,
-        name: `selected ${i}`,
-        projectId: 'project_be',
-        type: i >= 2 && i < 50 ? 'frontend' : 'backend',
-      }));
-      let dispatches = 0;
-      const error: unknown = await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          nameFilter: 'selected',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          shutdown,
-          fetchImpl: makeFetch((url, init) => {
-            methods.push(init.method ?? 'GET');
-            if (url.includes('/tests?')) return { body: { items: tests, nextToken: null } };
-            if (init.method === 'POST') {
-              dispatches++;
-              if (dispatches > 1) return errorBody('PRECONDITION_FAILED');
-              return {
-                body: {
-                  ...BATCH_FRESH_RESP,
-                  accepted: [
-                    { testId: 'test_0', runId: 'run_new', enqueuedAt: '2026-06-09T10:00:00Z' },
-                  ],
-                  conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
-                  skippedFrontend: tests.slice(2, 50).map(test => test.id),
-                },
-              };
-            }
-            if (url.includes('/runs/run_busy')) {
-              shutdown.interrupt(signal);
-              throw shutdown.signal.reason;
-            }
-            return { body: { environments: [] } };
-          }),
-          stdout: line => stdout.push(line),
-          stderr: () => {},
-        },
-      ).catch((caught: unknown) => caught);
-      expect(error).toBe(shutdown.signal.reason);
-      expect(shutdown.isArmed).toBe(false);
-      expect(JSON.parse(stdout.join('\n'))).toMatchObject({
-        accepted: [{ testId: 'test_0', runId: 'run_new', status: 'running' }],
-        conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
-        notRunTestIds: ['test_50'],
-        skippedFrontend: tests.slice(2, 50).map(test => test.id),
-      });
-      expect(methods.filter(method => method !== 'GET')).toEqual(['POST', 'POST']);
-    },
-  );
-
-  it.each(['SIGINT', 'SIGTERM'] as const)(
-    'preserves batch receipts and disarms the conflict metadata scope on %s',
-    async signal => {
-      const { credentialsPath } = makeCreds();
-      const shutdown = new ShutdownController();
-      const stdout: string[] = [];
-      const stderr: string[] = [];
-      let armedAtRead = false;
-      const response: BatchRunFreshResponse = {
-        ...BATCH_FRESH_RESP,
-        conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'in_flight' }],
-        skippedFrontend: ['test_frontend'],
-        skippedIntegration: [{ testId: 'test_integration' }],
-      };
-      const error: unknown = await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          shutdown,
-          fetchImpl: makeFetch((url, init) => {
-            if (init.method === 'POST') return { body: response };
-            if (url.includes('/runs/run_busy')) {
-              armedAtRead = shutdown.isArmed;
-              shutdown.interrupt(signal);
-              throw shutdown.signal.reason;
-            }
-            return { body: { environments: [] } };
-          }),
-          stdout: line => stdout.push(line),
-          stderr: line => stderr.push(line),
-        },
-      ).catch((caught: unknown) => caught);
-      expect(error).toBe(shutdown.signal.reason);
-      expect(armedAtRead).toBe(true);
-      expect(shutdown.isArmed).toBe(false);
-      expect(JSON.parse(stdout.join('\n'))).toEqual({
-        accepted: response.accepted.map(e => ({
-          testId: e.testId,
-          runId: e.runId,
-          status: 'running',
-        })),
-        conflicts: response.conflicts,
-        deferred: [],
-        skippedFrontend: response.skippedFrontend,
-        skippedIntegration: response.skippedIntegration,
-      });
-      expect(stderr.join('\n')).toContain('testsprite test wait run_fresh_01 run_fresh_02');
-    },
-  );
-
-  it('run --all --wait: a NOT_FOUND member poll → exit 4 with error.code (was folded to exit 1 before this PR)', async () => {
-    const { credentialsPath } = makeCreds();
-    let caughtError: unknown;
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: BATCH_FRESH_RESP };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      // run_fresh_01 passes; run_fresh_02's poll returns NOT_FOUND (404).
-      if (runId === 'run_fresh_01') return { body: makePassedRun(runId, 'test_be_01') };
-      return errorBody('NOT_FOUND');
-    });
-    try {
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          env: {} as NodeJS.ProcessEnv,
-          sleep: instantSleep,
-        },
-      );
-    } catch (err) {
-      caughtError = err;
-    }
-    // The operational branch now propagates the real code (exit 4) instead of
-    // the pre-PR generic exit 1, and carries a machine-readable `code`.
-    const e = caughtError as { exitCode?: number; code?: string };
-    expect(e.exitCode).toBe(4);
-    expect(e.code).toBe('NOT_FOUND');
-  });
-
-  it('run --all --wait auto-resume: fetches the in-flight run for a createdAt floor and names its source', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const runFetches: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      if (method === 'POST') {
-        // batch fresh: nothing newly accepted, one already-in-flight conflict
-        // carrying a currentRunId → the fan-out auto-resumes it.
-        return {
-          body: {
-            accepted: [],
-            conflicts: [{ testId: 'test_be_01', currentRunId: 'run_inflight' }],
-            deferred: [],
-            skippedFrontend: [],
-            skippedIntegration: [],
-          } as BatchRunFreshResponse,
-        };
-      }
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
-      runFetches.push(runId);
-      return { body: { ...makePassedRun(runId, 'test_be_01'), source: 'portal' } };
-    });
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: l => stdoutLines.push(l),
-        stderr: l => stderrLines.push(l),
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    );
-
-    const payload = JSON.parse(stdoutLines.join('\n')) as {
-      accepted: Array<{ runId: string; status: string }>;
-    };
-    // finding 2: the in-flight run is fetched (for the createdAt floor that
-    // replaces the epoch sentinel) and its source is named on stderr.
-    expect(runFetches).toContain('run_inflight');
-    expect(stderrLines.join('\n')).toContain('started by portal');
-    // Auto-resumed to the in-flight run's real verdict, not a stale/false one.
-    expect(payload.accepted.find(r => r.runId === 'run_inflight')?.status).toBe('passed');
-  });
-
-  it('routes to POST /tests/batch/run with correct body shape (projectId + source)', async () => {
-    const { credentialsPath } = makeCreds();
-    type Captured = { url: string; method: string; body: unknown };
-    const captured: Captured[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      captured.push({
-        url,
-        method: init.method ?? 'GET',
-        body: init.body ? JSON.parse(init.body as string) : undefined,
-      });
-      return { body: BATCH_FRESH_RESP };
-    });
-    const out: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => out.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    const post = captured.find(c => c.method === 'POST' && (c.url as string).includes('batch/run'));
-    expect(post).toBeDefined();
-    expect(post!.body).toMatchObject({ projectId: 'project_be', source: 'cli' });
-    // No testIds field when --filter is absent (run all)
-    expect((post!.body as Record<string, unknown>).testIds).toBeUndefined();
-  });
-
-  it('includes testIds when --filter is set (resolves via GET /tests then filters)', async () => {
-    const { credentialsPath } = makeCreds();
-    const allTests = [
-      {
-        id: 'test_a',
-        name: 'Create user',
-        type: 'backend',
-        status: 'ready',
-        projectId: 'project_be',
-        createdFrom: 'cli',
-        createdAt: '',
-        updatedAt: '',
-      },
-      {
-        id: 'test_b',
-        name: 'Read user',
-        type: 'backend',
-        status: 'ready',
-        projectId: 'project_be',
-        createdFrom: 'cli',
-        createdAt: '',
-        updatedAt: '',
-      },
-      {
-        id: 'test_c',
-        name: 'Delete user',
-        type: 'backend',
-        status: 'ready',
-        projectId: 'project_be',
-        createdFrom: 'cli',
-        createdAt: '',
-        updatedAt: '',
-      },
-    ];
-    type Captured = { url: string; body: unknown };
-    const captured: Captured[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      captured.push({ url, body: init.body ? JSON.parse(init.body as string) : undefined });
-      if (method === 'GET') return { body: { items: allTests, nextToken: null } };
-      return {
-        body: {
-          accepted: [{ testId: 'test_b', runId: 'run_b', enqueuedAt: '...' }],
-          conflicts: [],
-          deferred: [],
-          skippedFrontend: [],
-          skippedIntegration: [],
-        } satisfies BatchRunFreshResponse,
-      };
-    });
-    const stderrLines: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        nameFilter: 'read', // case-insensitive → matches 'Read user'
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    const post = captured.find(c => (c.url as string).includes('batch/run') && c.body);
-    expect(post).toBeDefined();
-    expect((post!.body as Record<string, unknown>).testIds).toEqual(['test_b']);
-    // Should report the filter skip count on stderr
-    expect(stderrLines.some(l => l.includes('--filter'))).toBe(true);
-  });
-
-  it('positional <test-id> + --all → exit 5 mutual exclusion (via command wiring)', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
-    disableExits(test);
-    await expect(
-      test.parseAsync(['run', 'test_xyz', '--all', '--project', 'proj_1'], { from: 'user' }),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('missing both positional and --all → exit 5', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
-    disableExits(test);
-    await expect(test.parseAsync(['run'], { from: 'user' })).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-    });
-  });
-
-  it('--all without --project → exit 5', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
-    disableExits(test);
-    await expect(test.parseAsync(['run', '--all'], { from: 'user' })).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: expect.objectContaining({
-        reason: expect.stringContaining('TESTSPRITE_PROJECT_ID'),
-      }),
-    });
-  });
-
-  it('run --all uses TESTSPRITE_PROJECT_ID when --project is omitted', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const { credentialsPath } = makeCreds();
-    type Captured = { url: string; method: string; body: unknown };
-    const captured: Captured[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      captured.push({ url, method, body: init.body ? JSON.parse(init.body as string) : undefined });
-      return { body: BATCH_FRESH_RESP };
-    });
-    const test = createTestCommand({
-      credentialsPath,
-      env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
-      fetchImpl,
-      stdout: () => undefined,
-      stderr: () => undefined,
-      sleep: instantSleep,
-    });
-    await test.parseAsync(['run', '--all'], { from: 'user' });
-    const post = captured.find(c => c.method === 'POST' && c.url.includes('/tests/batch/run'))!;
-    expect(post.body).toMatchObject({ projectId: 'project_env', source: 'cli' });
-  });
-
-  it('run --all uses TESTSPRITE_PROJECT_ID when --project is blank', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const { credentialsPath } = makeCreds();
-    type Captured = { url: string; method: string; body: unknown };
-    const captured: Captured[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      captured.push({ url, method, body: init.body ? JSON.parse(init.body as string) : undefined });
-      return { body: BATCH_FRESH_RESP };
-    });
-    const test = createTestCommand({
-      credentialsPath,
-      env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
-      fetchImpl,
-      stdout: () => undefined,
-      stderr: () => undefined,
-      sleep: instantSleep,
-    });
-    await test.parseAsync(['run', '--all', '--project', '   '], { from: 'user' });
-    const post = captured.find(c => c.method === 'POST' && c.url.includes('/tests/batch/run'))!;
-    expect(post.body).toMatchObject({ projectId: 'project_env', source: 'cli' });
-  });
-
-  it('--all --target-url → sends targetUrl on the batch request and advises about BE tests', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const { credentialsPath } = makeCreds();
-    const captured: Array<{ url: string; method: string; body: unknown }> = [];
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      captured.push({ url, method, body: init.body ? JSON.parse(init.body as string) : undefined });
-      // Honored-signal echo — the server applied the override.
-      return { body: { ...BATCH_FRESH_RESP, targetUrl: 'https://pr-42.preview.example.com' } };
-    });
-    const test = createTestCommand({
-      credentialsPath,
-      fetchImpl,
-      stdout: () => undefined,
-      stderr: (line: string) => stderrLines.push(line),
-      sleep: instantSleep,
-    });
-
-    await test.parseAsync(
-      [
-        'run',
-        '--all',
-        '--project',
-        'proj_1',
-        '--target-url',
-        'https://pr-42.preview.example.com',
-        '--skip-preflight',
-      ],
-      { from: 'user' },
-    );
-
-    const post = captured.find(c => c.method === 'POST' && c.url.includes('/tests/batch/run'))!;
-    expect(post.body).toMatchObject({
-      projectId: 'proj_1',
-      source: 'cli',
-      targetUrl: 'https://pr-42.preview.example.com',
-    });
-    // The advisory names what the override does NOT cover, so a BE verdict
-    // against a different URL is never a surprise.
-    const advisory = stderrLines.find(l => l.includes('--target-url applies to frontend tests'));
-    expect(advisory).toBeDefined();
-    expect(advisory).toContain('https://pr-42.preview.example.com');
-  });
-
-  it('--all --target-url against a backend that ignores it → exit 7, and the dispatched runs are cancelled', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const { credentialsPath } = makeCreds();
-    const cancelled: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      if (method === 'POST' && url.includes('/cancel')) {
-        cancelled.push(url);
-        return { body: { runId: 'x', status: 'cancelled', alreadyCancelled: false } };
-      }
-      // NO `targetUrl` echo: an older backend accepted the batch and silently
-      // ran the project's configured environment instead.
-      return { body: BATCH_FRESH_RESP };
-    });
-    const test = createTestCommand({
-      credentialsPath,
-      fetchImpl,
-      stdout: () => undefined,
-      stderr: () => undefined,
-      sleep: instantSleep,
-    });
-    disableExits(test);
-
-    const rejection = (await test
-      .parseAsync(
-        [
-          'run',
-          '--all',
-          '--project',
-          'proj_1',
-          '--target-url',
-          'https://pr-42.preview.example.com',
-          '--skip-preflight',
-        ],
-        { from: 'user' },
-      )
-      .catch((error: unknown) => error)) as ApiError;
-
-    // A verdict about a URL nobody tested is the exact failure this guards.
-    expect(rejection).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
-    expect(rejection.message).toContain('did not confirm --target-url');
-    // Both accepted runs receive a best-effort cancellation request.
-    expect(cancelled).toHaveLength(BATCH_FRESH_RESP.accepted.length);
-    expect(cancelled.join(' ')).toContain('run_fresh_01');
-    expect(cancelled.join(' ')).toContain('run_fresh_02');
-  });
-
-  it('--all --target-url with an empty value → exit 5 (the flag needs a URL)', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
-    disableExits(test);
-    await expect(
-      test.parseAsync(['run', '--all', '--project', 'proj_1', '--target-url', ''], {
-        from: 'user',
-      }),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      nextAction: expect.stringContaining('needs a URL'),
-    });
-  });
-
-  it('writes every CI artifact and reports server refund status when the echo is wrong', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-wrong-target-'));
-    const reportFile = join(dir, 'report.xml');
-    const summaryFile = join(dir, 'summary.json');
-    const stepSummary = join(dir, 'step.md');
-    const stderr: string[] = [];
-    const fetchImpl = makeFetch((url, init) =>
-      url.endsWith('/cancel')
-        ? {
-            body: {
-              ...makePassedRun('run_fresh_01', 'test_be_01'),
-              status: 'cancelled',
-              alreadyCancelled: false,
-              refund: { status: 'not_charged' },
-            },
-          }
-        : (init.method ?? 'GET') === 'POST'
-          ? {
-              body: {
-                accepted: [
-                  {
-                    testId: 'test_be_01',
-                    runId: 'run_fresh_01',
-                    enqueuedAt: '2026-09-25T00:00:00Z',
-                  },
-                ],
-                deferred: [],
-                conflicts: [],
-                skippedFrontend: [],
-                skippedIntegration: [],
-                targetUrl: 'https://wrong.example.com',
-              },
-            }
-          : errorBody('NOT_FOUND'),
-    );
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        targetUrl: 'https://preview.example.com',
-        skipPreflight: true,
-        report: 'junit',
-        reportFile,
-        summaryFile,
-        ghOutput: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: line => stderr.push(line),
-        env: { GITHUB_ACTIONS: 'true', GITHUB_STEP_SUMMARY: stepSummary } as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
-    const readArtifact = (path: string): string | null =>
-      // eslint-disable-next-line security/detect-non-literal-fs-filename -- every path is under this test's own mkdtempSync temp dir, never user input
-      existsSync(path) ? readFileSync(path, 'utf8') : null;
-    expect(readArtifact(reportFile)).toContain('test_be_01');
-    expect(JSON.parse(readArtifact(summaryFile) ?? 'null')).toMatchObject({ total: 1, passed: 0 });
-    expect(readArtifact(stepSummary)).toContain('test_be_01');
-    expect(stderr.join('\n')).toContain('not_charged');
-    expect(stderr.some(line => line.startsWith('::error'))).toBe(true);
-  });
-
+describe('run request metadata diagnostics', () => {
   it.each([
-    ['UNSUPPORTED', 7, 'Batch URL overrides require a V3 account'],
-    ['PRECONDITION_FAILED', 6, 'Login-once environment has a different origin'],
-  ] as const)('surfaces the server %s refusal with exit %i', async (code, exitCode, message) => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      status: code === 'UNSUPPORTED' ? 422 : 412,
-      body: { error: { code, message, requestId: 'req_test' } },
-    }));
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        targetUrl: 'https://preview.example.com',
-        skipPreflight: true,
-      },
-      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code, exitCode, message });
-  });
-
-  it('keeps dry-run offline and previews the URL in its request body', async () => {
-    const stdout: string[] = [];
-    const fetchImpl = vi.fn(() => {
-      throw new Error('network called');
-    }) as unknown as FetchImpl;
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        dryRun: true,
-        targetUrl: 'https://preview.example.com',
-      },
-      { fetchImpl, stdout: line => stdout.push(line), stderr: () => undefined },
-    );
-    expect(fetchImpl).not.toHaveBeenCalled();
-    expect(JSON.parse(stdout.join('\n'))).toMatchObject({
-      body: { projectId: 'project_be', targetUrl: 'https://preview.example.com' },
-    });
-  });
-
-  it('refuses --all --local with --target-url before network access', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const fetchImpl = vi.fn(() => {
-      throw new Error('network called');
-    }) as unknown as FetchImpl;
-    const test = createTestCommand({ fetchImpl, stdout: () => undefined, stderr: () => undefined });
-    disableExits(test);
-    await expect(
-      test.parseAsync(
-        [
-          'run',
-          '--all',
-          '--project',
-          'project_be',
-          '--local',
-          '3000',
-          '--target-url',
-          'https://preview.example.com',
-        ],
-        { from: 'user' },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      nextAction: expect.stringContaining('mutually exclusive'),
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('<test-id> --filter (without --all) → exit 5 (filter is --all-only)', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
-    disableExits(test);
-    await expect(
-      test.parseAsync(['run', 'test_xyz', '--filter', 'login'], { from: 'user' }),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('--wait polls each accepted runId and returns on all-pass (exit 0)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      if (method === 'POST') return { body: BATCH_FRESH_RESP };
-      // Poll GET /runs/<runId>
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
-      return { body: makePassedRun(runId, runId === 'run_fresh_01' ? 'test_be_01' : 'test_be_02') };
-    });
-    const out: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => out.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    const payload = JSON.parse(out.join('\n')) as { accepted: Array<{ status: string }> };
-    expect(payload.accepted.every(r => r.status === 'passed')).toBe(true);
-  });
-
-  it('writes a skipped JUnit testcase for a hard conflict counted in the CI summary', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const dir = mkdtempSync(join(tmpdir(), 'cli-junit-undispatched-'));
-    const summaryFile = join(dir, 'summary.json');
-    const reportFile = join(dir, 'report.xml');
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        return {
-          body: {
-            accepted: [
-              {
-                testId: 'test_be_01',
-                runId: 'run_fresh_01',
-                enqueuedAt: '2026-06-09T10:00:00.000Z',
-              },
-            ],
-            conflicts: [
-              { testId: 'test_refused', reason: 'billing_hold', message: 'Card declined.' },
-            ],
-            deferred: [],
-            skippedFrontend: [],
-            skippedIntegration: [],
-          } satisfies BatchRunFreshResponse,
-        };
-      }
-      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
-      return { body: makePassedRun('run_fresh_01', 'test_be_01') };
-    });
-    const rejection = (await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        report: 'junit',
-        reportFile,
-        summaryFile,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        env: {} as NodeJS.ProcessEnv,
-        stdout: () => undefined,
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch((e: unknown) => e)) as ApiError;
-    expect(rejection).toMatchObject({ exitCode: 6 });
-    const link = 'Upgrade: /pricing; billing: /dashboard/settings/billing.';
-    expect(stderrLines.join('\n')).toContain(link);
-    // Exactly once: the accepted run made the advisory print the link already
-    // (accepted.length > 0), so the final CONFLICT nextAction must not repeat
-    // it — never "already in flight" for a paused workspace either.
-    expect(stderrLines.join('\n').split(link)).toHaveLength(2);
-    expect(rejection.nextAction).not.toContain('Upgrade:');
-    expect(rejection.message).not.toContain('already in flight');
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
-    const summary = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
-      total: number;
-      skipped: number;
-    };
-    expect(summary).toMatchObject({ total: 2, skipped: 1 });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
-    const xml = readFileSync(reportFile, 'utf8');
-    expect(xml).toContain('tests="2" failures="0" errors="0" skipped="1"');
-    expect(xml).toContain('testId="test_refused"');
-    expect(xml).toContain('<skipped message="Card declined. (not dispatched)"/>');
-  });
-
-  it('run --all --wait: past the shared deadline, a single-shot read resolves an already-terminal run to its verdict instead of a false timeout', async () => {
-    const { credentialsPath } = makeCreds();
-    const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
-    let nowMs = baseNow;
-    const runFetches: string[] = [];
-    const stdoutLines: string[] = [];
-    let caughtError: unknown;
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
-
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      if (method === 'POST') return { body: BATCH_FRESH_RESP };
-      if (url.endsWith('/projects/project_be/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
-      runFetches.push(runId);
-      if (runId === 'run_fresh_01') {
-        nowMs = baseNow + 2000;
-        return { body: makePassedRun(runId, 'test_be_01') };
-      }
-      return { body: makePassedRun(runId, 'test_be_02') };
-    });
-
-    try {
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 1,
-          maxConcurrency: 1,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: () => undefined,
-          env: {} as NodeJS.ProcessEnv,
-          sleep: instantSleep,
-        },
+    ['text', false, false],
+    ['text', true, true],
+    ['json', false, true],
+  ] as const)(
+    'idempotency key is visible for output=%s verbose=%s',
+    async (output, verbose, visible) => {
+      const h = projectHarness();
+      await runTestRun(
+        { ...heldRunOptions, wait: false, output, verbose, idempotencyKey: 'stable-key' },
+        h.deps,
       );
-    } catch (err) {
-      caughtError = err;
-    } finally {
-      nowSpy.mockRestore();
-    }
-
-    const payload = JSON.parse(stdoutLines.join('\n')) as {
-      accepted: Array<{ runId: string; status: string }>;
-    };
-    // finding 1: run_fresh_01's poll pushes now past the 1s deadline; run_fresh_02
-    // is then past budget, but ONE single-shot read (not a full poll loop) finds
-    // it already terminal and resolves it as passed — not a false timeout. Both
-    // pass → exit 0.
-    expect(runFetches).toEqual(['run_fresh_01', 'run_fresh_02']);
-    expect(payload.accepted.find(r => r.runId === 'run_fresh_02')?.status).toBe('passed');
-    expect(caughtError).toBeUndefined();
-  });
-
-  it('--wait with a failed run → exit 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((url, init) => {
-      const method = init.method ?? 'GET';
-      if (method === 'POST') return { body: BATCH_FRESH_RESP };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
-      const run = makePassedRun(runId, 'test_be_01');
-      if (runId === 'run_fresh_01')
-        return { body: { ...run, status: 'failed', failureKind: 'assertion' } };
-      return { body: run };
-    });
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 1 });
-  });
-
-  it('skippedFrontend[] reported on stderr as advisory', async () => {
-    const { credentialsPath } = makeCreds();
-    const respWithSkipped: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_be_01', runId: 'run_01', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: ['test_fe_01', 'test_fe_02'],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'GET') return { body: { items: [], nextToken: null } };
-      return { body: respWithSkipped };
-    });
-    const stderrLines: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('frontend'))).toBe(true);
-    expect(stderrLines.some(l => l.includes('2'))).toBe(true);
-  });
-
-  it('deferred[] (rate-limited) forces exit 7 with a retry hint (non-wait)', async () => {
-    const { credentialsPath } = makeCreds();
-    const respWithDeferred: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_be_01', runId: 'run_01', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      conflicts: [],
-      deferred: [{ testId: 'test_be_02' }, { testId: 'test_be_03' }],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'GET') return { body: { items: [], nextToken: null } };
-      return { body: respWithDeferred };
-    });
-    const stderrLines: string[] = [];
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: false,
-          timeoutSeconds: 600,
-          maxConcurrency: 10,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: line => stderrLines.push(line),
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-    expect(stderrLines.some(l => l.toLowerCase().includes('rate-deferred'))).toBe(true);
-  });
-
-  it('all-conflict, nothing accepted → CONFLICT (exit 6)', async () => {
-    const { credentialsPath } = makeCreds();
-    const respAllConflict: BatchRunFreshResponse = {
-      accepted: [],
-      conflicts: [{ testId: 'test_be_01' }],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'GET') return { body: { items: [], nextToken: null } };
-      return { body: respAllConflict };
-    });
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: false,
-          timeoutSeconds: 600,
-          maxConcurrency: 10,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 6 });
-  });
-
-  it('skippedIntegration[] reported on stderr as advisory', async () => {
-    const { credentialsPath } = makeCreds();
-    const respWithIntegration: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_be_01', runId: 'run_01', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [{ testId: 'test_be_integ_01' }],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'GET') return { body: { items: [], nextToken: null } };
-      return { body: respWithIntegration };
-    });
-    const stderrLines: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(
-      stderrLines.some(l => l.includes('[advisory]') && l.toLowerCase().includes('integration')),
-    ).toBe(true);
-  });
-
-  it('--dry-run returns sample without network call', async () => {
-    resetDryRunBannerForTesting();
-    const fetchImpl = vi.fn() as unknown as FetchImpl;
-    const out: string[] = [];
-    const err: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        fetchImpl,
-        stdout: line => out.push(line),
-        stderr: line => err.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(fetchImpl).not.toHaveBeenCalled();
-    // Should print a non-empty JSON body (sample or envelope)
-    expect(out.length).toBeGreaterThan(0);
-    // The canned sample must carry the "not from the server" banner.
-    expect(err).toContain(DRY_RUN_BANNER);
-  });
-
-  it('--wait with timeout → exit 7', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: BATCH_FRESH_RESP };
-      // Always return running so we hit timeout
-      return {
-        body: {
-          runId: 'run_fresh_01',
-          testId: 'test_be_01',
-          projectId: 'project_be',
-          userId: 'u1',
-          status: 'running',
-          source: 'cli',
-          createdAt: '2026-06-09T10:00:00.000Z',
-          startedAt: '2026-06-09T10:00:01.000Z',
-          finishedAt: null,
-          codeVersion: 'v1',
-          targetUrl: 'https://api.example.com',
-          createdFrom: 'cli',
-          failedStepIndex: null,
-          failureKind: null,
-          error: null,
-          videoUrl: null,
-          stepSummary: { total: 3, completed: 1, passedCount: 0, failedCount: 0 },
-        } satisfies RunResponse,
-      };
-    });
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 1,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Gap B: `run --all --wait` auto-resumes an already-running case (a conflict
-// carrying `currentRunId`) by polling the existing run to a verdict, instead
-// of failing the batch on the conflict.
-// ---------------------------------------------------------------------------
-
-describe('run --all --wait: auto-resume already-running conflicts (Gap B)', () => {
-  it('polls an in-flight conflict (currentRunId) to a verdict — passes → exit 0, not exit 6', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // The whole batch came back as a conflict, but the case is already running
-    // and the backend told us its run id.
-    const conflictResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [{ testId: 'test_busy', currentRunId: 'run_inflight' }],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    const printed: Array<Record<string, unknown>> = [];
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: conflictResp };
-      if (url.includes('/runs/run_inflight')) {
-        return {
-          body: {
-            runId: 'run_inflight',
-            testId: 'test_busy',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:05.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    // Must NOT throw (the in-flight run passed) — the batch waits for its result.
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-
-    const payload = printed.find(p => p.summary && typeof p.summary === 'object');
-    const summary = payload?.summary as { passed: number; conflicts: number; total: number };
-    // The resumed run is counted as a real (passed) result, not a hard conflict.
-    expect(summary.passed).toBe(1);
-    expect(summary.conflicts).toBe(0);
-    expect(summary.total).toBe(1);
-  });
-
-  function inFlightRunRead(overrides: Partial<RunResponse>): RunResponse {
-    return {
-      runId: 'run_inflight',
-      testId: 'test_busy',
-      projectId: 'project_1',
-      userId: 'u1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-06-09T10:00:00.000Z',
-      startedAt: '2026-06-09T10:00:05.000Z',
-      finishedAt: '2026-06-09T10:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
-      createdFrom: 'cli',
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-      ...overrides,
-    };
-  }
-  const ENV_LISTING = {
-    environments: [
-      { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
-      { id: 'env_staging', name: 'staging', url: 'https://staging.example.com', isDefault: false },
-    ],
-  };
-  function batchWithOneInFlight(inFlight: RunResponse) {
-    const conflictResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [{ testId: 'test_busy', currentRunId: 'run_inflight' }],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const calls: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      calls.push(`${init.method ?? 'GET'} ${url.replace(/^https?:\/\/[^/]+/, '')}`);
-      if ((init.method ?? 'GET') === 'POST') {
-        // Echo the batch target like a current backend, so the echo guard
-        // (`target-url-not-honored`) is not what this test exercises.
-        const sent =
-          typeof init.body === 'string' ? (JSON.parse(init.body) as { targetUrl?: string }) : {};
-        return {
-          body: sent.targetUrl ? { ...conflictResp, targetUrl: sent.targetUrl } : conflictResp,
-        };
-      }
-      if (url.endsWith('/projects/project_1/env')) return { body: ENV_LISTING };
-      if (url.includes('/runs/run_inflight')) return { body: inFlight };
-      return errorBody('NOT_FOUND');
-    });
-    return { fetchImpl, calls };
-  }
-  const batchOpts = {
-    profile: 'default',
-    output: 'json' as const,
-    debug: false,
-    projectId: 'project_1',
-    wait: true,
-    timeoutSeconds: 60,
-    maxConcurrency: 5,
-  };
-
-  it('--env: an in-flight run on ANOTHER environment is not attached — it stays a hard conflict (exit 6)', async () => {
-    const { credentialsPath } = makeCreds();
-    const { fetchImpl, calls } = batchWithOneInFlight(
-      inFlightRunRead({ environment: { id: 'env_default', name: 'default' } }),
-    );
-    const stderr: string[] = [];
-    const err = await runTestRunAll(
-      { ...batchOpts, environment: 'staging' },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: l => stderr.push(l),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 6 });
-    // The in-flight run was read and the project's environments listed, but it
-    // was never polled as this batch's own result.
-    expect(calls.filter(c => c.includes('/runs/run_inflight')).length).toBe(1);
-    expect(calls.some(c => c.endsWith('/projects/project_1/env'))).toBe(true);
-    expect(stderr.some(l => l.includes('does not match the requested environment'))).toBe(true);
-    expect(stderr.some(l => l.includes('polling in-flight run'))).toBe(false);
-  });
-
-  it('--env: an in-flight run on THAT environment is attached and polled', async () => {
-    const { credentialsPath } = makeCreds();
-    const { fetchImpl } = batchWithOneInFlight(
-      inFlightRunRead({ environment: { id: 'env_staging', name: 'staging' } }),
-    );
-    const printed: Array<Record<string, unknown>> = [];
-    await runTestRunAll(
-      { ...batchOpts, environment: 'staging' },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    const summary = printed.find(p => p.summary)?.summary as { passed: number; conflicts: number };
-    expect(summary).toMatchObject({ passed: 1, conflicts: 0 });
-  });
-
-  it('no --env: an in-flight run that records an environment must be on the project default', async () => {
-    const { credentialsPath } = makeCreds();
-    const { fetchImpl } = batchWithOneInFlight(
-      inFlightRunRead({ environment: { id: 'env_pr_8', name: 'github-pr-8' } }),
-    );
-    const stderr: string[] = [];
-    const err = await runTestRunAll(batchOpts, {
-      credentialsPath,
-      fetchImpl,
-      stdout: () => {},
-      stderr: l => stderr.push(l),
-      sleep: instantSleep,
-    }).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 6 });
-    expect(stderr.some(l => l.includes('not attaching'))).toBe(true);
-  });
-
-  it('--target-url: an in-flight run against another URL is not attached', async () => {
-    const { credentialsPath } = makeCreds();
-    const { fetchImpl } = batchWithOneInFlight(
-      inFlightRunRead({ targetUrl: 'https://pr-9.preview.example.com' }),
-    );
-    const stderr: string[] = [];
-    const err = await runTestRunAll(
-      { ...batchOpts, targetUrl: 'https://pr-8.preview.example.com', skipPreflight: true },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: l => stderr.push(l),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 6 });
-    expect(stderr.some(l => l.includes('it targets https://pr-9.preview.example.com'))).toBe(true);
-  });
-
-  it('a hard conflict (no currentRunId) still exits 6 when nothing is pollable', async () => {
-    const { credentialsPath } = makeCreds();
-
-    const conflictResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [{ testId: 'test_x' }], // no currentRunId → not resumable
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: conflictResp };
-      return errorBody('NOT_FOUND');
-    });
-
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => {},
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 6 });
-  });
-
-  it('mixed batch: a passing resumable conflict does NOT mask a hard conflict — exits 6', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // One test is auto-resumable (running, has a runId) and passes; another is a
-    // HARD conflict (no runId) that never ran. The batch must still exit 6 —
-    // the passing resume must not green a batch with an unresolved test.
-    const conflictResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [
-        { testId: 'hard_x' }, // no currentRunId → hard, never ran
-        { testId: 'resumable_y', currentRunId: 'run_y' }, // in flight → resumable
-      ],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: conflictResp };
-      if (url.includes('/runs/run_y')) {
-        return {
-          body: {
-            runId: 'run_y',
-            testId: 'resumable_y',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:05.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => {},
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 6 });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// [B-E2E-01] Fix 1 regression — blocked/failed runs must exit 1 under --wait
-// ---------------------------------------------------------------------------
-
-describe('[B-E2E-01] runTestRunAll --wait: non-passed runs must exit 1 (regression)', () => {
-  // The unit tests below pin the post-retry exit-code path so any future
-  // refactor that accidentally drops the `if (failed > 0) throw CLIError(…, 1)`
-  // guard is caught immediately (blocked status had no dedicated test before).
-
-  const BATCH_RESP_BLOCKED: BatchRunFreshResponse = {
-    accepted: [
-      { testId: 'test_be_01', runId: 'run_blocked_01', enqueuedAt: '2026-06-09T11:00:00.000Z' },
-      { testId: 'test_be_02', runId: 'run_passed_02', enqueuedAt: '2026-06-09T11:00:01.000Z' },
-    ],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  };
-
-  function makeTerminalRun(runId: string, testId: string, status: string): RunResponse {
-    return {
-      runId,
-      testId,
-      projectId: 'project_be',
-      userId: 'user_1',
-      status: status as RunResponse['status'],
-      source: 'cli',
-      createdAt: '2026-06-09T11:00:00.000Z',
-      startedAt: '2026-06-09T11:00:01.000Z',
-      finishedAt: '2026-06-09T11:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://api.example.com',
-      createdFrom: 'cli',
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: {
-        total: 3,
-        completed: 3,
-        passedCount: status === 'passed' ? 3 : 0,
-        failedCount: 0,
-      },
-    };
-  }
-
-  it('--wait with a blocked run → exit 1 (not 0)', async () => {
-    // Regression test: before the fix, 51 blocked/failed runs could exit 0.
-    // Specifically test `blocked` status which had no dedicated coverage.
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: BATCH_RESP_BLOCKED };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      if (runId === 'run_blocked_01')
-        return { body: makeTerminalRun('run_blocked_01', 'test_be_01', 'blocked') };
-      if (runId === 'run_passed_02')
-        return { body: makeTerminalRun('run_passed_02', 'test_be_02', 'passed') };
-      return errorBody('NOT_FOUND');
-    });
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 1 });
-  });
-
-  it('--wait all blocked (51 blocked out of 51) → exit 1, not 0', async () => {
-    // Mirrors the live E2E observation: 51 blocked/failed in a 100-run batch.
-    // Uses a smaller batch (3 blocked) to keep the test fast.
-    const { credentialsPath } = makeCreds();
-    const allBlocked: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-09T11:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-09T11:00:01.000Z' },
-        { testId: 'test_3', runId: 'run_b3', enqueuedAt: '2026-06-09T11:00:02.000Z' },
-      ],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: allBlocked };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      return { body: makeTerminalRun(runId, 'test_x', 'blocked') };
-    });
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 1 });
-  });
-
-  it('--wait mixed blocked+failed → exit 1 with summary.failed = 2', async () => {
-    const { credentialsPath } = makeCreds();
-    const mixedBatch: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_p', runId: 'run_p', enqueuedAt: '2026-06-09T11:00:00.000Z' },
-        { testId: 'test_b', runId: 'run_b', enqueuedAt: '2026-06-09T11:00:01.000Z' },
-        { testId: 'test_f', runId: 'run_f', enqueuedAt: '2026-06-09T11:00:02.000Z' },
-      ],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: mixedBatch };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      if (runId === 'run_p') return { body: makeTerminalRun('run_p', 'test_p', 'passed') };
-      if (runId === 'run_b') return { body: makeTerminalRun('run_b', 'test_b', 'blocked') };
-      if (runId === 'run_f') return { body: makeTerminalRun('run_f', 'test_f', 'failed') };
-      return errorBody('NOT_FOUND');
-    });
-
-    const stdoutLines: string[] = [];
-    let caughtError: unknown;
-    try {
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: () => undefined,
-          env: {} as NodeJS.ProcessEnv,
-          sleep: instantSleep,
-        },
+      expect(h.stderr.some(line => line === 'idempotency-key: stable-key')).toBe(visible);
+      expect(h.calls.find(call => call.method === 'POST')?.headers.get('idempotency-key')).toBe(
+        'stable-key',
       );
-    } catch (err) {
-      caughtError = err;
-    }
-
-    expect(caughtError).toBeDefined();
-    expect((caughtError as { exitCode?: number }).exitCode).toBe(1);
-
-    // The JSON payload (written to stdout before throwing) must contain
-    // summary.failed = 2 (1 blocked + 1 failed).
-    const payload = JSON.parse(stdoutLines.join('\n')) as {
-      summary: { passed: number; failed: number };
-    };
-    expect(payload.summary.passed).toBe(1);
-    expect(payload.summary.failed).toBe(2);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// runTestRunAll — --max-concurrency upper bound (Fix 2)
-// ---------------------------------------------------------------------------
-
-describe('runTestRunAll — --max-concurrency validation', () => {
-  it('rejects --max-concurrency > 100 with VALIDATION_ERROR (exit 5)', async () => {
-    const { credentialsPath } = makeCreds();
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: false,
-          timeoutSeconds: 600,
-          maxConcurrency: 101,
-        },
-        { credentialsPath, sleep: () => Promise.resolve() },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: expect.objectContaining({ field: 'max-concurrency' }),
-    });
-  });
-
-  it('accepts --max-concurrency = 100 (boundary value, no validation error)', async () => {
-    const { credentialsPath } = makeCreds();
-    const BATCH_FRESH_RESP: BatchRunFreshResponse = {
-      accepted: [],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch(() => ({ body: BATCH_FRESH_RESP }));
-    // Should resolve without VALIDATION_ERROR
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: false,
-          timeoutSeconds: 600,
-          maxConcurrency: 100,
-          // This case only asserts --max-concurrency=100 is accepted; the empty
-          // batch would otherwise trip the zero-dispatch failure.
-          allowEmpty: true,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: () => Promise.resolve(),
-        },
-      ),
-    ).resolves.toBeDefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// `test run --all` that dispatches ZERO tests must not exit 0 (a CI
-// false-green). It fails with exit 5 and still emits summary / annotation /
-// JUnit, unless --allow-empty is set.
-// ---------------------------------------------------------------------------
-
-describe('runTestRunAll — zero-dispatch fails the CI gate', () => {
-  const EMPTY_BATCH: BatchRunFreshResponse = {
-    accepted: [],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  };
-
-  function baseOpts(over: Record<string, unknown> = {}) {
-    return {
-      profile: 'default',
-      output: 'json' as const,
-      debug: false,
-      projectId: 'project_be',
-      wait: false,
-      timeoutSeconds: 600,
-      maxConcurrency: 5,
-      ...over,
-    };
-  }
-
-  it('empty batch (nothing runnable) → rejects with exit 5', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    await expect(
-      runTestRunAll(baseOpts() as never, {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: () => Promise.resolve(),
-      }),
-    ).rejects.toMatchObject({ exitCode: 5 });
-  });
-
-  it('writes matching summary and JUnit for a batch with only a hard conflict', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-junit-conflict-'));
-    const summaryFile = join(dir, 'summary.json');
-    const reportFile = join(dir, 'report.xml');
-    const fetchImpl = makeFetch(() => ({
-      body: {
-        ...EMPTY_BATCH,
-        conflicts: [{ testId: 'test_refused', reason: 'billing_hold', message: 'Card declined.' }],
-      } satisfies BatchRunFreshResponse,
-    }));
-    await expect(
-      runTestRunAll(baseOpts({ wait: true, report: 'junit', reportFile, summaryFile }) as never, {
-        credentialsPath,
-        fetchImpl,
-        env: {} as NodeJS.ProcessEnv,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      }),
-    ).rejects.toMatchObject({ exitCode: 13, code: 'FEATURE_GATED' });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
-    expect(JSON.parse(readFileSync(summaryFile, 'utf8'))).toMatchObject({ total: 1, skipped: 1 });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
-    const xml = readFileSync(reportFile, 'utf8');
-    expect(xml).toContain('tests="1" failures="0" errors="0" skipped="1"');
-    expect(xml).toContain('testId="test_refused"');
-    expect(xml).toContain('<skipped message="Card declined. (not dispatched)"/>');
-  });
-
-  it('--allow-empty makes the same empty batch resolve (exit 0)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    await expect(
-      runTestRunAll(baseOpts({ allowEmpty: true }) as never, {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: () => Promise.resolve(),
-      }),
-    ).resolves.toBeDefined();
-  });
-
-  it('all frontend tests skipped → rejects with exit 5, reason names the FE skip', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1', 'fe_2'] },
-    }));
-    await expect(
-      runTestRunAll(baseOpts() as never, {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: () => Promise.resolve(),
-      }),
-    ).rejects.toMatchObject({ exitCode: 5, message: expect.stringContaining('frontend test') });
-  });
-
-  it('--filter that matches nothing → rejects with exit 5 before the batch call', async () => {
-    const { credentialsPath } = makeCreds();
-    let batchCalled = false;
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/run')) {
-        batchCalled = true;
-        return { body: EMPTY_BATCH };
-      }
-      // GET /tests: a test whose name does NOT contain the filter.
-      return {
-        body: {
-          items: [
-            {
-              id: 't1',
-              projectId: 'project_be',
-              name: 'Login flow',
-              type: 'backend',
-              createdFrom: 'portal',
-              status: 'passed',
-              createdAt: '2026-01-01T00:00:00.000Z',
-              updatedAt: '2026-01-01T00:00:00.000Z',
-            },
-          ],
-          nextToken: null,
-        },
-      };
-    });
-    await expect(
-      runTestRunAll(baseOpts({ nameFilter: 'zzz-no-match' }) as never, {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: () => Promise.resolve(),
-      }),
-    ).rejects.toMatchObject({ exitCode: 5 });
-    expect(batchCalled).toBe(false);
-  });
-
-  it('still writes the JUnit sidecar on a zero-dispatch (skipped testcases)', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-dev1046-'));
-    const reportFile = join(dir, 'junit.xml');
-    const fetchImpl = makeFetch(() => ({
-      body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] },
-    }));
-    await expect(
-      runTestRunAll(
-        // JUnit sidecar is a --wait feature → exercises the wait zero-dispatch path.
-        baseOpts({ report: 'junit', reportFile, wait: true }) as never,
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: () => Promise.resolve(),
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 5 });
-    // The artifact exists (previously NO report was written on this path).
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reportFile is a mkdtempSync path in this test's own temp dir.
-    const xml = readFileSync(reportFile, 'utf8');
-    expect(xml).toContain('<skipped');
-    expect(xml).toContain('fe_1');
-  });
-
-  it('emits the summary + ::error:: annotation on a zero-dispatch (shows WHY, not a bare exit)', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-dev1046-'));
-    const summaryFile = join(dir, 'summary.json');
-    const out: string[] = [];
-    const fetchImpl = makeFetch(() => ({ body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] } }));
-    await expect(
-      runTestRunAll(baseOpts({ ghOutput: true, summaryFile, wait: true }) as never, {
-        credentialsPath,
-        fetchImpl,
-        stdout: (l: string) => out.push(l),
-        stderr: (l: string) => out.push(l),
-        sleep: () => Promise.resolve(),
-      }),
-    ).rejects.toMatchObject({ exitCode: 5 });
-    // The annotation lands (the "show WHY" half), on either stream — a
-    // ::warning::, since the rows never dispatched (severity split);
-    // the exit-5 above is what makes the job red.
-    expect(out.some(l => l.startsWith('::warning'))).toBe(true);
-    // The machine summary is written and gate-consistent: 0 passed, the
-    // never-dispatched rows counted as skipped (not failed).
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- summaryFile is a mkdtempSync path in this test's own temp dir.
-    const summary = JSON.parse(readFileSync(summaryFile, 'utf8'));
-    expect(summary.passed).toBe(0);
-    expect(summary.failed).toBe(0);
-    expect(summary.skipped).toBeGreaterThan(0);
-    expect(summary.runs.length).toBeGreaterThan(0);
-  });
-
-  it('an unwritable --report-file still fails with exit 5 (not the I/O exit), summary still emitted', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-dev1046-'));
-    // Parent dir does not exist → the JUnit write throws; it must be swallowed
-    // so the zero-dispatch exit-5 gate (and the summary) survive.
-    const reportFile = join(dir, 'no-such-subdir', 'junit.xml');
-    const summaryFile = join(dir, 'summary.json');
-    const fetchImpl = makeFetch(() => ({ body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] } }));
-    await expect(
-      runTestRunAll(baseOpts({ report: 'junit', reportFile, summaryFile, wait: true }) as never, {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: () => Promise.resolve(),
-      }),
-    ).rejects.toMatchObject({ exitCode: 5 });
-    // The in-memory summary was emitted BEFORE the failed JUnit write.
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- summaryFile is a mkdtempSync path in this test's own temp dir.
-    expect(JSON.parse(readFileSync(summaryFile, 'utf8')).passed).toBe(0);
-  });
-
-  it.each([
-    ['--report-file', ['--report', 'junit', '--report-file'], 'junit.xml', 'report-file'],
-    ['--summary-file', ['--summary-file'], 'summary.json', 'summary-file'],
-  ])(
-    'test run --all: a %s in a missing directory is refused before anything is dispatched',
-    async (_flag, flags, file, field) => {
-      vi.resetModules();
-      const { createTestCommand } = await import('./test.js');
-      const { credentialsPath } = makeCreds();
-      const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-'));
-      const fetchImpl = vi.fn(makeFetch(() => ({ body: EMPTY_BATCH })));
-      const command = createTestCommand({
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: () => Promise.resolve(),
-      });
-      await expect(
-        command.parseAsync(
-          ['run', '--all', '--project', 'P', '--wait', ...flags, join(dir, 'no-such-subdir', file)],
-          { from: 'user' },
-        ),
-      ).rejects.toMatchObject({ exitCode: 5, details: { field } });
-      expect(fetchImpl).not.toHaveBeenCalled();
-      rmSync(dir, { recursive: true, force: true });
     },
   );
-
-  it('--allow-empty does NOT green a dispatched-but-failed run', async () => {
-    const { credentialsPath } = makeCreds();
-    const acceptedBatch: BatchRunFreshResponse = {
-      accepted: [{ testId: 'be_1', runId: 'run_1', enqueuedAt: '2026-01-01T00:00:00.000Z' }],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const failedRun = {
-      ...makeFailedRun(),
-      runId: 'run_1',
-      testId: 'be_1',
-      projectId: 'project_be',
-    };
-    const fetchImpl = makeFetch(url =>
-      url.includes('/tests/batch/run') ? { body: acceptedBatch } : { body: failedRun },
-    );
-    // A real failure must still fail even with --allow-empty (the flag only
-    // covers ZERO dispatch; it can't suppress a dispatched run's verdict).
-    await expect(
-      runTestRunAll(baseOpts({ wait: true, allowEmpty: true }) as never, {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: () => Promise.resolve(),
-      }),
-    ).rejects.toMatchObject({ exitCode: 1 });
-  });
 });
 
-// ---------------------------------------------------------------------------
-// dashboardUrl on run completion (colleague feedback 2026-06-10): terminal
-// run output carries a Portal deep link — projectId+testId come from the
-// GET /runs/{runId} wire row (single run) or opts+item (run --all).
-// ---------------------------------------------------------------------------
-
-describe('dashboardUrl on run completion', () => {
-  const PROD_API = 'https://api.testsprite.com';
-
-  function triggerThenTerminal(run: RunResponse): typeof globalThis.fetch {
-    return makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: run };
+describe('requestId trailer gated behind verbose', () => {
+  it.each([false, true])('request ID is visible only with verbose=%s', async verbose => {
+    const h = projectHarness({
+      answer: (_url, init) =>
+        init.method === 'POST'
+          ? new Response(JSON.stringify(projectRun()), {
+              headers: { 'x-request-id': 'req-visible' },
+            })
+          : undefined,
     });
-  }
-
-  it('run --wait (JSON, prod endpoint): final envelope includes dashboardUrl', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
-    const stdout: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: triggerThenTerminal(makePassedRun()),
-        stdout: line => stdout.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.dashboardUrl).toBe(
-      'https://www.testsprite.com/dashboard/tests/project_1/test/test_xyz',
-    );
-  });
-
-  it('run --wait (text, prod endpoint): card ends with dashboard line', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
-    const stdout: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: triggerThenTerminal(makePassedRun()),
-        stdout: line => stdout.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    expect(stdout.join('\n')).toContain(
-      'dashboard   https://www.testsprite.com/dashboard/tests/project_1/test/test_xyz',
-    );
-  });
-
-  it('run --wait (unknown API host): no dashboardUrl field', async () => {
-    const { credentialsPath } = makeCreds(); // localhost default
-    const stdout: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: triggerThenTerminal(makePassedRun()),
-        stdout: line => stdout.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.dashboardUrl).toBeUndefined();
-  });
-
-  it('run --wait: empty projectId on the run row → no dashboardUrl (BE fallback guard)', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
-    const stdout: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: triggerThenTerminal({ ...makePassedRun(), projectId: '' }),
-        stdout: line => stdout.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.dashboardUrl).toBeUndefined();
-  });
-
-  it('run --all no-wait (prod endpoint): accepted items carry dashboardUrl; text has project line', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
-    const batchResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_be_01', runId: 'run_f_01', enqueuedAt: '2026-06-10T10:00:00.000Z' },
-        { testId: 'test_be_02', runId: 'run_f_02', enqueuedAt: '2026-06-10T10:00:01.000Z' },
-      ],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const jsonOut: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: batchResp })),
-        stdout: line => jsonOut.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    const printed = JSON.parse(jsonOut.join('')) as {
-      accepted: Array<{ testId: string; dashboardUrl?: string }>;
-    };
-    expect(printed.accepted[0]!.dashboardUrl).toBe(
-      'https://www.testsprite.com/dashboard/tests/project_be/test/test_be_01',
-    );
-    expect(printed.accepted[1]!.dashboardUrl).toBe(
-      'https://www.testsprite.com/dashboard/tests/project_be/test/test_be_02',
-    );
-
-    const textOut: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: batchResp })),
-        stdout: line => textOut.push(line),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    expect(textOut.join('\n')).toContain(
-      'dashboard     https://www.testsprite.com/dashboard/tests/project_be',
-    );
-  });
-
-  it('run --all: emits the auto-minted idempotency-key on stderr in JSON output mode (parity with test run)', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
-    const batchResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_be_01', runId: 'run_f_01', enqueuedAt: '2026-06-10T10:00:00.000Z' },
-      ],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const stderrLines: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: batchResp })),
-        stdout: () => undefined,
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.startsWith('idempotency-key:'))).toBe(true);
-  });
-
-  it('run --all --wait (prod endpoint): summary items carry dashboardUrl + stderr Dashboard line', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
-    const batchResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_be_01', runId: 'run_f_01', enqueuedAt: '2026-06-10T10:00:00.000Z' },
-      ],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const terminal: RunResponse = {
-      runId: 'run_f_01',
-      testId: 'test_be_01',
-      projectId: 'project_be',
-      userId: 'user_1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-06-10T10:00:00.000Z',
-      startedAt: '2026-06-10T10:00:01.000Z',
-      finishedAt: '2026-06-10T10:00:05.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://api.example.com',
-      createdFrom: 'cli',
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-    };
-    const jsonOut: string[] = [];
-    const stderrLines: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 600,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(url => {
-          if (url.includes('batch/run')) return { body: batchResp };
-          return { body: terminal };
-        }),
-        stdout: line => jsonOut.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    const printed = JSON.parse(jsonOut.join('')) as {
-      accepted: Array<{ testId: string; dashboardUrl?: string }>;
-    };
-    expect(printed.accepted[0]!.dashboardUrl).toBe(
-      'https://www.testsprite.com/dashboard/tests/project_be/test/test_be_01',
-    );
+    await runTestRun({ ...heldRunOptions, wait: false, output: 'text', verbose }, h.deps);
     expect(
-      stderrLines.some(l =>
-        l.includes('Dashboard: https://www.testsprite.com/dashboard/tests/project_be'),
+      h.stderr.some(
+        line =>
+          line ===
+          `requestId: ${h.calls.find(call => call.method === 'POST')?.headers.get('x-request-id')}`,
       ),
-    ).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
-// ---------------------------------------------------------------------------
-
-describe('[finding-5] runTestRunAll --wait: RequestTimeoutError during fan-out poll writes JSON stdout + exit 7', () => {
-  it('stdout contains accepted[] with runIds when member polls throw RequestTimeoutError', async () => {
-    const { credentialsPath } = makeCreds();
-    const batchResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-        { testId: 'test_be_02', runId: 'run_fresh_02', enqueuedAt: '2026-06-09T10:00:01.000Z' },
-      ],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: batchResp };
-      if (url.includes('/runs/')) {
-        throw new RequestTimeoutError(120000, 'req_timeout_batch_all');
-      }
-      return errorBody('NOT_FOUND');
-    });
-    const stdoutLines: string[] = [];
-
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-
-    expect(err).toMatchObject({ exitCode: 7 });
-    expect(stdoutLines.length).toBeGreaterThan(0);
-    const parsed = JSON.parse(stdoutLines.join('\n')) as {
-      accepted: Array<{ testId: string; runId: string; status: string }>;
-    };
-    expect(parsed.accepted).toHaveLength(2);
-    expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_fresh_01', 'run_fresh_02']);
-    expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Graceful detach on SIGINT during test run --wait
-// ---------------------------------------------------------------------------
-
-describe('runTestRun --wait — InterruptError graceful detach', () => {
-  it('trigger succeeds, poll interrupted → partial to stdout + honest stderr + exit 130', async () => {
-    const { credentialsPath } = makeCreds();
-    const shutdown = new ShutdownController();
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    // Trigger POST resolves; the subsequent GET /runs/{id} long-poll hangs
-    // until the composed signal aborts (real-fetch contract).
-    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
-      const discovery = ordinaryRunDiscoveryResponse(input, init);
-      if (discovery) return discovery;
-      if (init.method === 'POST') {
-        return new Response(JSON.stringify(TRIGGER_RESP), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      return new Promise<Response>((_resolve, reject) => {
-        const signal = init.signal;
-        const rejectWithReason = (): void => {
-          const reason: unknown = signal?.reason;
-          reject(reason instanceof Error ? reason : new Error('aborted'));
-        };
-        if (signal?.aborted) {
-          rejectWithReason();
-          return;
-        }
-        signal?.addEventListener('abort', rejectWithReason, { once: true });
-      });
-    }) as typeof globalThis.fetch;
-
-    const pending = runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-        shutdown,
-      },
-    );
-    setTimeout(() => shutdown.interrupt('SIGINT'), 5);
-
-    const err = await pending.catch(e => e);
-    expect(err).toBeInstanceOf(InterruptError);
-    expect((err as InterruptError).exitCode).toBe(130);
-
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
-    expect(stdoutJson.runId).toBe('run_abc');
-    expect(stdoutJson.status).toBe('running');
-
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toContain('Interrupted (SIGINT)');
-    expect(stderrBlock).toContain('billing');
-    expect(stderrBlock).toContain('testsprite test wait run_abc');
-  });
-});
-
-describe('gh-output integration on run --all --wait (issue #99 reshape)', () => {
-  function makeTerminalRun(runId: string, testId: string, status: string): RunResponse {
-    return {
-      runId,
-      testId,
-      projectId: 'project_be',
-      userId: 'user_1',
-      status: status as RunResponse['status'],
-      source: 'cli',
-      createdAt: '2026-06-09T11:00:00.000Z',
-      startedAt: '2026-06-09T11:00:01.000Z',
-      finishedAt: '2026-06-09T11:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://api.example.com',
-      createdFrom: 'cli',
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: {
-        total: 3,
-        completed: 3,
-        passedCount: status === 'passed' ? 3 : 0,
-        failedCount: 0,
-      },
-    };
-  }
-
-  function mixedHarness() {
-    const { credentialsPath } = makeCreds();
-    const mixedBatch: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_p', runId: 'run_p', enqueuedAt: '2026-06-09T11:00:00.000Z' },
-        { testId: 'test_f', runId: 'run_f', enqueuedAt: '2026-06-09T11:00:02.000Z' },
-      ],
-      conflicts: [],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: mixedBatch };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      if (runId === 'run_p') return { body: makeTerminalRun('run_p', 'test_p', 'passed') };
-      if (runId === 'run_f') return { body: makeTerminalRun('run_f', 'test_f', 'failed') };
-      return errorBody('NOT_FOUND');
-    });
-    return { credentialsPath, fetchImpl };
-  }
-
-  it('under Actions with --output json: stdout stays parseable JSON, ::error:: goes to stderr', async () => {
-    const { credentialsPath, fetchImpl } = mixedHarness();
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        env: { GITHUB_ACTIONS: 'true' } as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 1 });
-    // The documented machine envelope must remain parseable as-is.
-    const payload = JSON.parse(stdoutLines.join('\n')) as { accepted?: unknown[] };
-    expect(Array.isArray(payload.accepted)).toBe(true);
-    expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(false);
-    const annotations = stderrLines.filter(line => line.startsWith('::error'));
-    expect(annotations).toHaveLength(1);
-    expect(annotations[0]).toContain('test_f');
-  });
-
-  it('--gh-output --summary-file writes the reduced artifact even though the gate exits 1', async () => {
-    const { credentialsPath, fetchImpl } = mixedHarness();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-output-'));
-    const summaryFile = join(dir, 'summary.json');
-    const stdoutLines: string[] = [];
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        ghOutput: true,
-        summaryFile,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 1 });
-    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
-      total: number;
-      passed: number;
-      failed: number;
-      runs: unknown[];
-    };
-    expect(artifact).toMatchObject({ total: 2, passed: 1, failed: 1 });
-    // Forced annotations (off-Actions) land on the text stdout, not the file.
-    expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(true);
-  });
-
-  it('all-conflict --wait: emits annotations + summary before exiting 6 (not a silent CI exit)', async () => {
-    const { credentialsPath } = makeCreds();
-    const respAllConflict: BatchRunFreshResponse = {
-      accepted: [],
-      conflicts: [{ testId: 'test_be_01' }],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'GET') return { body: { items: [], nextToken: null } };
-      return { body: respAllConflict };
-    });
-    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-conflict-'));
-    const summaryFile = join(dir, 'summary.json');
-    const stdoutLines: string[] = [];
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        ghOutput: true,
-        summaryFile,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    // The all-conflict batch still exits 6, but now surfaces it in CI first.
-    expect(err).toMatchObject({ exitCode: 6 });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
-    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
-      total: number;
-      passed: number;
-      failed: number;
-      skipped: number;
-      runs: { testId: string; status: string }[];
-    };
-    // The conflict row counts as skipped, not failed: nothing ran,
-    // and the exit-6 above is the failure signal the artifact must agree with.
-    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 0, skipped: 1 });
-    expect(artifact.runs.some(r => r.testId === 'test_be_01' && r.status === 'conflict')).toBe(
-      true,
-    );
-    expect(
-      stdoutLines.some(line => line.startsWith('::warning') && line.includes('test_be_01')),
-    ).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// --target-url advisory: response-driven, not assumption-driven.
-//
-// Redesigned to drop the `GET /me` + `v3Enabled` probe entirely: the backend
-// is the ground truth for whether an override was applied (V3 returns
-// `targetUrl: ''` rather than echo one it never used; V2 echoes the real
-// applied value), so the advisory now fires purely from comparing what was
-// requested against what the trigger response reports. All fixtures below
-// set `skipPreflight: true` — this block is about the mismatch advisory,
-// not the reachability preflight (covered separately further down).
-// ---------------------------------------------------------------------------
-
-describe('runTestRun — --target-url mismatch advisory (response-driven)', () => {
-  it('response targetUrl differs from requested → prints exactly one advisory on stderr; stdout stays clean JSON', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl: '' } }));
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_abc' });
-    const advisoryLines = stderrLines.filter(
-      l => l.includes('[advisory]') && l.includes('--target-url'),
-    );
-    expect(advisoryLines).toHaveLength(1);
-    // stdout must stay pure JSON — no advisory text, and it must still parse.
-    expect(() => JSON.parse(stdoutLines.join(''))).not.toThrow();
-    expect(stdoutLines.join('')).not.toContain('[advisory]');
-  });
-
-  it('response echoes the requested targetUrl → silent, no advisory', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch(() => ({
-      body: { ...TRIGGER_RESP, targetUrl: 'https://staging.example.com' },
-    }));
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
-  });
-
-  it('backend test type: a mismatching response is silent (a BE trigger response unconditionally echoes body.targetUrl, so this guards a case that cannot occur live)', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    // Simulate the theoretical mismatch anyway — the `opts.type` gate must
-    // suppress the advisory regardless of what the response reports.
-    const fetchImpl = makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl: '' } }));
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-        skipPreflight: true,
-        type: 'backend',
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
-  });
-
-  it('no --target-url → the trigger response has nothing to compare against, no advisory', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch(() => ({ body: TRIGGER_RESP }));
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
-  });
-
-  it('fires in --output text mode too (unconditional across modes)', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl: '' } }));
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('--target-url'))).toBe(
-      true,
-    );
-  });
-
-  it('--dry-run --target-url: no trigger response exists yet, so no advisory prints', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const stdoutLines: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-      },
-      {
-        credentialsPath,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('--target-url'))).toBe(
-      false,
-    );
-  });
-
-  it('never probes GET /me — the assumption-driven probe was removed', async () => {
-    const { credentialsPath } = makeCreds();
-    const urlsFetched: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      urlsFetched.push(url);
-      return { body: { ...TRIGGER_RESP, targetUrl: '' } };
-    });
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(urlsFetched.some(u => u.endsWith('/me'))).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Pre-charge --target-url reachability preflight wiring (the rule table
-// itself — every refuse/warn classification — is covered in
-// `src/lib/target-url-preflight.test.ts`; this block only pins that
-// `runTestRun` wires the probe correctly: before the trigger POST, and
-// opt-outable).
-// ---------------------------------------------------------------------------
-
-describe('runTestRun — --target-url reachability preflight wiring', () => {
-  // A literal IP skips the DNS step inside the probe entirely, so these
-  // tests are governed purely by the injected `fetchImpl` mock — no real
-  // DNS lookups, no network flakiness.
-  const LITERAL_IP_TARGET = 'http://203.0.113.10';
-
-  it('interrupting stalled DNS rejects before any probe HTTP request or trigger POST', async () => {
-    const { credentialsPath } = makeCreds();
-    const shutdown = new ShutdownController();
-    const fetchImpl = vi.fn();
-    const stderr = vi.fn();
-    const rejected = vi.fn();
-    vi.useFakeTimers();
-    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
-    try {
-      const pending = runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: false,
-          timeoutSeconds: 60,
-          targetUrl: 'https://preview.example.test',
-        },
-        { credentialsPath, fetchImpl, shutdown, stdout: () => {}, stderr },
-      ).catch(rejected);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(lookup).toHaveBeenCalledWith('preview.example.test', { all: true });
-      shutdown.interrupt('SIGINT');
-      await vi.advanceTimersByTimeAsync(0);
-      expect(rejected).toHaveBeenCalledWith(shutdown.signal.reason);
-      await pending;
-      expect(fetchImpl).not.toHaveBeenCalled();
-      expect(stderr.mock.calls.some(([line]) => line.includes('[advisory]'))).toBe(false);
-      expect(shutdown.hasCriticalOperations).toBe(false);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      lookup.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it('a stalled DNS timeout advises and still dispatches the run', async () => {
-    const { credentialsPath } = makeCreds();
-    const targetUrl = 'https://preview.example.test';
-    const fetchImpl = vi.fn(makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl } })));
-    const stderr = vi.fn();
-    const settled = vi.fn();
-    vi.useFakeTimers();
-    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
-    try {
-      const pending = runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          testId: 'test_xyz',
-          wait: false,
-          timeoutSeconds: 60,
-          targetUrl,
-        },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr },
-      ).then(settled);
-      await vi.advanceTimersByTimeAsync(7_999);
-      expect(fetchImpl).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(1);
-      expect(settled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run_abc' }));
-      await pending;
-      expect(fetchImpl).toHaveBeenCalledOnce();
-      expect(fetchImpl).toHaveBeenCalledWith(
-        expect.stringContaining('/tests/test_xyz/runs'),
-        expect.objectContaining({ method: 'POST' }),
-      );
-      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/\[advisory\].*DNS.*8s/));
-    } finally {
-      lookup.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it('a gateway-error response (502) refuses before the trigger POST — exit 5, no run row', async () => {
-    const { credentialsPath } = makeCreds();
-    const postedUrls: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      if (url === LITERAL_IP_TARGET) return { status: 502, body: {} };
-      postedUrls.push(url);
-      return { body: TRIGGER_RESP };
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: LITERAL_IP_TARGET,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
-    expect((err as ApiError).exitCode).toBe(5);
-    expect(postedUrls).toHaveLength(0);
-  });
-
-  it('an ambiguous negative (404) warns and lets the run proceed', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      if (url === LITERAL_IP_TARGET) return { status: 404, body: {} };
-      return { body: TRIGGER_RESP };
-    });
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: LITERAL_IP_TARGET,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_abc' });
-    expect(
-      stderrLines.some(l => l.includes('[advisory]') && l.includes('may not be reachable')),
-    ).toBe(true);
-  });
-
-  it('--skip-preflight makes the probe a zero-network-call no-op', async () => {
-    const { credentialsPath } = makeCreds();
-    const probedUrls: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      if (url === LITERAL_IP_TARGET) {
-        probedUrls.push(url);
-        return { status: 502, body: {} }; // would refuse if the probe ran at all
-      }
-      return { body: TRIGGER_RESP };
-    });
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: LITERAL_IP_TARGET,
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_abc' });
-    expect(probedUrls).toHaveLength(0);
-  });
-});
-
-describe('gh-output integration on single-test run --wait (Gap A)', () => {
-  function singleRunHarness(run: RunResponse) {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      // Trigger POST: /tests/{id}/runs (not the /runs/{runId} poll).
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: run };
-    });
-    return { credentialsPath, fetchImpl };
-  }
-
-  it('--gh-output --summary-file writes the one-row artifact even though the run failed (exit 1)', async () => {
-    const { credentialsPath, fetchImpl } = singleRunHarness(makeFailedRun());
-    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-output-single-'));
-    const summaryFile = join(dir, 'summary.json');
-    const stdoutLines: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        ghOutput: true,
-        summaryFile,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 1 });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
-    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
-      total: number;
-      passed: number;
-      failed: number;
-      runs: unknown[];
-    };
-    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 1 });
-    expect(artifact.runs).toHaveLength(1);
-    // Forced annotations (off-Actions) land on the text stdout for the failed run.
-    expect(stdoutLines.some(line => line.startsWith('::error') && line.includes('test_xyz'))).toBe(
-      true,
-    );
-  });
-
-  it('under Actions with --output json: stdout stays parseable JSON, ::error:: goes to stderr', async () => {
-    const { credentialsPath, fetchImpl } = singleRunHarness(makeFailedRun());
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        ghOutput: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        env: { GITHUB_ACTIONS: 'true' } as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 1 });
-    // The run envelope on stdout must remain parseable as-is.
-    const printed = JSON.parse(stdoutLines.join('')) as Record<string, unknown>;
-    expect(printed.status).toBe('failed');
-    expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(false);
-    const annotations = stderrLines.filter(line => line.startsWith('::error'));
-    expect(annotations).toHaveLength(1);
-    expect(annotations[0]).toContain('test_xyz');
-  });
-
-  it('auto-enables under GITHUB_ACTIONS=true without --gh-output (no summary file needed)', async () => {
-    const { credentialsPath, fetchImpl } = singleRunHarness(makeFailedRun());
-    const stdoutLines: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined,
-        env: { GITHUB_ACTIONS: 'true' } as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 1 });
-    expect(stdoutLines.some(line => line.startsWith('::error') && line.includes('test_xyz'))).toBe(
-      true,
-    );
+    ).toBe(verbose);
   });
 });
 
 describe('run --gh-output / --summary-file still require --wait (Gap A guard)', () => {
   it('--gh-output without --wait → exit 5', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
+    const { createRunCommand } = await import('./test.js');
+    const test = createRunCommand();
     disableExits(test);
     await expect(
-      test.parseAsync(['run', 'test_xyz', '--gh-output'], { from: 'user' }),
+      test.parseAsync(['test_xyz', '--gh-output'], { from: 'user' }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
   it('--summary-file without --wait → exit 5', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
+    const { createRunCommand } = await import('./test.js');
+    const test = createRunCommand();
     disableExits(test);
     const summaryDir = mkdtempSync(join(tmpdir(), 'cli-run-summary-'));
     const summaryFile = join(summaryDir, 'x.json');
-    await expect(
-      test.parseAsync(['run', 'test_xyz', '--summary-file', summaryFile], { from: 'user' }),
-    )
+    await expect(test.parseAsync(['test_xyz', '--summary-file', summaryFile], { from: 'user' }))
       .rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 })
       .finally(() => rmSync(summaryDir, { recursive: true, force: true }));
   });
-});
-
-describe('early run receipt', () => {
-  it.each([
-    { output: 'text' as const, timeout: false, chain: false },
-    { output: 'json' as const, timeout: false, chain: false },
-    { output: 'json' as const, timeout: true, chain: false },
-    { output: 'json' as const, timeout: false, chain: true },
-    { output: 'json' as const, timeout: true, chain: true },
-  ])(
-    'precedes the first poll response ($output, timeout=$timeout, chain=$chain)',
-    async ({ output, timeout, chain }) => {
-      vi.useFakeTimers();
-      const stdout: string[] = [];
-      const stderr: string[] = [];
-      let releasePoll = () => {};
-      const pollGate = new Promise<void>(resolve => {
-        releasePoll = resolve;
-      });
-      let enteredPoll = () => {};
-      const polling = new Promise<void>(resolve => {
-        enteredPoll = resolve;
-      });
-      const createContext = chain
-        ? {
-            testId: 'test_xyz',
-            type: 'frontend' as const,
-            codeVersion: 'v1',
-            createdAt: '2026-05-15T10:00:00.000Z',
-          }
-        : undefined;
-      const dashboardUrl = 'https://www.testsprite.com/dashboard/test/run_abc';
-      const pending = runTestRun(
-        {
-          profile: 'default',
-          output,
-          debug: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 1,
-          createContext,
-        },
-        {
-          ...makeCreds(),
-          stdout: line => stdout.push(line),
-          stderr: line => stderr.push(line),
-          shutdown: new ShutdownController(),
-          fetchImpl: async (input, init) => {
-            const discovery = ordinaryRunDiscoveryResponse(input, init);
-            if (discovery) return discovery;
-            if (init?.method === 'POST')
-              return new Response(JSON.stringify({ ...TRIGGER_RESP, dashboardUrl }));
-            enteredPoll();
-            await pollGate;
-            return new Response(
-              JSON.stringify(
-                timeout
-                  ? { ...makePassedRun(), status: 'running', retryAfterSeconds: 25 }
-                  : makePassedRun(),
-              ),
-            );
-          },
-        },
-      ).catch((err: unknown) => err);
-      try {
-        await polling;
-        expect(stderr).toContain('Run run_abc');
-        expect(stderr).toContain(`Dashboard: ${dashboardUrl}`);
-        expect(stdout).toEqual([]);
-      } finally {
-        releasePoll();
-        await vi.advanceTimersByTimeAsync(1000);
-        await pending;
-        vi.useRealTimers();
-      }
-      expect(stderr.filter(line => line === 'Run run_abc')).toHaveLength(1);
-      if (timeout) expect(await pending).toMatchObject({ exitCode: 7, code: 'UNSUPPORTED' });
-      if (output === 'json') {
-        const { runId, testId, ...passedFields } = makePassedRun();
-        const expectedRun = timeout
-          ? {
-              runId: 'run_abc',
-              status: 'running',
-              enqueuedAt: TRIGGER_RESP.enqueuedAt,
-              codeVersion: 'v1',
-              targetUrl: 'https://example.com',
-            }
-          : { runId, testId, testTitle: null, ...passedFields };
-        expect(stdout).toEqual([
-          JSON.stringify(chain ? { ...createContext, run: expectedRun } : expectedRun, null, 2),
-        ]);
-        expect(JSON.parse(stdout.join(''))).toEqual(
-          chain ? { ...createContext, run: expectedRun } : expectedRun,
-        );
-      }
-    },
-  );
-
-  it.each([false, true])(
-    'prints the resolved id after conflict resume (explicit target=$0)',
-    async explicitTarget => {
-      const stderr: string[] = [];
-      let reads = 0;
-      let receiptAtPoll: string[] = [];
-      await runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 60,
-          ...(explicitTarget ? { targetUrl: 'https://example.com', skipPreflight: true } : {}),
-        },
-        {
-          ...makeCreds(),
-          stdout: () => {},
-          stderr: line => stderr.push(line),
-          fetchImpl: makeFetch((url, init) => {
-            if (init.method === 'POST')
-              return errorBody('CONFLICT', {
-                reason: 'run_in_flight',
-                currentRunId: 'run_resumed',
-              });
-            if (url.endsWith('/projects/project_1/env'))
-              return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-            reads++;
-            if (reads > 1) receiptAtPoll = [...stderr];
-            return { body: { ...makePassedRun(), runId: 'run_resumed' } };
-          }),
-        },
-      );
-      expect(receiptAtPoll).toContain('Run run_resumed');
-      expect(stderr.filter(line => line === 'Run run_resumed')).toHaveLength(1);
-    },
-  );
-
-  it.each([
-    { links: {}, dashboard: undefined, execution: undefined },
-    {
-      links: { dashboardUrl: 'https://www.testsprite.com/dashboard/tests/test_xyz' },
-      dashboard: 'https://www.testsprite.com/dashboard/tests/test_xyz',
-      execution: undefined,
-    },
-    {
-      links: { executionUrl: 'https://www.testsprite.com/executions/run_abc' },
-      dashboard: undefined,
-      execution: 'https://www.testsprite.com/executions/run_abc',
-    },
-    {
-      links: {
-        dashboardUrl: 'https://www.testsprite.com/dashboard/tests/test_xyz',
-        executionUrl: 'https://www.testsprite.com/executions/run_abc',
-      },
-      dashboard: 'https://www.testsprite.com/dashboard/tests/test_xyz',
-      execution: 'https://www.testsprite.com/executions/run_abc',
-    },
-    {
-      links: { executionUrl: '' },
-      dashboard: undefined,
-      execution: undefined,
-    },
-  ])(
-    'prints a no-wait receipt using only available server links (dashboard=$dashboard execution=$execution)',
-    async ({ links, dashboard, execution }) => {
-      const stderr: string[] = [];
-      const stdout: string[] = [];
-      const response = { ...TRIGGER_RESP, ...links };
-      await runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          testId: 'test_xyz',
-          wait: false,
-          timeoutSeconds: 600,
-        },
-        {
-          ...makeCreds(),
-          stdout: line => stdout.push(line),
-          stderr: line => stderr.push(line),
-          fetchImpl: makeFetch(() => ({ body: response })),
-        },
-      );
-      expect(stderr).toContain('Run run_abc');
-      expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
-        dashboard ? [`Dashboard: ${dashboard}`] : [],
-      );
-      expect(stderr.filter(line => line.startsWith('Execution:'))).toEqual(
-        execution ? [`Execution: ${execution}`] : [],
-      );
-      expect(stdout).toEqual([JSON.stringify(response, null, 2)]);
-    },
-  );
-});
-
-const DASHBOARD_LINK = 'https://www.testsprite.com/dashboard/tests/test_xyz';
-const EXECUTION_LINK = 'https://www.testsprite.com/executions/run_abc';
-
-describe('run text links keep the execution page off the dashboard label', () => {
-  it.each([
-    {
-      name: 'both urls',
-      links: { dashboardUrl: DASHBOARD_LINK, executionUrl: EXECUTION_LINK },
-      dashboard: DASHBOARD_LINK,
-      execution: EXECUTION_LINK,
-    },
-    {
-      name: 'dashboard only',
-      links: { dashboardUrl: DASHBOARD_LINK },
-      dashboard: DASHBOARD_LINK,
-      execution: undefined,
-    },
-    {
-      name: 'execution only',
-      links: { executionUrl: EXECUTION_LINK },
-      dashboard: undefined,
-      execution: EXECUTION_LINK,
-    },
-    {
-      name: 'execution empty',
-      links: { executionUrl: '' },
-      dashboard: undefined,
-      execution: undefined,
-    },
-  ])('no-wait text card and receipt ($name)', async ({ links, dashboard, execution }) => {
-    const stderr: string[] = [];
-    const stdout: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 600,
-      },
-      {
-        ...makeCreds(),
-        stdout: line => stdout.push(line),
-        stderr: line => stderr.push(line),
-        fetchImpl: makeFetch(() => ({ body: { ...TRIGGER_RESP, ...links } })),
-      },
-    );
-    const card = stdout.join('\n');
-    expect(card.includes(`dashboard   ${DASHBOARD_LINK}`)).toBe(dashboard !== undefined);
-    expect(card.includes(`execution   ${EXECUTION_LINK}`)).toBe(execution !== undefined);
-    expect(card).not.toContain('Dashboard:');
-    expect(card).not.toContain('Execution:');
-    expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
-      dashboard ? [`Dashboard: ${dashboard}`] : [],
-    );
-    expect(stderr.filter(line => line.startsWith('Execution:'))).toEqual(
-      execution ? [`Execution: ${execution}`] : [],
-    );
-  });
-
-  it.each([
-    {
-      name: 'both urls',
-      run: { dashboardUrl: DASHBOARD_LINK, executionUrl: EXECUTION_LINK },
-      dashboard: true,
-      execution: true,
-    },
-    {
-      name: 'dashboard only',
-      run: { dashboardUrl: DASHBOARD_LINK },
-      dashboard: true,
-      execution: false,
-    },
-    {
-      name: 'execution only',
-      run: { executionUrl: EXECUTION_LINK },
-      dashboard: false,
-      execution: true,
-    },
-    {
-      name: 'execution null',
-      run: { executionUrl: null },
-      dashboard: false,
-      execution: false,
-    },
-  ])('finished run card ($name)', ({ run, dashboard, execution }) => {
-    const text = renderRunResponseText({ ...makePassedRun(), ...run });
-    expect(text.includes(`dashboard   ${DASHBOARD_LINK}`)).toBe(dashboard);
-    expect(text.includes(`execution   ${EXECUTION_LINK}`)).toBe(execution);
-    if (execution) expect(text).not.toContain(`dashboard   ${EXECUTION_LINK}`);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Billing refusals on the batch surface + per-command telemetry facts
-// ---------------------------------------------------------------------------
-
-describe('runTestRunAll — insufficient credits → exit 12 (single-run parity)', () => {
-  beforeEach(() => {
-    takeTelemetryExtras();
-  });
-  afterEach(() => {
-    takeTelemetryExtras();
-  });
-
-  const batchOpts = {
-    profile: 'default',
-    output: 'json' as const,
-    debug: false,
-    projectId: 'project_be',
-    timeoutSeconds: 60,
-    maxConcurrency: 10,
-  };
-
-  /** The server's own answer when NOTHING dispatched and every refusal was credits. */
-  const CREDITS_402 = {
-    status: 402,
-    body: {
-      error: {
-        code: 'INSUFFICIENT_CREDITS',
-        message: 'Insufficient credits: this run needs 2 credits, you have 0.',
-        nextAction: 'Top up credits on the portal Billing page.',
-        requestId: 'req_402',
-        details: { required: 2 },
-      },
-    },
-  };
-
-  it('--wait: a 402 INSUFFICIENT_CREDITS envelope from the batch route exits 12 with the credits nextAction, not 6', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return CREDITS_402;
-      return { body: { items: [], nextToken: null } };
-    });
-    const err = (await runTestRunAll(
-      { ...batchOpts, wait: true },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(err).toBeInstanceOf(ApiError);
-    expect(err.code).toBe('INSUFFICIENT_CREDITS');
-    expect(err.exitCode).toBe(12);
-    expect(err.message).toContain('Insufficient credits');
-    expect(err.nextAction).toBe('Top up credits on the portal Billing page.');
-    expect(err.requestId).toBe('req_402');
-  });
-
-  const ALL_CREDITS_CONFLICTS: BatchRunFreshResponse = {
-    accepted: [],
-    conflicts: [
-      {
-        testId: 'test_be_01',
-        reason: 'insufficient_credits',
-        message: 'Insufficient credits: need 2, have 0.',
-      },
-      { testId: 'test_be_02', reason: 'insufficient_credits' },
-    ],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  };
-
-  it.each([false, true])(
-    'wait=%s: zero accepted + zero deferred + every conflict insufficient_credits → exit 12 with the server message',
-    async wait => {
-      const { credentialsPath } = makeCreds();
-      const fetchImpl = makeFetch((_url, init) => {
-        if ((init.method ?? 'GET') === 'POST') return { body: ALL_CREDITS_CONFLICTS };
-        return { body: { items: [], nextToken: null } };
-      });
-      const err = (await runTestRunAll(
-        { ...batchOpts, wait },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ).catch(e => e)) as ApiError;
-      expect(err).toBeInstanceOf(ApiError);
-      expect(err.code).toBe('INSUFFICIENT_CREDITS');
-      expect(err.exitCode).toBe(12);
-      expect(err.message).toBe('Insufficient credits: need 2, have 0.');
-      expect(err.nextAction).toContain('/dashboard/settings/billing');
-      expect(err.details).toEqual({
-        reason: 'insufficient_credits',
-        conflicts: ['test_be_01', 'test_be_02'],
-      });
-      // The batch accounting still lands on telemetry for the failed invocation.
-      expect(takeTelemetryExtras()).toMatchObject({
-        accepted: 0,
-        conflicts: 2,
-        deferred: 0,
-        skipped: 0,
-        conflictReason: 'insufficient_credits',
-      });
-    },
-  );
-
-  it('a MIXED conflict set (credits + in-flight) keeps the all-conflict CONFLICT exit 6', async () => {
-    const { credentialsPath } = makeCreds();
-    const mixed: BatchRunFreshResponse = {
-      ...ALL_CREDITS_CONFLICTS,
-      conflicts: [
-        { testId: 'test_be_01', reason: 'insufficient_credits' },
-        { testId: 'test_be_02' }, // legacy shape: in flight
-      ],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: mixed };
-      return { body: { items: [], nextToken: null } };
-    });
-    const err = (await runTestRunAll(
-      { ...batchOpts, wait: false },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(err.code).toBe('CONFLICT');
-    expect(err.exitCode).toBe(6);
-  });
-
-  it('a credits conflict beside an accepted run is a hard conflict after the poll: exit 6, not 12', async () => {
-    const { credentialsPath } = makeCreds();
-    const partial: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_be_01', runId: 'run_ok', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      conflicts: [{ testId: 'test_be_02', reason: 'insufficient_credits' }],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: partial };
-      if (url.includes('/runs/run_ok')) {
-        return { body: { ...makePassedRun(), runId: 'run_ok', testId: 'test_be_01' } };
-      }
-      return { body: { items: [], nextToken: null } };
-    });
-    const err = (await runTestRunAll(
-      { ...batchOpts, wait: true },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(err.code).toBe('CONFLICT');
-    expect(err.exitCode).toBe(6);
-    expect(takeTelemetryExtras()).toEqual({
-      accepted: 1,
-      conflicts: 1,
-      deferred: 0,
-      skipped: 0,
-      conflictReason: 'insufficient_credits',
-      passed: 1,
-      failed: 0,
-      blocked: 0,
-      timedOut: 0,
-    });
-  });
-});
-
-describe('telemetry extras recorded by the run commands', () => {
-  beforeEach(() => {
-    takeTelemetryExtras();
-  });
-  afterEach(() => {
-    takeTelemetryExtras();
-  });
-
-  it('test run --all --wait records dispatch counts + disjoint verdict counts', async () => {
-    const { credentialsPath } = makeCreds();
-    const resp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 't1', runId: 'run_p', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-        { testId: 't2', runId: 'run_b', enqueuedAt: '2026-06-09T10:00:01.000Z' },
-      ],
-      conflicts: [{ testId: 't3', currentRunId: undefined, reason: 'mcp_view_only' }],
-      deferred: [],
-      skippedFrontend: ['fe1'],
-      skippedIntegration: [{ testId: 'int1' }],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: resp };
-      if (url.includes('/runs/run_p')) {
-        return { body: { ...makePassedRun(), runId: 'run_p', testId: 't1' } };
-      }
-      if (url.includes('/runs/run_b')) {
-        return { body: { ...makePassedRun(), runId: 'run_b', testId: 't2', status: 'blocked' } };
-      }
-      return { body: { items: [], nextToken: null } };
-    });
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(() => undefined); // blocked → exit 1 (+ hard conflict → 6); the facts are what's under test
-    expect(takeTelemetryExtras()).toEqual({
-      accepted: 2,
-      conflicts: 1,
-      deferred: 0,
-      skipped: 2,
-      conflictReason: 'mcp_view_only',
-      passed: 1,
-      failed: 0,
-      blocked: 1,
-      timedOut: 0,
-    });
-  });
-
-  it('test run --all (no --wait) records dispatch counts only', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        return {
-          body: {
-            accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-            conflicts: [],
-            deferred: [{ testId: 't2' }],
-            skippedFrontend: [],
-            skippedIntegration: [],
-          } satisfies BatchRunFreshResponse,
-        };
-      }
-      return { body: { items: [], nextToken: null } };
-    });
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 60,
-        maxConcurrency: 10,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(() => undefined); // deferred → exit 7
-    expect(takeTelemetryExtras()).toEqual({ accepted: 1, conflicts: 0, deferred: 1, skipped: 0 });
-  });
-
-  it('test run <id> --wait records the one-run verdict as 0/1 counts', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: makePassedRun() };
-    });
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-    expect(takeTelemetryExtras()).toEqual({ passed: 1, failed: 0, blocked: 0, timedOut: 0 });
-  });
-
-  it('test run <id> --wait on a --timeout records timedOut: 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
-        return { body: TRIGGER_RESP };
-      }
-      return { body: { ...makePassedRun(), status: 'running' as const } };
-    });
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 1,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(() => undefined); // exit 7
-    expect(takeTelemetryExtras()).toEqual({ passed: 0, failed: 0, blocked: 0, timedOut: 1 });
-  });
-});
-
-describe('runTestRunAll — paused workspace on the batch route', () => {
-  beforeEach(() => {
-    takeTelemetryExtras();
-  });
-  afterEach(() => {
-    takeTelemetryExtras();
-  });
-
-  const batchOpts = {
-    profile: 'default',
-    output: 'json' as const,
-    debug: false,
-    projectId: 'project_be',
-    timeoutSeconds: 60,
-    maxConcurrency: 10,
-  };
-
-  /** The server's answer when the WHOLE batch is refused because the workspace is paused —
-   * the same 403 FEATURE_GATED envelope the single-run route returns. */
-  const HOLD_403 = {
-    status: 403,
-    body: {
-      error: {
-        code: 'FEATURE_GATED',
-        message:
-          'This workspace is paused because its subscription ended. Subscribe again, or move it to the Free plan, in Settings → Billing to resume.',
-        nextAction: 'Resolve the payment on the billing page, then retry.',
-        requestId: 'req_403',
-        details: { reason: 'billing_hold', state: 'paused' },
-      },
-    },
-  };
-
-  it('--wait: a 403 FEATURE_GATED envelope from the batch route exits 13 with the envelope nextAction', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return HOLD_403;
-      return { body: { items: [], nextToken: null } };
-    });
-    const err = (await runTestRunAll(
-      { ...batchOpts, wait: true },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(err).toBeInstanceOf(ApiError);
-    expect(err.code).toBe('FEATURE_GATED');
-    expect(err.exitCode).toBe(13);
-    expect(err.message).toContain('This workspace is paused');
-    expect(err.nextAction).toBe('Resolve the payment on the billing page, then retry.');
-    expect(err.requestId).toBe('req_403');
-    expect(err.getDetail('reason')).toBe('billing_hold');
-    expect(err.getDetail('state')).toBe('paused');
-  });
-
-  it('an older backend folding every case into billing_hold conflicts exits 13', async () => {
-    const { credentialsPath } = makeCreds();
-    const allHold: BatchRunFreshResponse = {
-      accepted: [],
-      conflicts: [
-        { testId: 'test_be_01', reason: 'billing_hold', message: 'This workspace is paused.' },
-        { testId: 'test_be_02', reason: 'billing_hold' },
-      ],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: allHold };
-      return { body: { items: [], nextToken: null } };
-    });
-    const stderrLines: string[] = [];
-    const err = (await runTestRunAll(
-      { ...batchOpts, wait: true },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(err.code).toBe('FEATURE_GATED');
-    expect(err.exitCode).toBe(13);
-    // The envelope the CLI builds names the gate's refusal; the conflicts'
-    // deprecated wire spelling still reaches telemetry unchanged.
-    expect(err.getDetail('reason')).toBe('paused');
-    expect(err.nextAction).toContain('/dashboard/settings/billing');
-    // The cause is still named on stderr, not blanket "already in flight".
-    expect(stderrLines.join('\n')).toContain('2 workspace paused');
-    expect(takeTelemetryExtras()).toMatchObject({ conflicts: 2, conflictReason: 'billing_hold' });
-  });
-});
-
-describe('runTestRunAll — pure in-flight conflict wording is restored to origin/dev', () => {
-  it.each([false, true])(
-    'wait=%s: an all in-flight batch keeps the original "already in flight" text',
-    async wait => {
-      const { credentialsPath } = makeCreds();
-      const allInFlight: BatchRunFreshResponse = {
-        accepted: [],
-        // No `reason` at all — the legacy/absent-reason shape, which must still
-        // read exactly as it did on origin/dev, not the reason-aware summary
-        // (that summary is for when some OTHER reason is present instead).
-        conflicts: [{ testId: 'test_be_01' }, { testId: 'test_be_02' }],
-        deferred: [],
-        skippedFrontend: [],
-        skippedIntegration: [],
-      };
-      const fetchImpl = makeFetch((_url, init) => {
-        if ((init.method ?? 'GET') === 'POST') return { body: allInFlight };
-        return { body: { items: [], nextToken: null } };
-      });
-      const err = (await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ).catch(e => e)) as ApiError;
-      expect(err.code).toBe('CONFLICT');
-      expect(err.exitCode).toBe(6);
-      expect(err.message).toBe('Batch run: nothing was queued — 2 tests already in flight.');
-    },
-  );
-
-  it('a hard (unresumable) in-flight conflict mixed with an accepted run keeps the original "could not be resumed" wording', async () => {
-    const { credentialsPath } = makeCreds();
-    const mixedResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-      ],
-      // No `currentRunId` → a HARD conflict (nothing to auto-resume/poll), and
-      // no `reason` → the legacy pure in-flight shape.
-      conflicts: [{ testId: 'test_be_02' }],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: mixedResp };
-      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
-      return { body: makePassedRun() };
-    });
-    const err = (await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(err.code).toBe('CONFLICT');
-    expect(err.exitCode).toBe(6);
-    expect(err.message).toBe('1 test already in flight and could not be resumed — not run.');
-  });
-});
-
-describe('test run --all: dependency refusals in the batch advisory', () => {
-  it('names no_producer and producer_in_flight instead of repeating "not dispatched"', async () => {
-    const { credentialsPath } = makeCreds();
-    const resp: BatchRunFreshResponse = {
-      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      conflicts: [
-        { testId: 't2', reason: 'no_producer', message: 'Missing "x"' },
-        { testId: 't3', reason: 'producer_in_flight', currentRunId: 'run_other' },
-      ],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: resp };
-      return { body: { items: [], nextToken: null } };
-    });
-    const stderr: string[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: false,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(() => undefined);
-    const advisory = stderr.find(l => l.includes('not dispatched')) ?? '';
-    expect(advisory).toContain(
-      '2 tests not dispatched (1 no producer for its variables, 1 producer running in another run), skipped: t2 t3',
-    );
-  });
-});
-
-describe('test run --all --wait: a consumer seeded blocked is not auto-resumed', () => {
-  // The server answers no_producer / producer_in_flight with the id of the
-  // result it seeded BLOCKED for this request, before dispatch.
-  it.each([
-    [
-      'producer_in_flight',
-      '1 producer running in another run — blocked before dispatch.',
-      'Wait for the in-flight run(s) to finish, then retry: t2',
-    ],
-    [
-      'no_producer',
-      '1 no producer for its variables — blocked before dispatch.',
-      'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t2',
-    ],
-  ] as const)(
-    '%s: reports the refusal with exit 6, never polls its seeded result',
-    async (reason, message, nextAction) => {
-      const { credentialsPath } = makeCreds();
-      const resp: BatchRunFreshResponse = {
-        accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-        conflicts: [{ testId: 't2', reason, currentRunId: 'run_seeded_blocked' }],
-        deferred: [],
-        skippedFrontend: [],
-        skippedIntegration: [],
-      };
-      const urls: string[] = [];
-      const fetchImpl = makeFetch((url, init) => {
-        urls.push(url);
-        if ((init.method ?? 'GET') === 'POST') return { body: resp };
-        if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
-        if (url.includes('run_seeded_blocked')) {
-          return {
-            body: {
-              ...makePassedRun(),
-              runId: 'run_seeded_blocked',
-              testId: 't2',
-              status: 'blocked',
-            },
-          };
-        }
-        return { body: makePassedRun() };
-      });
-      const err = (await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ).catch(e => e)) as ApiError;
-      expect(urls.some(u => u.includes('run_seeded_blocked'))).toBe(false);
-      expect(err.code).toBe('CONFLICT');
-      expect(err.exitCode).toBe(6);
-      expect(err.message).toBe(message);
-      expect(err.nextAction).toBe(nextAction);
-    },
-  );
-
-  it('still polls the run id of a reason it has no label for (tunnel-required)', async () => {
-    const { credentialsPath } = makeCreds();
-    const resp: BatchRunFreshResponse = {
-      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      conflicts: [
-        {
-          testId: 't2',
-          reason: 'tunnel-required' as unknown as ConflictReason,
-          currentRunId: 'run_seeded_tunnel',
-        },
-      ],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const urls: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      urls.push(url);
-      if ((init.method ?? 'GET') === 'POST') return { body: resp };
-      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
-      if (url.endsWith('/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
-      if (url.includes('run_seeded_tunnel')) {
-        return {
-          body: { ...makePassedRun(), runId: 'run_seeded_tunnel', testId: 't2', status: 'blocked' },
-        };
-      }
-      return { body: makePassedRun() };
-    });
-    const err = (await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_fe',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(urls.some(u => u.includes('run_seeded_tunnel'))).toBe(true);
-    expect(err.exitCode).toBe(1);
-  });
-
-  it.each([false, true])(
-    'nothing queued, only no_producer (wait=%s): says to add a producer, not to wait',
-    async wait => {
-      const { credentialsPath } = makeCreds();
-      const resp: BatchRunFreshResponse = {
-        accepted: [],
-        conflicts: [
-          { testId: 't1', reason: 'no_producer', currentRunId: 'run_seeded_1' },
-          { testId: 't2', reason: 'no_producer', currentRunId: 'run_seeded_2' },
-        ],
-        deferred: [],
-        skippedFrontend: [],
-        skippedIntegration: [],
-      };
-      const fetchImpl = makeFetch((url, init) => {
-        if ((init.method ?? 'GET') === 'POST') return { body: resp };
-        return { body: { items: [], nextToken: null } };
-      });
-      const err = (await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ).catch(e => e)) as ApiError;
-      expect(err.exitCode).toBe(6);
-      expect(err.message).toBe('Batch run: nothing was queued — 2 no producer for its variables.');
-      expect(err.nextAction).toBe(
-        'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t1 t2',
-      );
-    },
-  );
-
-  it('a mixed hard-conflict batch names who waits and who needs a producer', async () => {
-    const { credentialsPath } = makeCreds();
-    const resp: BatchRunFreshResponse = {
-      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      conflicts: [
-        { testId: 't2', reason: 'producer_in_flight', currentRunId: 'run_seeded_2' },
-        { testId: 't3', reason: 'no_producer', currentRunId: 'run_seeded_3' },
-      ],
-      deferred: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: resp };
-      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
-      return { body: makePassedRun() };
-    });
-    const err = (await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    ).catch(e => e)) as ApiError;
-    expect(err.nextAction).toBe(
-      'Wait for the in-flight run(s) to finish, then retry: t2\n' +
-        'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t3',
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// `--env <name>`: a named environment on the run surfaces
-// ---------------------------------------------------------------------------
-
-describe('test run --env', () => {
-  const ME_ON = { userId: 'u_1', keyId: 'k_1', scopes: [], env: 'development' };
-
-  interface Seen {
-    method: string;
-    url: string;
-    body: unknown;
-  }
-
-  function recordingFetch(me: unknown, seen: Seen[]): typeof globalThis.fetch {
-    return makeFetch((url, init) => {
-      const method = (init.method ?? 'GET').toUpperCase();
-      const body =
-        init.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
-      seen.push({ method, url, body });
-      if (url.endsWith('/me')) return { body: me };
-      if (url.includes('/tests/batch/run')) {
-        return {
-          body: {
-            accepted: [
-              { testId: 'test_xyz', runId: 'run_abc', enqueuedAt: '2026-09-09T00:00:00.000Z' },
-            ],
-            conflicts: [],
-            deferred: [],
-            skippedFrontend: [],
-            skippedIntegration: [],
-          },
-        };
-      }
-      return { body: TRIGGER_RESP };
-    });
-  }
-
-  it('run and rerun expose --env (long flag only, no -e)', async () => {
-    const { createTestCommand } = await import('./test.js');
-    const test = createTestCommand();
-    for (const name of ['run', 'rerun']) {
-      const cmd = test.commands.find(c => c.name() === name)!;
-      const env = cmd.options.find(o => o.long === '--env');
-      expect(env).toBeDefined();
-      expect(env!.short).toBeUndefined();
-    }
-  });
-
-  it('sends `environment` in the trigger body, with no capability probe first', async () => {
-    const { credentialsPath } = makeCreds();
-    const seen: Seen[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        environment: 'staging',
-      },
-      {
-        credentialsPath,
-        fetchImpl: recordingFetch(ME_ON, seen),
-        stdout: () => {},
-        sleep: instantSleep,
-      },
-    );
-    const trigger = seen.find(s => s.method === 'POST' && s.url.includes('/tests/test_xyz/runs'));
-    expect(trigger?.body).toEqual({ source: 'cli', environment: 'staging' });
-    // Naming an environment is an ordinary argument, not a privilege. The
-    // request goes straight out; whether the name resolves is the server's
-    // answer to give, and a round trip asking permission first would only add
-    // a second place for the CLI and the server to disagree.
-    expect(seen.filter(s => s.url.endsWith('/me'))).toEqual([]);
-  });
-
-  it('does not touch /me when --env is absent (byte-identical to today)', async () => {
-    const { credentialsPath } = makeCreds();
-    const seen: Seen[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: recordingFetch(ME_ON, seen),
-        stdout: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(seen.some(s => s.url.endsWith('/me'))).toBe(false);
-    const trigger = seen.find(s => s.method === 'POST');
-    expect(trigger?.body).toEqual({ source: 'cli' });
-  });
-
-  it('a whitespace-only --env is a validation error before any network call', async () => {
-    const { credentialsPath } = makeCreds();
-    const seen: Seen[] = [];
-    await expect(
-      runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          testId: 'test_xyz',
-          wait: false,
-          timeoutSeconds: 60,
-          environment: '   ',
-        },
-        {
-          credentialsPath,
-          fetchImpl: recordingFetch(ME_ON, seen),
-          stdout: () => {},
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(seen).toEqual([]);
-  });
-
-  it('--all: `environment` rides on the batch body too', async () => {
-    const { credentialsPath } = makeCreds();
-    const seen: Seen[] = [];
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        projectId: 'project_1',
-        wait: false,
-        timeoutSeconds: 60,
-        maxConcurrency: 10,
-        environment: 'staging',
-      },
-      {
-        credentialsPath,
-        fetchImpl: recordingFetch(ME_ON, seen),
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    const batch = seen.find(s => s.method === 'POST' && s.url.includes('/tests/batch/run'));
-    expect(batch?.body).toEqual({ projectId: 'project_1', source: 'cli', environment: 'staging' });
-    expect(seen.filter(s => s.url.endsWith('/me'))).toEqual([]);
-  });
-
-  it('renders the environment line on the trigger card when the server reports one', async () => {
-    const { credentialsPath } = makeCreds();
-    const out: string[] = [];
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        environment: 'local-dev',
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(url =>
-          url.endsWith('/me')
-            ? { body: ME_ON }
-            : {
-                body: {
-                  ...TRIGGER_RESP,
-                  targetUrl: 'http://127.0.0.1:55015',
-                  environment: { id: 'env_1', name: 'local-dev' },
-                },
-              },
-        ),
-        stdout: l => out.push(l),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    const text = out.join('\n');
-    expect(text).toContain('environment local-dev');
-    expect(text).toContain('targetUrl   http://127.0.0.1:55015');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// `test run --all` on an EMPTY project (nothing skipped, no filter)
-// is a dead end for a new user: the exit-5 message itself names the generate
-// path so it prints in order after "Error:", and --allow-empty gets the same
-// pointer on stderr. Skipped-tests and filter-miss reasons are NOT an empty
-// project and must not claim it is.
-// ---------------------------------------------------------------------------
-describe('zero-dispatch on an EMPTY project points at test plan generate', () => {
-  const EMPTY_BATCH: BatchRunFreshResponse = {
-    accepted: [],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  };
-  const quiet = (stderr: string[] = []) => ({
-    stdout: () => undefined,
-    stderr: (l: string) => {
-      stderr.push(l);
-    },
-    sleep: () => Promise.resolve(),
-  });
-  function baseOpts(over: Record<string, unknown> = {}) {
-    return {
-      profile: 'default',
-      output: 'text' as const,
-      debug: false,
-      projectId: 'project_be',
-      wait: false,
-      timeoutSeconds: 600,
-      maxConcurrency: 5,
-      ...over,
-    };
-  }
-
-  it('empty project: the exit-5 message names test plan generate with the project id', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    await expect(
-      runTestRunAll(baseOpts() as never, { credentialsPath, fetchImpl, ...quiet() }),
-    ).rejects.toMatchObject({
-      exitCode: 5,
-      message: expect.stringContaining('testsprite test plan generate --project project_be'),
-    });
-  });
-
-  it('empty project + --allow-empty: the pointer still reaches stderr', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    const stderr: string[] = [];
-    await runTestRunAll(baseOpts({ allowEmpty: true }) as never, {
-      credentialsPath,
-      fetchImpl,
-      ...quiet(stderr),
-    });
-    expect(stderr.join('\n')).toContain('testsprite test plan generate --project project_be');
-  });
-
-  it('empty project: the pointer names accept after generate, so the suggested path can run', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    const err = await runTestRunAll(baseOpts() as never, {
-      credentialsPath,
-      fetchImpl,
-      ...quiet(),
-    }).catch((e: unknown) => e as Error);
-    const message = (err as Error).message;
-    const generateAt = message.indexOf('testsprite test plan generate --project project_be');
-    const acceptAt = message.indexOf('testsprite test plan accept --project project_be');
-    expect(generateAt).toBeGreaterThanOrEqual(0);
-    expect(acceptAt).toBeGreaterThan(generateAt);
-    expect(message).toContain('testsprite project docs upload <spec> --project project_be');
-  });
-
-  it('project id from TESTSPRITE_PROJECT_ID (no --project): the exit-5 message still names it', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    await expect(
-      runTestRunAll(baseOpts({ projectId: undefined }) as never, {
-        credentialsPath,
-        fetchImpl,
-        env: { TESTSPRITE_PROJECT_ID: 'project_env' },
-        ...quiet(),
-      }),
-    ).rejects.toMatchObject({
-      exitCode: 5,
-      message: expect.stringContaining('testsprite test plan generate --project project_env'),
-    });
-  });
-
-  it('project id from TESTSPRITE_PROJECT_ID + --allow-empty: the pointer still reaches stderr', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    const stderr: string[] = [];
-    await runTestRunAll(baseOpts({ projectId: undefined, allowEmpty: true }) as never, {
-      credentialsPath,
-      fetchImpl,
-      env: { TESTSPRITE_PROJECT_ID: 'project_env' },
-      ...quiet(stderr),
-    });
-    expect(stderr.join('\n')).toContain('[hint] This project has no tests yet.');
-    expect(stderr.join('\n')).toContain('testsprite test plan generate --project project_env');
-  });
-
-  it('--output json: the exit-5 message carries no pointer (the JSON envelope is unchanged)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    const stderr: string[] = [];
-    await expect(
-      runTestRunAll(baseOpts({ output: 'json' }) as never, {
-        credentialsPath,
-        fetchImpl,
-        ...quiet(stderr),
-      }),
-    ).rejects.toMatchObject({
-      exitCode: 5,
-      message: expect.not.stringContaining('plan generate'),
-    });
-    expect(stderr.join('\n')).not.toContain('[hint]');
-  });
-
-  it('--output json + --allow-empty: no pointer on stderr either', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
-    const stderr: string[] = [];
-    await runTestRunAll(baseOpts({ output: 'json', allowEmpty: true }) as never, {
-      credentialsPath,
-      fetchImpl,
-      ...quiet(stderr),
-    });
-    expect(stderr.join('\n')).not.toContain('[hint]');
-    expect(stderr.join('\n')).not.toContain('plan generate');
-  });
-
-  it('all frontend tests skipped is NOT an empty project: no generate pointer', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1', 'fe_2'] },
-    }));
-    await expect(
-      runTestRunAll(baseOpts() as never, { credentialsPath, fetchImpl, ...quiet() }),
-    ).rejects.toMatchObject({
-      exitCode: 5,
-      message: expect.not.stringContaining('plan generate'),
-    });
-  });
-
-  it('a --filter that matched nothing is NOT an empty project: no generate pointer', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/run')) return { body: EMPTY_BATCH };
-      return {
-        body: {
-          items: [
-            {
-              id: 't1',
-              projectId: 'project_be',
-              name: 'Login flow',
-              type: 'backend',
-              status: 'passed',
-              createdFrom: 'cli',
-              createdAt: '2026-01-01T00:00:00.000Z',
-              updatedAt: '2026-01-01T00:00:00.000Z',
-            },
-          ],
-          nextToken: null,
-        },
-      };
-    });
-    await expect(
-      runTestRunAll(baseOpts({ nameFilter: 'checkout' }) as never, {
-        credentialsPath,
-        fetchImpl,
-        ...quiet(),
-      }),
-    ).rejects.toMatchObject({
-      exitCode: 5,
-      message: expect.not.stringContaining('plan generate'),
-    });
-  });
-});
-
-describe('run output regressions', () => {
-  afterEach(() => vi.restoreAllMocks());
-  it('shows a blocked scheduled local environment reason under --wait', async () => {
-    const reason =
-      'Environment local is on this machine (http://localhost:4900); scheduled runs execute in the cloud and cannot reach it.';
-    const { runId, testId, ...fields } = makePassedRun();
-    const run = {
-      runId,
-      testId,
-      testTitle: null,
-      ...fields,
-      status: 'blocked' as const,
-      failureKind: 'infra',
-      error: reason,
-    };
-    for (const output of ['text', 'json'] as const) {
-      const lines: string[] = [];
-      const err = await runTestRun(
-        {
-          profile: 'default',
-          output,
-          debug: false,
-          testId: 'test_xyz',
-          wait: true,
-          timeoutSeconds: 60,
-        },
-        {
-          ...makeCreds(),
-          fetchImpl: makeFetch((_url, init) => ({
-            body: init.method === 'POST' ? TRIGGER_RESP : run,
-          })),
-          stdout: line => lines.push(line),
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ).catch((error: unknown) => error);
-      expect(err).toMatchObject({ exitCode: 1 });
-      if (output === 'json') expect(lines).toEqual([JSON.stringify(run, null, 2)]);
-      else expect(lines.join('\n')).toContain(`error       ${reason}`);
-    }
-  });
-
-  it.each([false, true])(
-    'uses a polled run createdAt for JUnit with final rescue poll=%s without changing JSON',
-    async rescue => {
-      let clock = 1_000;
-      const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
-      const dir = mkdtempSync(join(tmpdir(), 'batch-junit-timing-'));
-      const reportFile = join(dir, 'report.xml');
-      const lines: string[] = [];
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_1',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-          report: 'junit',
-          reportFile,
-        },
-        {
-          ...makeCreds(),
-          fetchImpl: makeFetch((url, init) => {
-            if (init.method === 'POST') {
-              return {
-                body: {
-                  accepted: [
-                    {
-                      testId: 'test_xyz',
-                      runId: 'run_abc',
-                      enqueuedAt: '2026-05-15T10:00:00.000Z',
-                    },
-                  ],
-                  conflicts: [],
-                  deferred: rescue ? [{ testId: 'later', reason: 'rate_limited' }] : [],
-                  skippedFrontend: [],
-                  skippedIntegration: [],
-                },
-              };
-            }
-            if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
-            return { body: { ...makePassedRun(), startedAt: null } };
-          }),
-          stdout: line => lines.push(line),
-          stderr: () => {},
-          sleep: async () => {
-            if (rescue) clock += 62_000;
-          },
-        },
-      ).catch(err => {
-        if (rescue) expect(err).toMatchObject({ exitCode: 7 });
-        else throw err;
-      });
-      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
-      const xml = readFileSync(reportFile, 'utf8');
-      expect(xml).toContain(`skipped="${rescue ? 1 : 0}" time="30">`);
-      expect(xml).toContain('runId="run_abc" time="30">');
-      const json = JSON.parse(lines[0]!) as { accepted: Record<string, unknown>[] };
-      expect(json.accepted[0]).not.toHaveProperty('createdAt');
-      expect(json.accepted[0]).not.toHaveProperty('durationSeconds');
-      now.mockRestore();
-      rmSync(dir, { recursive: true, force: true });
-    },
-  );
-});
-
-// ---------------------------------------------------------------------------
-// A deferral from an older backend is reported, never resent. Runs queue
-// inside their execution on the server now, so the client has no cap to wait
-// out: no 61 s sleep, no second dispatch, the accepted runs are still awaited.
-// ---------------------------------------------------------------------------
-
-describe('run --all: deferred[] from an older backend is reported, not resent', () => {
-  function deferredBatch(): BatchRunFreshResponse {
-    return {
-      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-10-22T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_later' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-  }
-
-  it('--wait sends one dispatch, never sleeps for the old resend, awaits the accepted run, exits 7', async () => {
-    const { credentialsPath } = makeCreds();
-    let posts = 0;
-    const sleeps: number[] = [];
-    const stderrLines: string[] = [];
-    const stdoutLines: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        posts++;
-        return { body: deferredBatch() };
-      }
-      if (url.includes('/runs/run_ok')) {
-        return { body: { ...makePassedRun(), runId: 'run_ok', testId: 'test_ok' } };
-      }
-      return { body: { items: [], nextToken: null } };
-    });
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 600,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: line => stderrLines.push(line),
-          sleep: async ms => {
-            sleeps.push(ms);
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-    expect(posts).toBe(1);
-    expect(sleeps.filter(ms => ms >= 60_000)).toEqual([]);
-    expect(stderrLines.join('\n')).not.toContain('[deferred-retry]');
-    expect(stderrLines.join('\n')).toContain('Rate-deferred testIds');
-    expect(stderrLines.join('\n')).toContain('test_later');
-    const payload = JSON.parse(stdoutLines.find(l => l.includes('"summary"'))!) as {
-      deferred: Array<{ testId: string }>;
-      summary: { passed: number };
-    };
-    expect(payload.summary.passed).toBe(1);
-    expect(payload.deferred).toEqual([{ testId: 'test_later' }]);
-  });
-
-  it('--wait with every id deferred: one dispatch, no sleep, exit 7', async () => {
-    const { credentialsPath } = makeCreds();
-    let posts = 0;
-    const sleeps: number[] = [];
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        posts++;
-        return { body: { ...deferredBatch(), accepted: [] } };
-      }
-      return { body: { items: [], nextToken: null } };
-    });
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 600,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: async ms => {
-            sleeps.push(ms);
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-    expect(posts).toBe(1);
-    expect(sleeps).toEqual([]);
-  });
-});
-
-describe('run --all --wait: a queued run is waited through', () => {
-  it('queued → running → passed is polled to the verdict and the run is reported passed', async () => {
-    const { credentialsPath } = makeCreds();
-    const seen: string[] = [];
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const sequence = ['queued', 'queued', 'running', 'passed'] as const;
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        return {
-          body: {
-            accepted: [
-              { testId: 'test_q', runId: 'run_q', enqueuedAt: '2026-10-22T10:00:00.000Z' },
-            ],
-            deferred: [],
-            conflicts: [],
-            skippedFrontend: [],
-            skippedIntegration: [],
-          } satisfies BatchRunFreshResponse,
-        };
-      }
-      if (url.includes('/runs/run_q')) {
-        const status = sequence[Math.min(seen.length, sequence.length - 1)]!;
-        seen.push(status);
-        const base = { ...makePassedRun(), runId: 'run_q', testId: 'test_q' };
-        return status === 'passed'
-          ? { body: base }
-          : {
-              body: {
-                ...base,
-                status,
-                finishedAt: null,
-                startedAt: status === 'running' ? base.startedAt : null,
-                stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
-              },
-            };
-      }
-      return { body: { items: [], nextToken: null } };
-    });
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 600,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(seen).toEqual(['queued', 'queued', 'running', 'passed']);
-    const payload = JSON.parse(stdoutLines.find(l => l.includes('"summary"'))!) as {
-      summary: { passed: number; total: number };
-    };
-    expect(payload.summary).toMatchObject({ passed: 1, total: 1 });
-  });
-});
-
-describe('runTestRun --wait — failure recovery hint for a run that is terminal on the first poll', () => {
-  async function runTerminal(
-    output: 'text' | 'json',
-    runStatus: RunResponse['status'],
-    type?: string,
-  ) {
-    const { credentialsPath } = makeCreds();
-    const router = beRunRouter({ type, runStatus, result: () => makeBeResult() });
-    const stderr: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output,
-        debug: false,
-        dryRun: false,
-        testId: 'test_be',
-        wait: true,
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: l => stderr.push(l),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    return {
-      err,
-      hint: stderr.find(l => l.startsWith('Run finished')) ?? '',
-      counts: router.counts,
-    };
-  }
-
-  it.each(['failed', 'blocked'] as const)(
-    'JSON: a %s backend run points at test failure get <test-id>',
-    async runStatus => {
-      const { err, hint, counts } = await runTerminal('json', runStatus);
-      expect(err.exitCode).toBe(1);
-      expect(hint).toContain("'testsprite test failure get test_be'");
-      expect(hint).not.toContain('artifact get');
-      expect(counts.result).toBe(0);
-    },
-  );
-
-  it('JSON: a failed frontend run keeps the run-scoped artifact hint', async () => {
-    const { hint } = await runTerminal('json', 'failed', 'frontend');
-    expect(hint).toContain("'testsprite test artifact get run_abc'");
-  });
-
-  it('JSON: the hint costs one extra type lookup, and only for a failed run', async () => {
-    // `test run` already reads the test once before triggering; the hint adds
-    // at most one GET on top of that, and none when the run passed.
-    const passed = await runTerminal('json', 'passed');
-    const failed = await runTerminal('json', 'failed');
-    expect(passed.err.status).toBe('passed');
-    expect(passed.hint).toBe('');
-    expect(failed.counts.type - passed.counts.type).toBe(1);
-  });
-});
-
-describe('run --all --wait: auth takes precedence over rate-deferred tests', () => {
-  it.each([
-    { verdict: 'auth', deferred: true, exitCode: 3 },
-    { verdict: 'auth', deferred: false, exitCode: 3 },
-    { verdict: 'passed', deferred: true, exitCode: 7 },
-    { verdict: 'failed', deferred: true, exitCode: 7 },
-  ])(
-    '$verdict with deferred=$deferred exits $exitCode',
-    async ({ verdict, deferred, exitCode }) => {
-      const { credentialsPath } = makeCreds();
-      const output: string[] = [];
-      let dispatches = 0;
-      const fetchImpl = makeFetch((url, init) => {
-        if (init.method === 'POST') {
-          return {
-            status: 202,
-            body: {
-              accepted:
-                dispatches++ === 0
-                  ? [{ testId: 'test_xyz', runId: 'run_abc', enqueuedAt: TRIGGER_RESP.enqueuedAt }]
-                  : [],
-              deferred: deferred ? [{ testId: 'test_deferred' }] : [],
-              conflicts: [],
-              skippedFrontend: [],
-              skippedIntegration: [],
-            } satisfies BatchRunFreshResponse,
-          };
-        }
-        if (verdict === 'auth')
-          return {
-            status: 401,
-            body: {
-              error: {
-                code: 'AUTH_INVALID',
-                message: 'Replace invalid credentials',
-                nextAction: 'Log in again',
-                requestId: 'req_auth_deferred',
-              },
-            },
-          };
-        // The poll reads the run with a ?waitSeconds query.
-        if (url.split('?')[0]!.endsWith('/runs/run_abc')) {
-          return { body: { ...makePassedRun(), status: verdict } };
-        }
-        throw new Error(`Unexpected request: ${url}`);
-      });
-      await expect(
-        runTestRunAll(
-          {
-            profile: 'default',
-            output: 'json',
-            debug: false,
-            projectId: 'project_1',
-            wait: true,
-            timeoutSeconds: 60,
-            maxConcurrency: 2,
-            environmentResolutionComplete: true,
-          },
-          {
-            credentialsPath,
-            fetchImpl,
-            sleep: instantSleep,
-            stdout: line => output.push(line),
-            stderr: () => undefined,
-          },
-        ),
-      ).rejects.toMatchObject({ exitCode });
-      const envelope = JSON.parse(output[0]!);
-      expect(envelope.accepted).toHaveLength(1);
-      expect(envelope.deferred).toHaveLength(deferred ? 1 : 0);
-    },
-  );
 });

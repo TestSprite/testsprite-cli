@@ -252,3 +252,22 @@ describe('terminal escape sequences', () => {
     expect(output.text()).toBe('Key: ***\n');
   });
 });
+
+describe('a question that names a server value', () => {
+  // An environment name from the agent's proposal, say: a window-title OSC,
+  // a clear-screen CSI and a carriage return that would redraw the line.
+  const question = 'Password for the "stg\u001b]0;pwned\u0007\u001b[2J\rKey: " environment: ';
+
+  it.each([
+    ['promptText', promptText],
+    ['promptSecret', promptSecret],
+  ])('%s writes it without an escape sequence or a control character', async (_name, prompt) => {
+    const output = new CaptureStream();
+    await prompt(question, { input: Readable.from(['x\n']), output });
+    const written = output.text();
+    // eslint-disable-next-line no-control-regex -- finding control characters is the point.
+    expect(written).not.toMatch(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/);
+    expect(written).toContain('Password for the "stg');
+    expect(written).not.toContain('pwned');
+  });
+});

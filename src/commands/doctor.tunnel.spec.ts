@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
 import { runDoctor } from './doctor.js';
+import { onFakeTimers } from '../../test/helpers/fake-timers.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 
@@ -134,7 +135,7 @@ describe('doctor — Local tunnel', () => {
   it('warns — never fails — when the environment has no tunnel surface', async () => {
     // Production has no tunnel endpoints configured today. A `fail` here would
     // make `doctor` exit 1 for every prod user over a feature they are not using.
-    const check = await tunnelCheck(503, envelope('UNAVAILABLE'));
+    const check = await onFakeTimers(() => tunnelCheck(503, envelope('UNAVAILABLE')));
     expect(check?.status).toBe('warn');
     expect(check?.detail).toMatch(/not available/i);
   });

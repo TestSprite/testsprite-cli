@@ -56,6 +56,20 @@ function fakeClientFactory(
   };
 }
 
+describe('openTunnelSession — the client log lines', () => {
+  it("prints a line the client logs (a server's close reason, say) on one line", async () => {
+    const lines: string[] = [];
+    const fake = fakeClientFactory();
+    const session = await openTunnelSession(
+      { log: line => lines.push(line) },
+      { mint: async () => TLS_MINT, destroy: async () => {}, createClient: fake.factory },
+    );
+    fake.emitLog('Received close tunnel instruction: bye\u001b]0;pwned\u0007\nforged: line');
+    expect(lines).toEqual(['Received close tunnel instruction: bye forged: line']);
+    await session.close();
+  });
+});
+
 describe('openTunnelSession — mint and connect', () => {
   it('passes the mint endpoints through verbatim and never defaults them', async () => {
     const fake = fakeClientFactory();
@@ -528,14 +542,17 @@ describe('openTunnelSession — adopting a caller-supplied client', () => {
 
 describe('TunnelLostError', () => {
   it('is an UNAVAILABLE ApiError so the caller exits 10, not 1', () => {
-    const err = new TunnelLostError('auth-failed', 'run-1');
+    const err = new TunnelLostError('auth-failed', { runId: 'run-1' });
     expect(err).toBeInstanceOf(ApiError);
     expect(err.code).toBe('UNAVAILABLE');
     expect(err.message).toMatch(/tunnel/i);
   });
 
   it('tells a borrower the run lost its route and to check it before re-running', () => {
-    const err = new TunnelLostError('owner-gone', 'run-borrowed-1');
+    const err = new TunnelLostError('owner-gone', {
+      resultId: 'result-borrowed-1',
+      runId: 'run-borrowed-1',
+    });
 
     // The cancel/refund outcome is reported by the run command itself (it is
     // the one that issues the cancel); this error only names the cause and the
@@ -547,16 +564,38 @@ describe('TunnelLostError', () => {
         'The borrowed tunnel for run run-borrowed-1 is no longer registered. It was minted ' +
         'by another process (`testsprite tunnel start`), and that process has stopped or its ' +
         'credential expired. The run cannot reach your app through that tunnel.',
-      nextAction: 'Check the run before re-running: testsprite test wait run-borrowed-1.',
-      details: { reason: 'owner-gone', runId: 'run-borrowed-1' },
+      nextAction: 'Check the run before re-running: testsprite run wait run-borrowed-1.',
+    });
+    expect(err.details).toEqual({
+      reason: 'owner-gone',
+      runId: 'run-borrowed-1',
+      resultId: 'result-borrowed-1',
     });
     expect(err.nextAction).not.toContain('run again');
+  });
+
+  it('an older backend names no launch: the result is named and no wait command is offered', () => {
+    const err = new TunnelLostError('owner-gone', { resultId: 'result-borrowed-1' });
+
+    expect(err.message).toContain('The borrowed tunnel for result result-borrowed-1 is no longer');
+    expect(err.nextAction).toBe('Check the run before re-running.');
+    expect(err.details).toEqual({ reason: 'owner-gone', resultId: 'result-borrowed-1' });
+  });
+
+  it('lost before any run was accepted: no id to name', () => {
+    const err = new TunnelLostError('auth-failed', {});
+
+    expect(err.message).toBe(
+      'The tunnel carrying the run was disconnected by the server and cannot be restored for ' +
+        'this run (auth-failed).',
+    );
+    expect(err.details).toEqual({ reason: 'auth-failed', resultId: null });
   });
 
   it('explains exhausted encrypted data-plane retries and points at the run', () => {
     const err = new TunnelLostError(
       'data-plane-unreachable',
-      'run-tls-1',
+      { resultId: 'result-tls-1', runId: 'run-tls-1' },
       'Data plane tls at data.tun.testsprite.com:443 is unreachable after 60000ms: ' +
         'unable to verify the first certificate',
     );
@@ -564,8 +603,8 @@ describe('TunnelLostError', () => {
     expect(err).toMatchObject({
       code: 'UNAVAILABLE',
       exitCode: 10,
-      nextAction: expect.stringContaining('testsprite test wait run-tls-1'),
-      details: { reason: 'data-plane-unreachable', runId: 'run-tls-1' },
+      nextAction: expect.stringContaining('testsprite run wait run-tls-1'),
+      details: { reason: 'data-plane-unreachable', runId: 'run-tls-1', resultId: 'result-tls-1' },
     });
     expect(err.message).toContain('data.tun.testsprite.com:443');
     expect(err.message).toContain('could not be established for 60s');
@@ -576,15 +615,17 @@ describe('TunnelLostError', () => {
   it('explains plaintext exhaustion with self-hosted service and egress guidance only', () => {
     const err = new TunnelLostError(
       'data-plane-unreachable',
-      'run-plaintext-1',
+      { resultId: 'result-plaintext-1' },
       'Data plane plaintext at selfhost.example:7400 is unreachable after 60000ms: ECONNREFUSED',
     );
 
     expect(err).toMatchObject({
       code: 'UNAVAILABLE',
       exitCode: 10,
-      details: { reason: 'data-plane-unreachable', runId: 'run-plaintext-1' },
+      details: { reason: 'data-plane-unreachable', resultId: 'result-plaintext-1' },
     });
+    // No launch id, so no `run wait` in the hint.
+    expect(err.nextAction).not.toContain('run wait');
     expect(err.message).toContain('selfhost.example:7400');
     expect(err.message).toMatch(/self-hosted tunnel service/i);
     expect(err.message).toMatch(/egress firewall/i);

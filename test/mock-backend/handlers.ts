@@ -24,25 +24,17 @@
 
 import { http, HttpResponse } from 'msw';
 import {
-  failureContextFixture,
-  failureContextNoAnalysisFixture,
   FIXTURE_PROJECT_ID,
   FIXTURE_PROJECT_ID_BACKEND,
-  FIXTURE_TEST_ID_FAILED,
-  FIXTURE_TEST_ID_LARGE_CODE,
-  FIXTURE_TEST_ID_NO_ANALYSIS,
-  FIXTURE_TEST_ID_PASSED,
-  FIXTURE_TEST_ID_RUNNING,
-  latestResultFailedFixture,
-  latestResultPassedFixture,
-  latestResultRunningFixture,
+  FIXTURE_RESULT_ENVIRONMENTS,
   meFixture,
   projectFixtures,
-  testCodeFixture,
-  testCodeLargeFixture,
+  resultDetailFixtures,
+  resultHistoryWindowFixture,
+  resultLineFixtures,
   testFixtures,
-  testStepsFixture,
 } from './fixtures.js';
+import { RESULT_STATUSES, requestedResultStatuses } from '../helpers/result-list.js';
 
 export const DEFAULT_BASE_URL = 'https://api.testsprite.com/api/cli/v1';
 
@@ -113,7 +105,7 @@ function requireApiKey(request: Request): Response | null {
     return errorEnvelope({
       code: 'AUTH_REQUIRED',
       message: 'Authentication is required.',
-      nextAction: 'Run `testsprite auth configure`, or set TESTSPRITE_API_KEY in the environment.',
+      nextAction: 'Run `testsprite setup`, or set TESTSPRITE_API_KEY in the environment.',
       status: 401,
     });
   }
@@ -188,8 +180,6 @@ export function buildHandlers(baseUrl: string = DEFAULT_BASE_URL) {
       let items = testFixtures.filter(t => t.projectId === projectId);
       const type = url.searchParams.get('type');
       if (type) items = items.filter(t => t.type === type);
-      const createdFrom = url.searchParams.get('createdFrom');
-      if (createdFrom) items = items.filter(t => t.createdFrom === createdFrom);
       return HttpResponse.json(
         { items, nextToken: null },
         { headers: { 'x-request-id': 'req_2026_05_05_tests_ok' } },
@@ -207,91 +197,106 @@ export function buildHandlers(baseUrl: string = DEFAULT_BASE_URL) {
       });
     }),
 
-    // /tests/:id/code — inline body when small, presigned URL when >= 100 KB.
-    http.get(`${baseUrl}/tests/:testId/code`, ({ params, request }) => {
+    // /results — the results of one run (`run`) or one test's history (`test`).
+    http.get(`${baseUrl}/results`, ({ request }) => {
       const earlyReturn = requireApiKey(request);
       if (earlyReturn) return earlyReturn;
-      if (params.testId === FIXTURE_TEST_ID_FAILED) {
-        return HttpResponse.json(testCodeFixture, {
-          headers: { 'x-request-id': 'req_2026_05_05_code_ok' },
-        });
+      const query = new URL(request.url).searchParams;
+      const run = query.get('run');
+      const test = query.get('test');
+      if (run !== null && test !== null) {
+        return invalidResultQuery('run', 'pass either `run` or `test`, not both');
       }
-      if (params.testId === FIXTURE_TEST_ID_LARGE_CODE) {
-        return HttpResponse.json(testCodeLargeFixture, {
-          headers: { 'x-request-id': 'req_2026_05_05_code_presigned' },
-        });
+      if (run === null && test === null) {
+        return invalidResultQuery('run', 'pass one of `run` or `test`');
       }
-      return notFoundEnvelope('test', String(params.testId));
-    }),
 
-    // /tests/:id/steps
-    http.get(`${baseUrl}/tests/:testId/steps`, ({ params, request }) => {
-      const earlyReturn = requireApiKey(request);
-      if (earlyReturn) return earlyReturn;
-      if (params.testId !== FIXTURE_TEST_ID_FAILED) {
-        return notFoundEnvelope('test', String(params.testId));
+      const statuses = requestedResultStatuses(query);
+      if (statuses === undefined) return unknownResultStatus();
+      const kept = resultLineFixtures.filter(line => statuses.includes(line.testStatus));
+
+      if (run !== null) {
+        for (const field of ['environment', 'limit']) {
+          if (query.has(field)) {
+            return invalidResultQuery(field, 'applies to `test`, not to `run`');
+          }
+        }
+        if (!resultLineFixtures.some(line => line.runId === run)) {
+          return notFoundEnvelope('run', run);
+        }
+        return HttpResponse.json(
+          { results: kept.filter(line => line.runId === run) },
+          { headers: { 'x-request-id': 'req_2026_05_05_results_run' } },
+        );
+      }
+
+      const testId = String(test);
+      const limit = query.has('limit') ? Number(query.get('limit')) : 20;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return invalidResultQuery('limit', 'limit must be an integer from 1 to 100');
+      }
+      // The test is looked up before the environment name is checked. A test
+      // that exists but has never run has an empty history, not a 404.
+      const lines = resultLineFixtures.filter(line => line.caseKey === testId);
+      if (lines.length === 0 && !testFixtures.some(t => t.id === testId)) {
+        return notFoundEnvelope('test', testId);
+      }
+      const env = query.get('environment');
+      if (env !== null && !(FIXTURE_RESULT_ENVIRONMENTS as readonly string[]).includes(env)) {
+        return invalidResultQuery(
+          'environment',
+          `no environment named "${env}"; this project has: ${FIXTURE_RESULT_ENVIRONMENTS.join(', ')}`,
+        );
       }
       return HttpResponse.json(
-        { items: testStepsFixture, nextToken: null },
-        { headers: { 'x-request-id': 'req_2026_05_05_steps_ok' } },
+        {
+          results: kept
+            .filter(line => line.caseKey === testId)
+            .filter(line => env === null || line.environmentName === env)
+            .slice(0, limit),
+          ...resultHistoryWindowFixture,
+          // A test that has never run has no runs to hold back.
+          ...(lines.length === 0 ? { hiddenRunCount: 0 } : {}),
+        },
+        { headers: { 'x-request-id': 'req_2026_05_05_results_test' } },
       );
     }),
 
-    // /tests/:id/result
-    http.get(`${baseUrl}/tests/:testId/result`, ({ params, request }) => {
+    // /results/:id — one result with its steps.
+    http.get(`${baseUrl}/results/:resultId`, ({ params, request }) => {
       const earlyReturn = requireApiKey(request);
       if (earlyReturn) return earlyReturn;
-      if (params.testId === FIXTURE_TEST_ID_FAILED) {
-        return HttpResponse.json(latestResultFailedFixture, {
-          headers: { 'x-request-id': 'req_2026_05_05_result_failed' },
-        });
-      }
-      if (params.testId === FIXTURE_TEST_ID_PASSED) {
-        return HttpResponse.json(latestResultPassedFixture, {
-          headers: { 'x-request-id': 'req_2026_05_05_result_passed' },
-        });
-      }
-      if (params.testId === FIXTURE_TEST_ID_RUNNING) {
-        return HttpResponse.json(latestResultRunningFixture, {
-          headers: { 'x-request-id': 'req_2026_05_05_result_running' },
-        });
-      }
-      return notFoundEnvelope('test', String(params.testId));
-    }),
-
-    // /tests/:id/failure — agent-facing bundle.
-    http.get(`${baseUrl}/tests/:testId/failure`, ({ params, request }) => {
-      const earlyReturn = requireApiKey(request);
-      if (earlyReturn) return earlyReturn;
-      if (params.testId === FIXTURE_TEST_ID_FAILED) {
-        return HttpResponse.json(failureContextFixture, {
-          headers: { 'x-request-id': 'req_2026_05_05_failure_ok' },
-        });
-      }
-      if (params.testId === FIXTURE_TEST_ID_NO_ANALYSIS) {
-        return HttpResponse.json(failureContextNoAnalysisFixture, {
-          headers: { 'x-request-id': 'req_2026_05_05_failure_no_analysis' },
-        });
-      }
-      if (params.testId === FIXTURE_TEST_ID_PASSED) {
-        // Test exists, but it is currently passing — the CLI error spec §8.2.
-        return errorEnvelope({
-          code: 'NOT_FOUND',
-          message: 'Test has no failing run.',
-          nextAction:
-            'Test has no failing run. Use `testsprite test result <test-id>` to inspect the latest result.',
-          status: 404,
-          requestId: 'req_2026_05_05_failure_no_failing_run',
-          details: {
-            resource: 'test',
-            id: String(params.testId),
-            reason: 'no_failing_run',
-          },
-        });
-      }
-      return notFoundEnvelope('test', String(params.testId));
+      const detail = resultDetailFixtures[String(params.resultId)];
+      if (!detail) return notFoundEnvelope('result', String(params.resultId));
+      return HttpResponse.json(detail, {
+        headers: { 'x-request-id': 'req_2026_05_05_result_detail' },
+      });
     }),
   ];
+}
+
+/**
+ * How the server refuses a `status` it does not know: its query validation
+ * fails, so the reason is the message and nothing names the field.
+ */
+function unknownResultStatus(): Response {
+  return errorEnvelope({
+    code: 'VALIDATION_ERROR',
+    message: `status must be one of ${RESULT_STATUSES.join(', ').toLowerCase()}`,
+    nextAction: '',
+    status: 400,
+  });
+}
+
+/** How the server refuses the run, test, env or limit of a `/results` query. */
+function invalidResultQuery(field: string, reason: string): Response {
+  return errorEnvelope({
+    code: 'VALIDATION_ERROR',
+    message: 'Invalid request.',
+    nextAction: `Field \`${field}\` is invalid: ${reason}. See \`testsprite result list --help\` for accepted values.`,
+    status: 400,
+    details: { field, reason },
+  });
 }
 
 /** Default-happy handlers, bound to the dev base URL. */
@@ -339,16 +344,19 @@ export const errorHandlers = {
       }),
     ),
 
-  /** Force every `/tests/:id/result` request to return `CONFLICT`. */
+  /**
+   * Synthetic envelope-shape fixture: force `/results/:resultId` to return
+   * `CONFLICT`. The route is arbitrary (it is not documented to send a 409);
+   * only the CONFLICT envelope is under test.
+   */
   conflict: (baseUrl: string = DEFAULT_BASE_URL) =>
-    http.get(`${baseUrl}/tests/:testId/result`, () =>
+    http.get(`${baseUrl}/results/:resultId`, () =>
       errorEnvelope({
         code: 'CONFLICT',
-        message: 'Snapshot in flight; retry shortly.',
-        nextAction:
-          'Snapshot in flight; retry in a few seconds. The CLI re-fetches against a single `snapshotId` so partial reads are safe.',
+        message: 'Conflict; retry shortly.',
+        nextAction: 'Retry in a few seconds.',
         status: 409,
-        details: { reason: 'snapshot_in_flight' },
+        details: { reason: 'synthetic_conflict' },
       }),
     ),
 
@@ -377,16 +385,20 @@ export const errorHandlers = {
       }),
     ),
 
-  /** Force the `failure` endpoint for a known-good id to return `UNSUPPORTED`. */
+  /**
+   * Synthetic envelope-shape fixture: force `/results` to return
+   * `UNSUPPORTED`. The route is arbitrary (it is not documented to send a 501);
+   * only the UNSUPPORTED envelope is under test.
+   */
   unsupported: (baseUrl: string = DEFAULT_BASE_URL) =>
-    http.get(`${baseUrl}/tests/:testId/failure`, () =>
+    http.get(`${baseUrl}/results`, () =>
       errorEnvelope({
         code: 'UNSUPPORTED',
         message: 'Operation not supported on this backend version.',
         nextAction:
           'This feature is not available on the current backend version. Upgrade the backend or use the documented fallback.',
         status: 501,
-        details: { feature: 'failure_bundle' },
+        details: { feature: 'synthetic_feature' },
       }),
     ),
 

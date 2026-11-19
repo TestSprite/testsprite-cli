@@ -2,14 +2,21 @@ import { createWriteStream, statSync } from 'node:fs';
 import { rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { localValidationError, TransportError } from './errors.js';
-import { isNonDispatchedStatus, type CiSummary } from './gh-output.js';
+import { InterruptError, localValidationError, TransportError } from './errors.js';
+import { isNonDispatchedStatus, type CiRunRow, type CiSummary } from './gh-output.js';
+import { sharedLaunchId } from './run-render.js';
 
 export type JUnitReportFormat = 'junit';
 
-/** Minimal testcase input shared by batch run and batch rerun poll results. */
+/** Minimal testcase input shared by the batch `run` and `run --testlist` poll results. */
 export interface JUnitTestResult {
   testId: string;
+  /** The result id (wire name); the `resultId` attribute of the testcase. */
+  resultId?: string;
+  /**
+   * The launch the result belongs to (wire name). When every case that names
+   * a result shares it, it is the `resultId` attribute of the testsuite.
+   */
   runId?: string;
   status: string;
   /** Observed on polled runs; used for classname when --project is omitted. */
@@ -69,7 +76,7 @@ export interface JUnitReportFlagOptions {
   reportFile?: string;
   reportSuiteName?: string;
   wait: boolean;
-  /** True when the invocation is a batch path (run --all or rerun batch). */
+  /** True when the invocation is a batch path (a project or several named IDs). */
   batchPath: boolean;
 }
 
@@ -105,7 +112,7 @@ export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
   if (!opts.batchPath) {
     throw localValidationError(
       'report',
-      '--report junit only applies to batch --wait runs (test run --all, or test rerun --all / multiple test ids)',
+      '--report junit only applies to batch --wait runs (run --project, or multiple test ids)',
     );
   }
   if (!opts.wait) {
@@ -169,7 +176,7 @@ type JUnitOutcome = 'passed' | 'failure' | 'error' | 'skipped';
 
 function classifyJUnitOutcome(status: string, error?: JUnitTestResult['error']): JUnitOutcome {
   if (status === 'passed') return 'passed';
-  if (isNonDispatchedStatus(status)) return 'skipped';
+  if (status === 'running' || isNonDispatchedStatus(status)) return 'skipped';
   if (status === 'error' || error?.exitCode === 3) return 'error';
   return 'failure';
 }
@@ -191,9 +198,12 @@ function renderTestcase(result: JUnitTestResult, classname: string, displayName?
   const cls = escapeXml(classname);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
-  const runAttr = result.runId ? ` runId="${escapeXml(result.runId)}"` : '';
+  // The testcase names its own result. Its launch is the suite's, when the
+  // suite has one.
+  const { resultId } = { resultId: result.resultId };
+  const resultAttr = resultId ? ` resultId="${escapeXml(resultId)}"` : '';
   const lines = [
-    `    <testcase classname="${cls}" name="${name}"${idAttr}${runAttr} time="${time}">`,
+    `    <testcase classname="${cls}" name="${name}"${idAttr}${resultAttr} time="${time}">`,
   ];
 
   if (outcome === 'failure') {
@@ -202,7 +212,7 @@ function renderTestcase(result: JUnitTestResult, classname: string, displayName?
     const body = escapeXml(
       [
         `status: ${result.status}`,
-        result.runId ? `runId: ${result.runId}` : undefined,
+        resultId ? `resultId: ${resultId}` : undefined,
         result.error?.code ? `code: ${result.error.code}` : undefined,
         result.error?.message ? `message: ${result.error.message}` : undefined,
       ]
@@ -217,16 +227,18 @@ function renderTestcase(result: JUnitTestResult, classname: string, displayName?
       [
         result.error?.code ? `code: ${result.error.code}` : undefined,
         result.error?.message ? `message: ${result.error.message}` : undefined,
-        result.runId ? `runId: ${result.runId}` : undefined,
+        resultId ? `resultId: ${resultId}` : undefined,
       ]
         .filter(Boolean)
         .join('\n'),
     );
     lines.push(`      <error message="${message}" type="${type}">${body}</error>`);
   } else if (outcome === 'skipped') {
-    lines.push(
-      `      <skipped message="${escapeXml(result.skipReason ?? failureMessage(result))}"/>`,
-    );
+    const reason =
+      result.status === 'running'
+        ? 'Still running when the wait ended'
+        : (result.skipReason ?? failureMessage(result));
+    lines.push(`      <skipped message="${escapeXml(reason)}"/>`);
   }
 
   lines.push('    </testcase>');
@@ -238,7 +250,7 @@ function renderTestcase(result: JUnitTestResult, classname: string, displayName?
  * and ignore extra attributes, so rows sharing both collapse into one — a
  * same-name pair from a multi-project list then loses one verdict and one
  * run's diagnostics (#515). The stable logical testId — not the ephemeral
- * runId, which would break cross-run comparison — joins the standard identity
+ * result id, which would break cross-run comparison — joins the standard identity
  * for colliding groups only: unique names render exactly as before.
  */
 function resolveJUnitDisplayNames(
@@ -267,7 +279,7 @@ function resolveJUnitDisplayNames(
   // an injective encoded suffix, so the set ends pairwise distinct and the
   // loop terminates. A group whose rows all share one testId can never be
   // separated by any suffix — the rows are exact duplicates — so it is left
-  // alone instead of spinning to the round cap (testlist run can pass the
+  // alone instead of spinning to the round cap (run --testlist can pass the
   // same id twice, billing each row).
   for (let round = 0; round <= results.length; round++) {
     const groups = new Map<string, { count: number; testIds: Set<string> }>();
@@ -296,6 +308,16 @@ function resolveJUnitDisplayNames(
  * Build a JUnit XML document from batch results, including skipped members. Per-`testcase` `time` is
  * the run's wall-clock duration (from `startedAt`/`finishedAt`); the `testsuite`
  * `time` is their sum. `time` falls back to `0` for a run with no timing.
+ *
+ * A testcase carries the `resultId` it names. The testsuite carries `resultId`:
+ * the launch the testcases that ran here share, and only when every testcase
+ * that names a result, skipped ones included, belongs to it too. So a suite
+ * with a skipped test another run holds, one whose tests ran in several
+ * launches, one where nothing ran (all of it held by an earlier run), or one
+ * from a backend that names no launch, carries none. A test this invocation
+ * joined (already running, then waited on) ran here, so a batch that only
+ * joined one run names that run. A test that never got a result names no
+ * launch and does not count.
  */
 export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   const results = opts.results;
@@ -315,6 +337,11 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
+  // The run this invocation's tests ran in, and only when no testcase, skipped
+  // ones included, names a result of another run.
+  const own = sharedLaunchId(results.filter(result => !isNonDispatchedStatus(result.status)));
+  const launchId = own !== undefined && sharedLaunchId(results) === own ? own : undefined;
+  const runAttr = launchId !== undefined ? ` runId="${escapeXml(launchId)}"` : '';
   const displayNames = resolveJUnitDisplayNames(results, opts.classname);
   const testcases = results
     .map((r, index) => renderTestcase(r, r.classname ?? opts.classname, displayNames[index]))
@@ -323,7 +350,7 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   return [
     XML_DECL,
     '<testsuites>',
-    `  <testsuite name="${suiteName}" tests="${results.length}" failures="${failures}" errors="${errors}" skipped="${skipped}" time="${formatTime(totalSeconds)}">`,
+    `  <testsuite name="${suiteName}"${runAttr} tests="${results.length}" failures="${failures}" errors="${errors}" skipped="${skipped}" time="${formatTime(totalSeconds)}">`,
     testcases,
     '  </testsuite>',
     '</testsuites>',
@@ -332,8 +359,25 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
 }
 
 /**
+ * One non-dispatched summary row as a skipped JUnit result, with its reason
+ * (or its status when it has none). A test another run already holds keeps
+ * that run's result and launch.
+ */
+export function skippedRowFromSummary(row: CiRunRow): JUnitTestResult {
+  return {
+    testId: row.testId ?? row.resultId ?? row.runId ?? '(unknown)',
+    ...(row.resultId !== undefined ? { resultId: row.resultId } : {}),
+    ...(row.runId !== undefined ? { runId: row.runId } : {}),
+    status: 'skipped',
+    skipReason: row.error ?? row.status,
+  };
+}
+
+/**
  * The summary's non-dispatched rows (deferred / conflict / not-found) as
- * skipped JUnit results. Accepted rows carry run statuses and today never
+ * skipped JUnit results. A test another run already holds names that run's
+ * result and launch, so the suite does not name its launch as this
+ * invocation's run (see `buildJUnitReport`). Accepted rows carry run statuses and today never
  * match `isNonDispatchedStatus`, but the two vocabularies are only disjoint
  * by convention: `skipped` is a word both could use. So a member already in
  * `dispatched` (the polled results the caller is writing) is left out here
@@ -345,9 +389,31 @@ export function skippedJUnitResultsFromSummary(
   dispatched: ReadonlyArray<Pick<JUnitTestResult, 'testId'>> = [],
 ): JUnitTestResult[] {
   const alreadyIncluded = new Set(dispatched.map(row => row.testId));
-  return summary.runs
-    .filter(row => isNonDispatchedStatus(row.status) && !alreadyIncluded.has(row.testId))
-    .map(row => ({ testId: row.testId, status: 'skipped', skipReason: row.error ?? row.status }));
+  return summary.results
+    .filter(
+      row => isNonDispatchedStatus(row.status) && (!row.testId || !alreadyIncluded.has(row.testId)),
+    )
+    .map(skippedRowFromSummary);
+}
+
+/**
+ * The summary's rows as the report of a batch that stopped before its runs
+ * were awaited: a test that never dispatched is skipped with its reason, and
+ * every other row is an error with its own note, or `failure` when it has
+ * none. Each row keeps its result and launch.
+ */
+export function junitRowsFromSummary(summary: CiSummary, failure: string): JUnitTestResult[] {
+  return summary.results.map(row =>
+    isNonDispatchedStatus(row.status)
+      ? skippedRowFromSummary(row)
+      : {
+          testId: row.testId ?? row.resultId ?? row.runId ?? '(unknown)',
+          ...(row.resultId !== undefined ? { resultId: row.resultId } : {}),
+          ...(row.runId !== undefined ? { runId: row.runId } : {}),
+          status: 'error',
+          error: { code: 'UNSUPPORTED', message: row.error ?? failure, exitCode: 7 },
+        },
+  );
 }
 
 function errorCode(err: unknown): string {
@@ -450,4 +516,29 @@ export async function writeJUnitReportFile(rawPath: string, xml: string): Promis
       });
     });
   });
+}
+
+/**
+ * Write a run's JUnit report (`write`) when the command may already owe an
+ * exit: a failed or timed-out test, one not dispatched, a refused request.
+ * Then the report is best-effort: one that cannot be written (its directory
+ * gone, say) is a line on stderr and the exit owed stands. With nothing owed,
+ * the write's error is the command's. An interrupt always propagates.
+ */
+export async function writeReportOwing(
+  owesAnExit: boolean,
+  write: () => Promise<void>,
+  stderr: (line: string) => void,
+  context: { label: string; what?: string },
+): Promise<void> {
+  if (!owesAnExit) return write();
+  try {
+    await write();
+  } catch (err) {
+    if (err instanceof InterruptError) throw err;
+    stderr(
+      `[${context.label}] could not write ${context.what ?? 'the JUnit report'}: ` +
+        `${err instanceof Error ? err.message : String(err)}; continuing`,
+    );
+  }
 }

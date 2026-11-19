@@ -11,6 +11,8 @@
  *   to verify the CLI forwards them to stderr verbatim.
  */
 
+import type { ResultDetail, ResultLine, ResultStep } from '../../src/lib/result/types.js';
+
 export const FIXTURE_DEV_USER_ID = '11111111-1111-4111-8111-111111111111';
 export const FIXTURE_KEY_ID = 'key_2026_05_05_abc';
 
@@ -18,14 +20,11 @@ export const FIXTURE_PROJECT_ID = 'project_b3c91efa';
 export const FIXTURE_PROJECT_ID_BACKEND = 'project_a47b2c11';
 export const FIXTURE_TEST_ID_FAILED = 'test_8f2a4d10';
 export const FIXTURE_TEST_ID_PASSED = 'test_3a91bb02';
-export const FIXTURE_TEST_ID_NO_FAILURE = 'test_3a91bb02';
 export const FIXTURE_TEST_ID_NO_ANALYSIS = 'test_5d92e007';
 export const FIXTURE_TEST_ID_RUNNING = 'test_running_77c2';
 export const FIXTURE_TEST_ID_BLOCKED = 'test_blocked_4f7a';
 export const FIXTURE_TEST_ID_LARGE_CODE = 'test_large_code_42b9';
 export const FIXTURE_TEST_ID_NOT_FOUND = 'test_does_not_exist';
-export const FIXTURE_RUN_ID = 'run_abc';
-export const FIXTURE_SNAPSHOT_ID = 'snap_2026_05_05_b2f9a1c8';
 export const FIXTURE_TARGET_URL = 'https://staging.example.com/checkout';
 
 export const meFixture = {
@@ -58,326 +57,307 @@ export const testFixtures = [
   {
     id: FIXTURE_TEST_ID_FAILED,
     projectId: FIXTURE_PROJECT_ID,
-    name: 'Checkout happy path',
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-001',
+    title: 'Checkout happy path',
+    description: null,
     type: 'frontend' as const,
-    createdFrom: 'portal' as const,
-    status: 'failed' as const,
+    category: 'Checkout',
+    priority: 'High',
+    version: { hash: 'a3f9c2e1d4b7', label: 'v1.0' },
+    stepCount: 6,
     createdAt: '2026-04-20T11:00:00.000Z',
     updatedAt: '2026-05-05T12:34:56.000Z',
-    details: {
-      processingStatus: 'Idle',
-      testStatus: 'Failed',
-      rawStatus: 'ps=Idle; ts=Failed',
-    },
   },
   {
     id: FIXTURE_TEST_ID_PASSED,
     projectId: FIXTURE_PROJECT_ID,
-    name: 'Checkout — declined card',
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-002',
+    title: 'Checkout — declined card',
+    description: null,
     type: 'frontend' as const,
-    createdFrom: 'portal' as const,
-    status: 'passed' as const,
+    category: 'Checkout',
+    priority: null,
+    version: { hash: '7c1e0b9a5d22', label: 'v1.0' },
+    stepCount: 5,
     createdAt: '2026-04-20T11:00:00.000Z',
     updatedAt: '2026-05-05T08:00:00.000Z',
-    details: {
-      processingStatus: 'Idle',
-      testStatus: 'Passed',
-      rawStatus: 'ps=Idle; ts=Passed',
-    },
   },
   {
     id: FIXTURE_TEST_ID_NO_ANALYSIS,
     projectId: FIXTURE_PROJECT_ID,
-    name: 'Smoke — health check',
+    projectName: 'Checkout',
+    slug: 'SMOKE-001',
+    title: 'Smoke — health check',
+    description: null,
     type: 'backend' as const,
-    createdFrom: 'mcp' as const,
-    status: 'failed' as const,
+    category: 'Smoke',
+    priority: null,
+    version: { hash: '0d1e2f3a4b5c', label: 'v1.0' },
+    stepCount: null,
     createdAt: '2026-04-22T09:00:00.000Z',
     updatedAt: '2026-05-05T11:00:30.000Z',
-    details: {
-      processingStatus: null,
-      testStatus: 'FAILED',
-      rawStatus: 'ts=FAILED',
-    },
   },
   {
     id: FIXTURE_TEST_ID_RUNNING,
     projectId: FIXTURE_PROJECT_ID,
-    name: 'Checkout — concurrent users',
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-003',
+    title: 'Checkout — concurrent users',
+    description: null,
     type: 'frontend' as const,
-    createdFrom: 'portal' as const,
-    status: 'running' as const,
+    category: 'Checkout',
+    priority: null,
+    version: { hash: '6a7b8c9d0e1f', label: 'v1.0' },
+    stepCount: 4,
     createdAt: '2026-04-25T15:00:00.000Z',
     updatedAt: '2026-05-05T12:34:00.000Z',
-    details: {
-      processingStatus: 'Executing',
-      testStatus: null,
-      rawStatus: 'ps=Executing; ts=null',
-    },
   },
   {
-    // Distinct `blocked` row. Previously this fixture
-    // would have collapsed to `failed`; the dedicated row keeps the
-    // mock-backend handler tests honest about the new public value.
     id: FIXTURE_TEST_ID_BLOCKED,
     projectId: FIXTURE_PROJECT_ID,
-    name: 'Checkout — coupon redemption',
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-004',
+    title: 'Checkout — coupon redemption',
+    description: null,
     type: 'frontend' as const,
-    createdFrom: 'portal' as const,
-    status: 'blocked' as const,
+    category: 'Checkout',
+    priority: null,
+    version: { hash: 'e5d4c3b2a101', label: 'v1.0' },
+    stepCount: 6,
     createdAt: '2026-04-21T09:00:00.000Z',
     updatedAt: '2026-05-05T13:01:12.000Z',
-    details: {
-      processingStatus: 'Idle',
-      testStatus: 'Blocked',
-      rawStatus: 'ps=Idle; ts=Blocked',
-    },
   },
   {
     id: FIXTURE_TEST_ID_LARGE_CODE,
     projectId: FIXTURE_PROJECT_ID,
-    name: 'End-to-end suite — full',
+    projectName: 'Checkout',
+    slug: 'E2E-001',
+    title: 'End-to-end suite — full',
+    description: null,
     type: 'frontend' as const,
-    createdFrom: 'portal' as const,
-    status: 'ready' as const,
+    category: 'End-to-end',
+    priority: null,
+    version: { hash: '1f2e3d4c5b6a', label: 'v1.0' },
+    stepCount: 40,
     createdAt: '2026-04-28T09:00:00.000Z',
     updatedAt: '2026-05-04T18:00:00.000Z',
-    details: {
-      processingStatus: 'Idle',
-      testStatus: null,
-      rawStatus: 'ps=Idle; ts=null',
-    },
   },
 ];
 
-export const testCodeFixture = {
-  testId: FIXTURE_TEST_ID_FAILED,
-  language: 'typescript' as const,
-  framework: 'playwright' as const,
-  code: [
-    "import { test, expect } from '@playwright/test';",
-    "test('checkout happy path', async ({ page }) => {",
-    '  await page.goto(process.env.TARGET_URL!);',
-    '  await page.click(\'[data-testid="cart"]\');',
-    '  await page.click(\'[data-testid="submit"]\');',
-    "  await expect(page.getByRole('heading', { name: 'Order placed' })).toBeVisible();",
-    '});',
-    '',
-  ].join('\n'),
-  codeVersion: 'v3',
-  etag: 'sha256:c7c4a4f6c1b8c2e5',
-};
+// ---------------------------------------------------------------------------
+// GET /results, GET /results/:resultId
+// ---------------------------------------------------------------------------
+
+/** One run with a passed, a failed, a blocked and a cancelled result. */
+export const FIXTURE_RESULT_RUN_ID = 'exec_7c41d9e2';
+/** An earlier run that holds one older result of the failed test. */
+export const FIXTURE_RESULT_RUN_ID_EARLIER = 'exec_3b08aa15';
+export const FIXTURE_RESULT_ID_PASSED = 'result_passed_01';
+export const FIXTURE_RESULT_ID_FAILED = 'result_failed_02';
+export const FIXTURE_RESULT_ID_BLOCKED = 'result_blocked_03';
+/** Listed only when `status` names `cancelled`. */
+export const FIXTURE_RESULT_ID_CANCELLED = 'result_cancelled_04';
+export const FIXTURE_RESULT_ID_EARLIER = 'result_earlier_05';
+/** The environment names `?test=…&env=` accepts; any other name is a 400. */
+export const FIXTURE_RESULT_ENVIRONMENTS = ['staging', 'production'] as const;
 
 /**
- * Presigned-URL variant of the code endpoint, returned by the facade
- * when the source is >= 100 KB. The `code` field carries an `https://`
- * URL instead of the source body.
+ * Every result the mock holds, newest first, as `GET /results` lists them.
+ * A line's `caseKey` is the id of its test: the value `?test=` takes.
  */
-export const testCodeLargeFixture = {
-  testId: FIXTURE_TEST_ID_LARGE_CODE,
-  language: 'typescript' as const,
-  framework: 'playwright' as const,
-  code: 'https://s3-presigned.example.com/codes/test_large_code_42b9?X-Amz-fixture',
-  codeVersion: 'v1',
-  etag: 'sha256:9182a0bd71f4c85c',
-};
-
-export const testStepsFixture = [
+export const resultLineFixtures: ResultLine[] = [
   {
-    testId: FIXTURE_TEST_ID_FAILED,
-    stepIndex: 4,
+    resultId: FIXTURE_RESULT_ID_CANCELLED,
+    runId: FIXTURE_RESULT_RUN_ID,
+    caseKey: FIXTURE_TEST_ID_RUNNING,
+    title: 'Order history lists the last order',
+    testStatus: 'CANCELLED',
+    processStatus: 'Idle',
+    error: null,
+    blockedReason: null,
+    environmentName: 'staging',
+    created: '2026-05-05T12:34:03.000Z',
+  },
+  {
+    resultId: FIXTURE_RESULT_ID_BLOCKED,
+    runId: FIXTURE_RESULT_RUN_ID,
+    caseKey: FIXTURE_TEST_ID_BLOCKED,
+    title: 'Account page shows the current plan',
+    testStatus: 'BLOCKED',
+    processStatus: 'Idle',
+    error: null,
+    blockedReason: 'Sign-in failed, so the test never started.',
+    environmentName: 'staging',
+    created: '2026-05-05T12:34:02.000Z',
+  },
+  {
+    resultId: FIXTURE_RESULT_ID_FAILED,
+    runId: FIXTURE_RESULT_RUN_ID,
+    caseKey: FIXTURE_TEST_ID_FAILED,
+    title: 'Checkout shows the order confirmation',
+    testStatus: 'FAILED',
+    processStatus: 'Idle',
+    error: 'Expected the order confirmation heading, but it never appeared.',
+    blockedReason: null,
+    environmentName: 'staging',
+    created: '2026-05-05T12:34:01.000Z',
+  },
+  {
+    resultId: FIXTURE_RESULT_ID_PASSED,
+    runId: FIXTURE_RESULT_RUN_ID,
+    caseKey: FIXTURE_TEST_ID_PASSED,
+    title: 'Login with a valid account',
+    testStatus: 'PASSED',
+    processStatus: 'Idle',
+    error: null,
+    blockedReason: null,
+    environmentName: 'staging',
+    created: '2026-05-05T12:34:00.000Z',
+  },
+  {
+    resultId: FIXTURE_RESULT_ID_EARLIER,
+    runId: FIXTURE_RESULT_RUN_ID_EARLIER,
+    caseKey: FIXTURE_TEST_ID_FAILED,
+    title: 'Checkout shows the order confirmation',
+    testStatus: 'PASSED',
+    processStatus: 'Idle',
+    error: null,
+    blockedReason: null,
+    environmentName: 'production',
+    created: '2026-05-04T09:00:00.000Z',
+  },
+];
+
+/** What a test's history reports about the plan's history window. */
+export const resultHistoryWindowFixture = { hiddenRunCount: 2, retentionDays: 30 };
+
+const resultStepFixtures: ResultStep[] = [
+  {
+    stepIndex: '1',
+    type: 'action',
     action: 'click',
     description: 'Click the cart icon',
-    status: 'passed' as const,
-    screenshotUrl: 'https://s3-presigned.example.com/snap/04.png?X-Amz-fixture',
-    htmlSnapshotUrl: 'https://s3-presigned.example.com/snap/04.html?X-Amz-fixture',
-    runIdIfAvailable: FIXTURE_RUN_ID,
-    codeVersion: 'v3',
-    capturedAt: '2026-05-05T12:34:55.000Z',
-    updatedAt: '2026-05-05T12:34:56.000Z',
+    status: 'passed',
+    selector: '[data-testid="cart"]',
+    url: FIXTURE_TARGET_URL,
+    healed: false,
+    screenshotSignedUrl: 'https://s3-presigned.example.com/snap/01.png?X-Amz-fixture',
+    htmlSignedUrl: 'https://s3-presigned.example.com/snap/01.html?X-Amz-fixture',
   },
   {
-    testId: FIXTURE_TEST_ID_FAILED,
-    stepIndex: 5,
+    stepIndex: '2',
+    type: 'action',
     action: 'click',
     description: 'Click the submit button',
-    status: 'failed' as const,
-    screenshotUrl: 'https://s3-presigned.example.com/snap/05.png?X-Amz-fixture',
-    htmlSnapshotUrl: 'https://s3-presigned.example.com/snap/05.html?X-Amz-fixture',
-    runIdIfAvailable: FIXTURE_RUN_ID,
-    codeVersion: 'v3',
-    capturedAt: '2026-05-05T12:34:56.000Z',
-    updatedAt: '2026-05-05T12:34:56.000Z',
+    status: 'passed',
+    selector: 'button[type="submit"]',
+    url: FIXTURE_TARGET_URL,
+    healed: true,
+    screenshotSignedUrl: 'https://s3-presigned.example.com/snap/02.png?X-Amz-fixture',
+    htmlSignedUrl: 'https://s3-presigned.example.com/snap/02.html?X-Amz-fixture',
   },
   {
-    testId: FIXTURE_TEST_ID_FAILED,
-    stepIndex: 6,
+    stepIndex: '3',
+    type: 'assertion',
     action: 'expect',
-    description: 'Expect order confirmation heading',
-    status: null,
-    screenshotUrl: null,
-    htmlSnapshotUrl: null,
-    runIdIfAvailable: FIXTURE_RUN_ID,
-    codeVersion: 'v3',
-    capturedAt: null,
-    updatedAt: '2026-05-05T12:34:58.000Z',
+    description: 'Expect the order confirmation heading',
+    status: 'failed',
+    selector: 'h1.confirmation',
+    url: FIXTURE_TARGET_URL,
+    healed: false,
+    screenshotSignedUrl: 'https://s3-presigned.example.com/snap/03.png?X-Amz-fixture',
+    htmlSignedUrl: 'https://s3-presigned.example.com/snap/03.html?X-Amz-fixture',
   },
 ];
 
-/**
- * In-flight result. Returned by `/tests/{id}/result` when a run is
- * mid-flight. `finishedAt`, `videoUrl`, and `failureAnalysisUrl` are
- * `null` (not omitted) so clients can distinguish "no data yet" from
- * "did not ask".
- */
-export const latestResultRunningFixture = {
-  testId: FIXTURE_TEST_ID_RUNNING,
-  status: 'running' as const,
-  startedAt: '2026-05-05T12:34:00.000Z',
-  finishedAt: null,
-  videoUrl: null,
-  failureAnalysisUrl: null,
-  snapshotId: 'snap_2026_05_05_runn1ng9',
-  runIdIfAvailable: 'run_running',
-  codeVersion: 'v1',
-  targetUrl: FIXTURE_TARGET_URL,
-  failedStepIndex: null,
-  failureKind: null,
-  verdict: null,
-  executionStatus: 'running' as const,
-  summary: 'Run is still in progress.',
-};
-
-export const latestResultPassedFixture = {
-  testId: FIXTURE_TEST_ID_PASSED,
-  status: 'passed' as const,
-  startedAt: '2026-05-05T07:59:30.000Z',
-  finishedAt: '2026-05-05T08:00:12.000Z',
-  videoUrl: 'https://s3-presigned.example.com/video/run_xyz.mp4?X-Amz-fixture',
-  failureAnalysisUrl: null,
-  snapshotId: 'snap_2026_05_05_e1b9c2a4',
-  runIdIfAvailable: 'run_xyz',
-  codeVersion: 'v2',
-  targetUrl: FIXTURE_TARGET_URL,
-  targetUrlSource: 'run' as const,
-  failedStepIndex: null,
-  failureKind: null,
-  verdict: 'passed' as const,
-  executionStatus: 'completed' as const,
-  summary: 'Passed all 8 steps.',
-};
-
-export const latestResultFailedFixture = {
-  testId: FIXTURE_TEST_ID_FAILED,
-  status: 'failed' as const,
-  startedAt: '2026-05-05T12:34:00.000Z',
-  finishedAt: '2026-05-05T12:34:58.000Z',
-  videoUrl: 'https://s3-presigned.example.com/video/run_abc.mp4?X-Amz-fixture',
-  failureAnalysisUrl: 'https://s3-presigned.example.com/analysis/run_abc.json?X-Amz-fixture',
-  snapshotId: FIXTURE_SNAPSHOT_ID,
-  runIdIfAvailable: FIXTURE_RUN_ID,
-  codeVersion: 'v3',
-  targetUrl: FIXTURE_TARGET_URL,
-  targetUrlSource: 'run' as const,
-  failedStepIndex: 5,
-  failureKind: 'assertion' as const,
-  verdict: 'failed' as const,
-  executionStatus: 'completed' as const,
-  summary: 'Failed (assertion) on step 5: expected cart badge to show 1 item, but it was empty.',
-};
-
-export const failureContextFixture = {
-  snapshotId: FIXTURE_SNAPSHOT_ID,
-  testId: FIXTURE_TEST_ID_FAILED,
-  projectId: FIXTURE_PROJECT_ID,
-  result: latestResultFailedFixture,
-  steps: testStepsFixture,
-  code: testCodeFixture,
-  failure: {
-    rootCauseHypothesis:
-      'Submit button has `opacity: 0.4` and is rendered as disabled. The checkout ' +
-      "form's `isFormValid` predicate evaluates to false because the credit-card " +
-      'field is empty. Selector `[data-testid="submit"]` matches the element but ' +
-      'the click does not fire the navigation because the button has ' +
-      '`pointer-events: none`.',
-    recommendedFixTarget: {
-      kind: 'code' as const,
-      reference: 'src/components/CheckoutForm.tsx:412',
-      rationale:
-        'The disabled state originates from `isFormValid()` in CheckoutForm.tsx; ' +
-        'the submit button only enables when `card.number.length === 16`. The ' +
-        'test fixture leaves the card field empty.',
-    },
-    evidence: [
-      {
-        kind: 'screenshot' as const,
-        stepIndex: 5,
-        url: 'https://s3-presigned.example.com/evidence/run_abc/05.png?X-Amz-fixture',
-        summary:
-          'Submit button has `opacity: 0.4` and is rendered as disabled. ' +
-          'Credit-card field is empty. No visible error message. Cart icon ' +
-          'shows `1 item` in the top-right.',
-      },
-      {
-        kind: 'snapshot' as const,
-        stepIndex: 5,
-        url: 'https://s3-presigned.example.com/evidence/run_abc/05.html?X-Amz-fixture',
-        summary:
-          '`<button data-testid="submit" disabled aria-disabled="true" ' +
-          'style="pointer-events:none;opacity:0.4">`. The DOM diff vs. step 4 ' +
-          "shows the `disabled` attribute being added by the form's onChange " +
-          'handler.',
-      },
-      {
-        kind: 'console' as const,
-        stepIndex: 5,
-        url: 'https://s3-presigned.example.com/evidence/run_abc/05-console.json?X-Amz-fixture',
-        summary:
-          'No errors logged at the time of click. One earlier warning: ' +
-          '`[warn] CheckoutForm: card.number is empty; submit disabled`.',
-      },
-    ],
-  },
-};
-
-export const failureContextNoAnalysisFixture = {
-  snapshotId: 'snap_2026_05_05_44ab12cd',
-  testId: FIXTURE_TEST_ID_NO_ANALYSIS,
-  projectId: FIXTURE_PROJECT_ID,
-  result: {
-    testId: FIXTURE_TEST_ID_NO_ANALYSIS,
-    status: 'failed' as const,
-    startedAt: '2026-05-05T11:00:00.000Z',
-    finishedAt: '2026-05-05T11:00:30.000Z',
+/** The fields a detail shares with its line, plus the ones every fixture result has in common. */
+function resultDetailBase(resultId: string) {
+  const line = resultLineFixtures.find(r => r.resultId === resultId)!;
+  return {
+    resultId: line.resultId,
+    runId: line.runId,
+    caseKey: line.caseKey,
+    caseHash: `case_${line.resultId}`,
+    title: line.title,
+    type: 'frontend',
+    testStatus: line.testStatus,
+    processStatus: line.processStatus,
+    processErrorMessage: null,
+    error: line.error,
+    cause: null,
+    fix: null,
+    blockedReason: line.blockedReason,
     videoUrl: null,
-    failureAnalysisUrl: null,
-    snapshotId: 'snap_2026_05_05_44ab12cd',
-    runIdIfAvailable: null,
-    codeVersion: null,
-    targetUrl: 'https://staging.example.com/',
-    failedStepIndex: 2,
-    failureKind: 'unknown' as const,
-    verdict: 'failed' as const,
-    executionStatus: 'completed' as const,
-    summary: 'Failed with no detailed analysis available.',
+    envId: line.environmentName === 'production' ? 'env_production_02' : 'env_staging_01',
+    created: line.created,
+    modified: line.created,
+    failedStep: null,
+    steps: [],
+    signIn: null,
+  } satisfies ResultDetail;
+}
+
+/** `GET /results/:resultId`, by result id. */
+export const resultDetailFixtures: Record<string, ResultDetail> = {
+  [FIXTURE_RESULT_ID_PASSED]: {
+    ...resultDetailBase(FIXTURE_RESULT_ID_PASSED),
+    videoUrl: 'https://s3-presigned.example.com/video/result_passed_01.mp4?X-Amz-fixture',
+    modified: '2026-05-05T12:34:40.000Z',
+    steps: resultStepFixtures.slice(0, 2),
   },
-  steps: [],
-  code: {
-    testId: FIXTURE_TEST_ID_NO_ANALYSIS,
-    language: 'python' as const,
-    framework: 'pytest' as const,
-    code: [
-      'def test_smoke(client):',
-      "    response = client.get('/health')",
-      '    assert response.status_code == 200',
-      '',
-    ].join('\n'),
-    codeVersion: null,
-    etag: null,
+  [FIXTURE_RESULT_ID_FAILED]: {
+    ...resultDetailBase(FIXTURE_RESULT_ID_FAILED),
+    cause: 'The submit button stays disabled because the card field is empty.',
+    fix: 'Fill the card field before submitting the form.',
+    videoUrl: 'https://s3-presigned.example.com/video/result_failed_02.mp4?X-Amz-fixture',
+    modified: '2026-05-05T12:34:58.000Z',
+    failedStep: resultStepFixtures[2]!,
+    steps: resultStepFixtures,
   },
-  failure: {
-    rootCauseHypothesis: null,
-    recommendedFixTarget: { kind: 'unknown' as const, reference: null, rationale: null },
-    evidence: [],
+  [FIXTURE_RESULT_ID_BLOCKED]: {
+    ...resultDetailBase(FIXTURE_RESULT_ID_BLOCKED),
+    modified: '2026-05-05T12:34:20.000Z',
+    signIn: {
+      id: 'auth_5e1c77a0',
+      status: 'failed',
+      videoUrl: 'https://s3-presigned.example.com/video/auth_5e1c77a0.mp4?X-Amz-fixture',
+      finalUrl: 'https://staging.example.com/login',
+      stepCount: 2,
+      error: 'The sign-in page rejected the password.',
+      steps: [
+        {
+          stepIndex: '1',
+          type: 'action',
+          action: 'fill',
+          description: "Fill '***' into the password field",
+          status: 'passed',
+          selector: '#password',
+          url: 'https://staging.example.com/login',
+          healed: false,
+          screenshotSignedUrl: null,
+          htmlSignedUrl: 'https://s3-presigned.example.com/auth/01.html?X-Amz-fixture',
+        },
+        {
+          stepIndex: '2',
+          type: 'action',
+          action: 'click',
+          description: 'Click the sign-in button',
+          status: 'failed',
+          selector: 'button[type="submit"]',
+          url: 'https://staging.example.com/login',
+          healed: false,
+          screenshotSignedUrl: null,
+          htmlSignedUrl: 'https://s3-presigned.example.com/auth/02.html?X-Amz-fixture',
+        },
+      ],
+    },
+  },
+  [FIXTURE_RESULT_ID_CANCELLED]: resultDetailBase(FIXTURE_RESULT_ID_CANCELLED),
+  [FIXTURE_RESULT_ID_EARLIER]: {
+    ...resultDetailBase(FIXTURE_RESULT_ID_EARLIER),
+    modified: '2026-05-04T09:00:45.000Z',
+    steps: resultStepFixtures.map(step => ({ ...step, status: 'passed' as const })),
   },
 };

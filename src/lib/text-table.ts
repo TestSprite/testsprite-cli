@@ -1,4 +1,5 @@
 import { localValidationError } from './errors.js';
+import { terminalSafeLine } from './terminal-text.js';
 import { terminalWidth } from './ticker.js';
 
 export interface TextTableColumn<T> {
@@ -30,7 +31,12 @@ export function renderTextTable<T>(
   columns: readonly TextTableColumn<T>[],
   options: TextTableOptions = {},
 ): string {
-  const selected = resolveTextColumns(options.columns, columns);
+  // A cell is one line of server text: no escape sequence, and no line break
+  // that would start a row the server wrote. Made safe before it is measured.
+  const selected = resolveTextColumns(options.columns, columns).map(column => ({
+    ...column,
+    render: (row: T) => terminalSafeLine(column.render(row)),
+  }));
   const widths = measureTextColumns(rows, selected);
   const body = rows.map(row =>
     formatTextTableRow(

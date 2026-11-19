@@ -15,6 +15,7 @@
  */
 import type { Dispatcher } from 'undici';
 import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import { terminalSafeWriter } from './terminal-text.js';
 
 export interface ProxyDeps {
   env?: NodeJS.ProcessEnv;
@@ -47,7 +48,7 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
     install(new EnvHttpProxyAgent());
     return true;
   } catch (error) {
-    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    const stderr = terminalSafeWriter(deps.stderr);
     stderr(
       `warning: ignoring proxy environment (could not initialize proxy agent): ${
         error instanceof Error ? error.message : String(error)

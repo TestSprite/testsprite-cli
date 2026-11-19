@@ -28,6 +28,7 @@ import {
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
 } from '../lib/agent-targets.js';
+import { terminalSafeWriter } from '../lib/terminal-text.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -356,7 +357,7 @@ function makeOwnFileBodyResolver(): (target: AgentTarget, skill: string) => stri
 
 export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Promise<void> {
   const agentFs = deps.fs ?? defaultAgentFs;
-  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderrFn = terminalSafeWriter(deps.stderr);
   const out = makeOutput(opts.output, deps);
 
   // 1. Parse targets
@@ -828,7 +829,7 @@ function agentDisplayName(target: AgentTarget, status: string): string {
 
 export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promise<void> {
   const out = makeOutput(opts.output, deps);
-  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderrFn = terminalSafeWriter(deps.stderr);
 
   // One row per (target × default skill). Own-file targets land each skill at a
   // distinct path; the codex managed-section target merges all skills into the
@@ -1042,18 +1043,15 @@ async function classifyManagedSectionStates(
  * (exit 0) when every row is 'ok' or 'absent'; throws CLIError exit 1 when any
  * row is stale/modified/unmarked/corrupt, so the command can gate CI.
  */
-export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Promise<void> {
-  const agentFs = deps.fs ?? defaultAgentFs;
-  const out = makeOutput(opts.output, deps);
-
-  // An explicit but empty --dir must not silently resolve to cwd
-  // (path.resolve('') === cwd).
-  if (opts.dir !== undefined && opts.dir.trim() === '') {
-    throw localValidationError('dir', 'must not be empty');
-  }
-  const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
-  const root = path.resolve(dir);
-
+/**
+ * Each target's state for each default skill under `root`: what `agent
+ * status` prints and `doctor` reads. Absent artifacts never touch the skill
+ * assets.
+ */
+export async function skillStates(
+  root: string,
+  agentFs: AgentFs = defaultAgentFs,
+): Promise<StatusResult[]> {
   // The SAME resolver the installer stamps its marker hashes from — a
   // separate copy here is exactly how install and status end up disagreeing.
   const ownFileBodyFor = makeOwnFileBodyResolver();
@@ -1088,6 +1086,20 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
       });
     }
   }
+  return results;
+}
+
+export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Promise<void> {
+  const agentFs = deps.fs ?? defaultAgentFs;
+  const out = makeOutput(opts.output, deps);
+
+  // An explicit but empty --dir must not silently resolve to cwd
+  // (path.resolve('') === cwd).
+  if (opts.dir !== undefined && opts.dir.trim() === '') {
+    throw localValidationError('dir', 'must not be empty');
+  }
+  const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
+  const results = await skillStates(path.resolve(dir), agentFs);
 
   out.print(results, data => {
     const items = data as StatusResult[];

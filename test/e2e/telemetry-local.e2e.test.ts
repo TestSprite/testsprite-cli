@@ -1,3 +1,5 @@
+import { projectRun, runListing } from '../helpers/project-run.js';
+import { resultLine } from '../helpers/result-list.js';
 /**
  * Explicit --local commands report local=true even when refused before opening
  * a tunnel. Saved loopback environments also report local=true after the
@@ -81,38 +83,29 @@ beforeAll(async () => {
       res.end();
       return;
     }
-    if (req.method === 'POST' && path === '/api/cli/v1/tests/test_auto/runs') {
+    if (req.method === 'POST' && path === '/api/cli/v1/projects/project_auto/runs') {
       req.resume();
-      json({
-        runId: 'run_auto',
-        status: 'queued',
-        enqueuedAt: '2026-10-01T00:00:00Z',
-        codeVersion: 'v1',
-        targetUrl: AUTO_URL,
-        tunnelClientId: AUTO_CLIENT_ID,
-      });
+      json(
+        projectRun({
+          runId: 'exec_auto',
+          projectId: 'project_auto',
+          targetUrl: AUTO_URL,
+          tunnelClientId: AUTO_CLIENT_ID,
+        }),
+      );
       return;
     }
-    if (req.method === 'GET' && path === '/api/cli/v1/runs/run_auto') {
-      json({
-        runId: 'run_auto',
-        testId: 'test_auto',
-        projectId: 'project_auto',
-        userId: 'user_auto',
-        status: 'passed',
-        source: 'cli',
-        createdAt: '2026-10-01T00:00:00Z',
-        startedAt: null,
-        finishedAt: '2026-10-01T00:00:01Z',
-        codeVersion: 'v1',
-        targetUrl: AUTO_URL,
-        createdFrom: 'cli',
-        failedStepIndex: null,
-        failureKind: null,
-        error: null,
-        videoUrl: null,
-        stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-      });
+    if (req.method === 'GET' && path === '/api/cli/v1/results') {
+      json(
+        runListing({ runId: 'exec_auto', status: 'finished', cancelled: false }, [
+          resultLine({
+            resultId: 'run_auto',
+            runId: 'exec_auto',
+            caseKey: 'test_auto',
+            testStatus: 'PASSED',
+          }),
+        ]),
+      );
       return;
     }
     res.writeHead(404, { connection: 'close' });
@@ -219,7 +212,6 @@ async function waitForTelemetryBody(): Promise<Record<string, unknown>> {
 describe('telemetry — local field', () => {
   it('records local for a refused --local command that opened no tunnel', async () => {
     const result = await runCli([
-      'test',
       'run',
       'some-test-id',
       '--local',
@@ -231,7 +223,7 @@ describe('telemetry — local field', () => {
     ]);
     expect(result.status).toBe(5);
     const body = await waitForTelemetryBody();
-    expect(body.command).toBe('test run');
+    expect(body.command).toBe('run');
     expect(body.outcome).toBe('error');
     expect(body.errorCode).toBe('VALIDATION_ERROR');
     expect(body.local).toBe(true);
@@ -239,27 +231,26 @@ describe('telemetry — local field', () => {
   });
 
   it('omits the local key for an ordinary (non --local) invocation', async () => {
-    // <test-id> + --all is a different, --local-free mutual-exclusion
-    // refusal (positional vs. --all) — same exit code, no --local anywhere.
+    // <test-id> + --project is a different, --local-free mutual-exclusion
+    // refusal (positional vs. --project) — same exit code, no --local anywhere.
     const result = await runCli([
-      'test',
       'run',
       'some-test-id',
-      '--all',
+      '--project',
+      'project-explicit',
       '--endpoint-url',
       baseUrl,
     ]);
     expect(result.status).toBe(5);
 
     const body = await waitForTelemetryBody();
-    expect(body.command).toBe('test run');
+    expect(body.command).toBe('run');
     expect(body.outcome).toBe('error');
     expect(body).not.toHaveProperty('local');
   });
 
   it('records local for an automatic tunnel without a --local flag', async () => {
     const result = await runCli([
-      'test',
       'run',
       'test_auto',
       '--skip-preflight',
@@ -269,9 +260,12 @@ describe('telemetry — local field', () => {
       baseUrl,
     ]);
     expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ runId: 'run_auto', status: 'passed' });
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      runs: [{ runId: 'exec_auto' }],
+      results: [{ resultId: 'run_auto', runId: 'exec_auto', status: 'passed' }],
+    });
     const body = await waitForTelemetryBody();
-    expect(body).toMatchObject({ command: 'test run', outcome: 'success', local: true });
+    expect(body).toMatchObject({ command: 'run', outcome: 'success', local: true });
     expect(requests).toContain('POST /api/cli/v1/tunnel');
     expect(requests).toContain(`DELETE /api/cli/v1/tunnel/${AUTO_CLIENT_ID}`);
   });

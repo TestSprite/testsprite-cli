@@ -72,7 +72,7 @@ export interface SkillSpec {
  * (not in a `*.codex.md` asset) because it is one line; see {@link CodexContribution}.
  */
 export const ONBOARD_CODEX_LINE =
-  '**First-time setup:** if this repo has no TestSprite tests yet, seed a *broad* first suite across its main user flows — not just one test — each with a concrete, observable assertion, before reporting setup as done. Try `testsprite test plan generate --project <id>` then `test plan accept` first; author plans by hand only if generation is unavailable.';
+  '**First-time setup:** if this repo has no TestSprite tests yet, seed a *broad* first suite across its main user flows — not just one test — each with a concrete, observable assertion, before reporting setup as done. Ask the project\'s agent with `testsprite plan --project <id> "<the main user flows>"`, review what it proposes, then `testsprite apply`.';
 
 /**
  * `testsprite-ci` codex contribution — one always-on line; the full onboarding
@@ -92,14 +92,14 @@ export const SKILLS: Record<string, SkillSpec> = {
   'testsprite-verify': {
     name: 'testsprite-verify',
     description:
-      'TestSprite verification loop — after finishing a feature or fix in a TestSprite-tested repo, use the `testsprite` CLI to run the relevant TestSprite tests against the change and inspect any failure artifacts before reporting the work as done. Use whenever code has changed outside docs/config and is about to be reported complete — by running an existing test that covers the change, or by creating a new TestSprite test (a frontend plan, or a backend Python assertion) and running it to a terminal verdict.',
+      "TestSprite verification loop — after finishing a feature or fix in a TestSprite-tested repo, use the `testsprite` CLI to run the relevant TestSprite tests against the change and inspect any failure artifacts before reporting the work as done. Use whenever code has changed outside docs/config and is about to be reported complete — by running an existing test that covers the change, or by asking the project's agent for a new one (`testsprite plan`, then `testsprite apply`) and running it to a terminal verdict.",
     bodyFile: 'testsprite-verify.skill.md',
     codex: { kind: 'full', file: 'testsprite-verify.codex.md' },
   },
   'testsprite-onboard': {
     name: 'testsprite-onboard',
     description:
-      'Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), generate a coherent set of tests (or derive and batch-create them from the codebase), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.',
+      'Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), have the project\'s agent plan a coherent set of tests (`testsprite plan`, then `testsprite apply`), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.',
     bodyFile: 'testsprite-onboard.skill.md',
     codex: { kind: 'line', text: ONBOARD_CODEX_LINE },
   },

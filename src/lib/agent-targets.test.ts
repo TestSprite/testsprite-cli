@@ -114,9 +114,9 @@ const STUB_BODY = `# TestSprite Verification Loop
 
 The verification-loop autopilot
 
-testsprite test run <test-id> --wait --target-url <url> --timeout 600
+testsprite run <test-id> --wait --target-url <url> --timeout 600
 
-testsprite test artifact get <run-id> --out ./out/
+testsprite result get <result-id> --out ./out/
 `;
 
 // ---------------------------------------------------------------------------
@@ -392,7 +392,7 @@ describe('windsurf renders within the rules-file budget', () => {
     expect(claude.content).toContain('The verification loop that flies');
     expect(windsurf.content).not.toContain('The verification loop that flies');
     // ...but the load-bearing command survives.
-    expect(windsurf.content).toContain('testsprite test run');
+    expect(windsurf.content).toContain('testsprite run');
   });
 });
 
@@ -424,7 +424,7 @@ describe('renderForTarget("copilot")', () => {
     const claude = renderForTarget('claude', 'testsprite-verify');
     expect(copilot.content.length).toBeLessThan(claude.content.length);
     expect(copilot.content).not.toContain('The verification loop that flies');
-    expect(copilot.content).toContain('testsprite test run');
+    expect(copilot.content).toContain('testsprite run');
   });
 });
 
@@ -477,16 +477,16 @@ describe('content integrity — own-file targets', () => {
         expect(result.content).toContain('The verification loop that flies');
       });
 
-      it('contains testsprite test run', () => {
-        expect(result.content).toContain('testsprite test run');
+      it('contains testsprite run', () => {
+        expect(result.content).toContain('testsprite run');
       });
 
       it('contains --wait flag', () => {
         expect(result.content).toContain('--wait');
       });
 
-      it('contains test artifact get', () => {
-        expect(result.content).toContain('test artifact get');
+      it('contains result get', () => {
+        expect(result.content).toContain('testsprite result get');
       });
     });
   }
@@ -566,6 +566,47 @@ describe('content integrity — local run outcomes', () => {
   });
 });
 
+describe('content integrity — run links and result reads', () => {
+  const verifyAssets = () =>
+    [
+      ['docs template', templateRaw],
+      ['own-file skill body', renderForTarget('claude', 'testsprite-verify').content],
+      ['codex skill body', renderForTarget('codex', 'testsprite-verify').content],
+    ] as const;
+
+  it('installed verify skills name the Dashboard line and no Execution receipt', () => {
+    // `run` prints one link per run, as a `Dashboard:` line on the run's card.
+    // There is no `Execution:` line: a skill that names one sends the agent
+    // looking for output the CLI never prints.
+    for (const [name, content] of verifyAssets()) {
+      expect(content, name).toContain('`Dashboard:');
+      expect(content, name).not.toContain('Execution:');
+    }
+  });
+
+  it('installed verify skills read and download a result with result get, and name no removed command', () => {
+    // One result is one test's part of a run, frontend or backend alike, so
+    // `result get <result-id>` reads it and `--out` downloads its evidence. The
+    // six read commands it replaced are unknown commands now (exit 5).
+    for (const [name, content] of verifyAssets()) {
+      expect(content, name).toContain('testsprite result get <result-id> --out');
+      expect(content, name).toContain('testsprite result list --run <run-id>');
+      expect(content, name).not.toMatch(/\btest (?:result|steps|failure|artifact|diff)\b/);
+      expect(content, name).not.toMatch(/--run-id|--history/);
+    }
+  });
+});
+
+describe('content integrity — testsprite-ci generated workflow', () => {
+  it('lists every pull request the generated workflow skips, and what its concurrency group is keyed by', () => {
+    // The skill tells the agent which parts of the generated file to leave
+    // alone, so it has to describe the file `ci init github` writes today.
+    const body = loadSkillBodyFor('testsprite-ci');
+    expect(body).toMatch(/fork, Dependabot and draft PRs\s+skipped/);
+    expect(body).toMatch(/keyed by the\s+workflow's filename/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // MANAGED_SECTION sentinels
 // ---------------------------------------------------------------------------
@@ -592,9 +633,9 @@ describe('MANAGED_SECTION sentinels', () => {
 // ---------------------------------------------------------------------------
 
 describe('content integrity — codex target (testsprite-verify.codex.md)', () => {
-  it('contains testsprite test run (load-bearing command)', () => {
+  it('contains testsprite run (load-bearing command)', () => {
     const body = loadCodexSkillBody();
-    expect(body).toContain('testsprite test run');
+    expect(body).toContain('testsprite run');
   });
 
   it('contains --wait flag (load-bearing command string)', () => {
@@ -602,21 +643,19 @@ describe('content integrity — codex target (testsprite-verify.codex.md)', () =
     expect(body).toContain('--wait');
   });
 
-  it('contains test artifact get (load-bearing command)', () => {
+  it('contains result get (load-bearing command)', () => {
     const body = loadCodexSkillBody();
-    expect(body).toContain('test artifact get');
+    expect(body).toContain('testsprite result get');
   });
 
   it('renderForTarget("codex") path is AGENTS.md', () => {
-    const STUB_CODEX_BODY =
-      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
+    const STUB_CODEX_BODY = '# TestSprite Verification Loop\ntestsprite run\n--wait\nresult get\n';
     const result = renderForTarget('codex', 'testsprite-verify', STUB_CODEX_BODY);
     expect(result.path).toBe('AGENTS.md');
   });
 
   it('renderForTarget("codex") content is the body unwrapped (no frontmatter)', () => {
-    const STUB_CODEX_BODY =
-      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
+    const STUB_CODEX_BODY = '# TestSprite Verification Loop\ntestsprite run\n--wait\nresult get\n';
     const result = renderForTarget('codex', 'testsprite-verify', STUB_CODEX_BODY);
     // codex wrap is identity — no frontmatter fences
     expect(result.content).toBe(STUB_CODEX_BODY);
@@ -794,9 +833,9 @@ describe('loadSkillBodyFor', () => {
 // ---------------------------------------------------------------------------
 
 describe('codexContentFor', () => {
-  it('testsprite-verify (full) contains "testsprite test run"', () => {
+  it('testsprite-verify (full) contains "testsprite run"', () => {
     const content = codexContentFor('testsprite-verify');
-    expect(content).toContain('testsprite test run');
+    expect(content).toContain('testsprite run');
   });
 
   it('testsprite-verify (full) contains "--wait"', () => {
@@ -1102,17 +1141,19 @@ describe('own-file frontmatter is valid YAML for every skill', () => {
 // ---------------------------------------------------------------------------
 // The two ALWAYS-ON trigger strings (the SKILL.md description an
 // agent reads to decide whether to load the skill, and the codex AGENTS.md
-// one-liner) must name the generate path, since the body already leads with
+// one-liner) must name the project's agent (plan, then apply), since the body leads with
 // it. The windsurf 12 000-char gate above bounds how long the description may
 // grow.
 // ---------------------------------------------------------------------------
-describe('the always-on onboard trigger strings name generation', () => {
-  it('testsprite-onboard description says the suite can be generated', () => {
-    expect(SKILLS['testsprite-onboard']!.description).toMatch(/generate/i);
+describe("the always-on onboard trigger strings name the project's agent", () => {
+  it('testsprite-onboard description names plan and apply', () => {
+    expect(SKILLS['testsprite-onboard']!.description).toContain(
+      '`testsprite plan`, then `testsprite apply`',
+    );
   });
 
-  it('ONBOARD_CODEX_LINE names test plan generate and test plan accept', () => {
-    expect(ONBOARD_CODEX_LINE).toContain('testsprite test plan generate');
-    expect(ONBOARD_CODEX_LINE).toContain('test plan accept');
+  it('ONBOARD_CODEX_LINE names plan and apply', () => {
+    expect(ONBOARD_CODEX_LINE).toContain('testsprite plan --project <id>');
+    expect(ONBOARD_CODEX_LINE).toContain('testsprite apply');
   });
 });

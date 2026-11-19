@@ -1,32 +1,20 @@
 import { randomUUID } from 'node:crypto';
-import { createReadStream, statSync, type Stats } from 'node:fs';
-import { basename, extname } from 'node:path';
-import { Readable } from 'node:stream';
-import { Command, Option } from 'commander';
+import { Command } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
-  resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { resolveProfileName } from '../lib/config.js';
-import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError } from '../lib/errors.js';
 import { firstSuiteNextSteps } from '../lib/first-suite-hint.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
-import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
-import {
-  assertStoredLocalTargetListening,
-  buildLocalTargetUrl,
-  parseStoredLocalTarget,
-  type LocalPortProbeDeps,
-  type StoredLocalTarget,
-} from '../lib/local-target.js';
+import { type ShutdownHandle } from '../lib/interrupt.js';
+import { type LocalPortProbeDeps } from '../lib/local-target.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
-import { readSecretFileGuarded } from '../lib/secret-file.js';
 import { CLI_PROJECT_LIST_SCHEMA, CLI_PROJECT_SCHEMA } from '../lib/response-schemas.js';
 import { terminalWidth } from '../lib/ticker.js';
-import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import {
@@ -38,7 +26,7 @@ import {
   type PaginationFlags,
 } from '../lib/pagination.js';
 import { createProjectEnvCommand } from './project-env.js';
-import { createProjectSignInCommand } from './project-sign-in.js';
+import { terminalSafe, terminalSafeLine, terminalSafeWriter } from '../lib/terminal-text.js';
 
 export interface CliProject {
   id: string;
@@ -57,33 +45,11 @@ export interface CliProject {
    */
   orgId?: string;
   orgName?: string;
-  /**
-   * The project's default target/environment URL, or `null` when the project has
-   * none configured.
-   *
-   * **Absent vs. `null` is load-bearing here.** `null` means "the server resolved
-   * it and this project has no URL configured" — actionable, so the renderer
-   * prints the `project update … --url` remedy. **Absent** means "no answer", and
-   * the server uses it for every case where a remedy would be a lie: an older
-   * backend, the `list` endpoint (which would pay an extra read per row), a
-   * resolution that failed (a transient outage must never be reported as "no URL
-   * set"), and a V2 backend project (V2 backend runs resolve no project URL at
-   * all, so there is nothing to report and nothing `--url` would change).
-   *
-   * So the renderer must key on presence, not truthiness: printing "(not set)"
-   * for an absent field would report every project on an older backend — and
-   * every project in a `list` — as having no URL, including the ones that do.
-   *
-   * A backend project with no URL is not merely cosmetic: on the V3 execution
-   * path the first run of any of its tests is rejected `no-target-resolvable`
-   * (see the `project create --type backend` note in CLAUDE.md).
-   */
-  targetUrl?: string | null;
-  /** Absent on older servers, V2 projects, or when the environment read failed. */
+  /** Absent on older servers, or when the environment read failed. */
   defaultEnvironment?: string | null;
   environmentCount?: number;
-  /** Present only when the stored project target is local to the developer machine. */
-  originMode?: 'local';
+  /** Project detail only. Null when unset, absent on older servers. */
+  instruction?: string | null;
   /**
    * Project-level test-id attribute priority list (e.g. `['data-element',
    * 'data-testid']`). The execution engine tries these DOM attributes, in
@@ -224,12 +190,6 @@ export async function runGet(opts: GetOptions, deps: ProjectDeps = {}): Promise<
 export interface CliCreateProjectRequest {
   type: 'frontend' | 'backend';
   name: string;
-  targetUrl?: string;
-  originMode?: 'local';
-  // `description` is intentionally not part of the wire request — projects have
-  // no description field. The `--description` flag is rejected client-side.
-  username?: string;
-  password?: string;
   instruction?: string;
   /** Ordered test-id attribute list — see `CliProject.testIdAttributes`. */
   testIdAttributes?: string[];
@@ -242,11 +202,11 @@ export interface CliCreateProjectRequest {
  * response keying its id as `projectId` (matching `CliDeleteProjectResponse`'s
  * convention), not `id` like the read paths (`GET /projects`, `GET
  * /projects/{id}` — those are proven-`id` via the dev-e2e smoke test) — and
- * possibly omitting `targetUrl`/`updatedAt` entirely. Rather than guess which
+ * possibly omitting `updatedAt` entirely. Rather than guess which
  * single shape is "the real one" and risk flipping the drift instead of
  * fixing it, both id field names are accepted here (and normalized — see
  * `resolveCreatedProjectId` — so JSON consumers keyed on either `id` or
- * `projectId` keep working), and `targetUrl`/`updatedAt` are optional.
+ * `projectId` keep working), and `updatedAt` is optional.
  */
 export interface CliCreateProjectResponse {
   /** Preferred — matches the live backend's response and `project delete`'s `projectId`. */
@@ -259,8 +219,6 @@ export interface CliCreateProjectResponse {
   createdAt: string;
   /** Absent-safe: not guaranteed on every backend response. */
   updatedAt?: string;
-  targetUrl?: string;
-  originMode?: 'local';
 }
 
 /** Resolve the created project's id regardless of which field name the backend used. */
@@ -269,20 +227,10 @@ export function resolveCreatedProjectId(r: CliCreateProjectResponse): string | u
 }
 
 interface CreateOptions extends CommonOptions {
-  /** `'local'` marks the target as an app on the caller's own machine. */
-  originMode?: 'local';
   type: 'frontend' | 'backend';
   name: string;
-  targetUrl?: string;
-  local?: string;
-  localHost?: string;
-  skipPreflight?: boolean;
-  description?: string;
-  testIdAttributes?: string[];
-  username?: string;
-  password?: string;
-  passwordFile?: string;
   instruction?: string;
+  testIdAttributes?: string[];
   idempotencyKey?: string;
 }
 
@@ -291,7 +239,7 @@ export async function runCreate(
   deps: ProjectDeps = {},
 ): Promise<CliCreateProjectResponse> {
   const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
 
   // P1-2: validate idempotency key before sending as an HTTP header.
   // Non-ASCII chars cause a ByteString TypeError at the transport layer
@@ -299,59 +247,13 @@ export async function runCreate(
   assertIdempotencyKey(opts.idempotencyKey);
 
   // P1-3: client-side length checks matching server limits.
-  // Whitespace-only / empty rejection (parity with `test create`'s requireString;
-  // a truthy `--name "   "` otherwise creates a blank-named project on the backend).
+  // Whitespace-only / empty rejection: a truthy `--name "   "` otherwise
+  // creates a blank-named project on the backend.
   if (opts.name === undefined || opts.name.trim().length === 0) {
     throw localValidationError('--name is required and must not be empty or whitespace-only');
   }
-  if (opts.password !== undefined && opts.password.trim().length === 0) {
-    throw localValidationError('--password must not be empty or whitespace-only');
-  }
-  if (opts.password !== undefined && opts.passwordFile !== undefined) {
-    stderr('Warning: --password takes precedence; --password-file was ignored.');
-  }
   if (opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
-  }
-  // `--description` is not supported on projects — no project entity stores a
-  // description, and the backend rejects it with a 422. Fail fast client-side
-  // with an actionable message instead of a wasted round trip.
-  if (opts.description !== undefined) {
-    throw localValidationError(
-      '--description is not supported for projects; omit it (test-level descriptions are set on `test create`)',
-    );
-  }
-
-  if (opts.local !== undefined && opts.type !== 'frontend') {
-    throw localValidationError('--local projects are frontend-only');
-  }
-  const localTarget = parseStoredLocalTarget({
-    local: opts.local,
-    localHost: opts.localHost,
-    url: opts.targetUrl,
-  });
-  // A loopback --url is the same stored target as --local, so it gets the same
-  // refusal before anything is sent.
-  if (localTarget && opts.type !== 'frontend') {
-    throw localValidationError(
-      'a --url on this machine (localhost, 127.0.0.1, [::1]) is frontend-only; give a backend project a public URL',
-    );
-  }
-  const targetUrl =
-    opts.targetUrl ??
-    (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined);
-
-  // Keep the existing public-address guard for targets a loopback tunnel cannot reach.
-  if (opts.targetUrl !== undefined && !localTarget) {
-    assertNotLocal(opts.targetUrl, {
-      field: 'url',
-      helpCommand: 'testsprite project create',
-      hintContext: 'local-project-create',
-    });
-  }
-
-  if (opts.type === 'frontend' && !targetUrl) {
-    throw localValidationError('--url is required for --type frontend');
   }
 
   if (opts.dryRun) {
@@ -360,9 +262,9 @@ export async function runCreate(
     // response.
     emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
-    // P2-6: gate idempotency-key output behind --verbose/--debug/json (matches
-    // test create convention). Suppress in plain text interactive mode to reduce
-    // noise; still available for automation and retry flows.
+    // P2-6: gate idempotency-key output behind --verbose/--debug/json. Suppress
+    // in plain text interactive mode to reduce noise; still available for
+    // automation and retry flows.
     if (
       opts.idempotencyKey === undefined &&
       (opts.output === 'json' || opts.verbose || opts.debug)
@@ -377,24 +279,12 @@ export async function runCreate(
       id: 'p_dryrun_2026',
       type: opts.type,
       name: opts.name,
-      targetUrl: targetUrl ?? '',
-      ...(localTarget ? { originMode: 'local' } : {}),
       createdFrom: 'cli',
       createdAt: '2026-05-16T00:00:00.000Z',
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
     out.print(sample, data => renderCreateProjectText(data as CliCreateProjectResponse));
     return sample;
-  }
-
-  if (localTarget) {
-    await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
-  }
-
-  // Resolve password: flag > file > none
-  let password = opts.password;
-  if (password === undefined && opts.passwordFile !== undefined) {
-    password = readSecretFileGuarded('password-file', opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
@@ -405,10 +295,6 @@ export async function runCreate(
   const body: CliCreateProjectRequest = {
     type: opts.type,
     name: opts.name,
-    ...(targetUrl !== undefined ? { targetUrl } : {}),
-    ...(localTarget ? { originMode: 'local' } : {}),
-    ...(opts.username !== undefined ? { username: opts.username } : {}),
-    ...(password !== undefined ? { password } : {}),
     ...(opts.instruction !== undefined ? { instruction: opts.instruction } : {}),
     ...(opts.testIdAttributes !== undefined ? { testIdAttributes: opts.testIdAttributes } : {}),
   };
@@ -432,59 +318,12 @@ export async function runCreate(
     ...(resolvedId !== undefined ? { projectId: resolvedId, id: resolvedId } : {}),
   };
 
-  out.print(created, data =>
-    renderCreateProjectText(data as CliCreateProjectResponse, localTarget),
-  );
+  out.print(created, data => renderCreateProjectText(data as CliCreateProjectResponse));
 
-  // A backend project created without --url has no default environment URL.
-  // On the V3 execution path, the shared admission guard (`runProjectGuarded`
-  // -> `assertProjectEnvNotLocal`, called by every V3 run/rerun/batch entry
-  // point, including `backendRun`) rejects the FIRST run of any test in the
-  // project with 400 no-target-resolvable. On the V2 path (`cli-run.service.ts`
-  // -> `resolveRunPrereqsFE`), this URL resolution is frontend-only and is
-  // never applied to a backend run, so a V2-routed backend project without a
-  // URL runs fine — V2 is the only execution path live in production today
-  // (V3 is dev-only pending its own GA release), so the wording below is
-  // conditioned on V3 rather than stated as a universal consequence.
-  // `--url` is intentionally NOT made mandatory here (that would break the
-  // published --help contract: npm 0.4.0 already ships text saying the URL
-  // is frontend-only), so this stays advisory-only. The CLI does not call
-  // GET /me here to check the caller's actual v3Enabled routing before
-  // deciding whether to print this — an extra round-trip on every create is
-  // not worth it just to gate a hint — so it points the reader at `auth
-  // status` (which already renders the routing: v2|v3 line) instead.
-  // Emitted in EVERY output mode, including --output json: this goes to
-  // stderr, which never touches JSON stdout, so there is nothing to protect
-  // by suppressing it (unlike `emitV3RoutingAdvisory`, which withholds
-  // account-context advisory in JSON mode because a JSON caller can read
-  // `v3Enabled` directly instead — there is no equivalent structured signal
-  // for this one). And --output json is precisely the case that needs it
-  // most: a script or agent creating a project non-interactively has no one
-  // watching a terminal, so a silent dead-on-arrival project only surfaces
-  // later as an unexplained 400 on the first run. Same family as the C1
-  // `--target-url` advisory above (a flag/setup the caller just made has a
-  // structural consequence) rather than the routing-advisory family.
-  // Real path only — NOT duplicated into the dry-run branch above, because
-  // the remedy command below embeds the created project id, and under
-  // --dry-run that id is the canned `p_dryrun_2026` sample: emitting a
-  // live-looking fix-it command against a fake resource is exactly what the
-  // `dashboardUrl` convention (see CLAUDE.md) already decided to suppress.
-  if (opts.type === 'backend' && !opts.targetUrl) {
-    stderr(
-      `[advisory] this backend project has no default environment URL. On the V3 execution ` +
-        `path (check with \`testsprite auth status\`), test runs are rejected with ` +
-        `no-target-resolvable until one is set. Fix: testsprite project update ` +
-        `${resolvedId ?? '<project-id>'} --url <url>`,
-    );
-  }
-
-  // A new project with no tests is where activation stalls. Point at
-  // the generate -> accept path (text mode only: a JSON caller already holds
-  // the id; --dry-run returned above, its id is the canned sample). Printed
-  // after the URL advisory so a fix-first warning is never buried below it.
-  // A --local project is skipped: its record above already ends with the
-  // hand-written-plan next steps.
-  if (opts.output !== 'json' && resolvedId !== undefined && !localTarget) {
+  // A new project has no environment and no tests yet; one hint names both
+  // steps. Text mode only: a JSON caller already holds the id, and --dry-run
+  // returned above with a canned one.
+  if (opts.output !== 'json' && resolvedId !== undefined) {
     stderr(firstSuiteNextSteps(resolvedId, opts.type));
   }
 
@@ -511,9 +350,6 @@ export interface CliUpdateProjectResponse {
   updatedFields?: string[];
   /** Absent-safe: not guaranteed on every backend response. */
   updatedAt?: string;
-  /** Present on servers that report which default environment was edited. */
-  environment?: { name: string; isDefault: true };
-  effects?: string[];
 }
 
 /** Resolve the updated project's id regardless of which field name the backend used. */
@@ -524,18 +360,6 @@ export function resolveUpdatedProjectId(r: CliUpdateProjectResponse): string | u
 interface UpdateOptions extends CommonOptions {
   projectId: string;
   name?: string;
-  targetUrl?: string;
-  /**
-   * `--local <port>`: point the project at an app on this machine. The same
-   * spelling as `project create`; builds the loopback URL and sends the
-   * `originMode: 'local'` marker that lets the server store it.
-   */
-  local?: string;
-  localHost?: string;
-  skipPreflight?: boolean;
-  username?: string;
-  password?: string;
-  passwordFile?: string;
   instruction?: string;
   /** Ordered test-id attribute list; `clearTestIdAttributes` sends `null` to unset. */
   testIdAttributes?: string[];
@@ -548,7 +372,7 @@ export async function runUpdate(
   deps: ProjectDeps = {},
 ): Promise<CliUpdateProjectResponse> {
   const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
 
   // P1-2: validate idempotency key before sending as an HTTP header.
   assertIdempotencyKey(opts.idempotencyKey);
@@ -559,44 +383,16 @@ export async function runUpdate(
   if (opts.name !== undefined && opts.name.trim().length === 0) {
     throw localValidationError('--name must not be empty or whitespace-only');
   }
-  if (opts.password !== undefined && opts.password.trim().length === 0) {
-    throw localValidationError('--password must not be empty or whitespace-only');
-  }
-  if (opts.password !== undefined && opts.passwordFile !== undefined) {
-    stderr('Warning: --password takes precedence; --password-file was ignored.');
-  }
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  // A loopback URL and --local shorthand use the same stored-target wire shape.
-  // The server owns project-type validation on update.
-  const localTarget = parseStoredLocalTarget({
-    local: opts.local,
-    localHost: opts.localHost,
-    url: opts.targetUrl,
-  });
-  const targetUrl =
-    opts.targetUrl ??
-    (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined);
-  if (opts.targetUrl !== undefined && !localTarget) {
-    assertNotLocal(opts.targetUrl, {
-      field: 'url',
-      helpCommand: 'testsprite project update',
-      hintContext: 'local-project-create',
-    });
-  }
-
   if (opts.testIdAttributes !== undefined && opts.clearTestIdAttributes) {
     throw localValidationError(
       '--test-id-attributes and --clear-test-id-attributes are mutually exclusive.',
     );
   }
-  const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
   const mutableFields: Record<string, boolean> = {
     name: opts.name !== undefined,
-    targetUrl: targetUrl !== undefined,
-    username: opts.username !== undefined,
-    password: passwordSupplied,
     instruction: opts.instruction !== undefined,
     testIdAttributes: opts.testIdAttributes !== undefined || opts.clearTestIdAttributes === true,
   };
@@ -605,8 +401,8 @@ export async function runUpdate(
     .map(([field]) => field);
   if (presentFieldNames.length === 0) {
     throw localValidationError(
-      'At least one mutable flag is required: --name, --url, --username, --password/--password-file, ' +
-        '--instruction, --test-id-attributes, or --clear-test-id-attributes.',
+      'At least one mutable flag is required: --name, --instruction, --test-id-attributes, or ' +
+        '--clear-test-id-attributes.',
     );
   }
 
@@ -629,19 +425,8 @@ export async function runUpdate(
       updatedFields: presentFieldNames,
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
-    out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse, localTarget));
+    out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse));
     return sample;
-  }
-
-  if (localTarget) {
-    await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
-  }
-
-  // Resolve password only on the real path. Dry-run must not touch the
-  // filesystem, even when --password-file is present.
-  let password = opts.password;
-  if (password === undefined && opts.passwordFile !== undefined) {
-    password = readSecretFileGuarded('password-file', opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
@@ -651,10 +436,6 @@ export async function runUpdate(
 
   const bodyFields: Record<string, string | string[] | null | undefined> = {
     name: opts.name,
-    targetUrl,
-    originMode: localTarget ? 'local' : undefined,
-    username: opts.username,
-    password,
     instruction: opts.instruction,
     // `null` clears the list server-side (same convention as `test update --clear-step-timeout`).
     testIdAttributes: opts.clearTestIdAttributes ? null : opts.testIdAttributes,
@@ -686,7 +467,7 @@ export async function runUpdate(
       : {}),
   };
 
-  out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse, localTarget));
+  out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse));
   return updated;
 }
 
@@ -744,7 +525,7 @@ export async function runDelete(
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-delete-${randomUUID()}`;
   if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    const stderr = terminalSafeWriter(deps.stderr);
     stderr(`idempotency-key: ${idempotencyKey}`);
   }
 
@@ -759,783 +540,6 @@ export async function runDelete(
 
   out.print(response, data => renderDeleteText(data as CliDeleteProjectResponse));
   return response;
-}
-
-// ---------------------------------------------------------------------------
-// project credential — set the static backend credential
-// ---------------------------------------------------------------------------
-
-const CLI_AUTH_TYPES = ['public', 'Bearer token', 'API key', 'basic token'] as const;
-
-export interface CliProjectCredentialResponse {
-  projectId: string;
-  authType: string;
-  rewroteCount: number;
-}
-
-interface CredentialOptions extends CommonOptions {
-  projectId: string;
-  authType: string;
-  credential?: string;
-  credentialFile?: string;
-  idempotencyKey?: string;
-}
-
-export async function runCredential(
-  opts: CredentialOptions,
-  deps: ProjectDeps = {},
-): Promise<CliProjectCredentialResponse> {
-  const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  assertIdempotencyKey(opts.idempotencyKey);
-
-  if (!(CLI_AUTH_TYPES as readonly string[]).includes(opts.authType)) {
-    throw localValidationError(`--type must be one of: ${CLI_AUTH_TYPES.join(', ')}`);
-  }
-
-  // A credential (flag or file) is required for every type except `public`
-  // (which clears it). Presence only here: dry-run checks that the flag was
-  // given, not the file's contents; --credential-file is read after the dry-run
-  // early return so --dry-run never touches the filesystem.
-  const missingCredential = (): ApiError =>
-    localValidationError(
-      '--credential (or --credential-file) is required unless --type is "public"',
-    );
-  const credentialSupplied =
-    opts.credential !== undefined ? opts.credential !== '' : opts.credentialFile !== undefined;
-  if (opts.authType !== 'public' && !credentialSupplied) {
-    throw missingCredential();
-  }
-
-  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-cred-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    stderr(`idempotency-key: ${idempotencyKey}`);
-  }
-
-  if (opts.dryRun) {
-    const sample: CliProjectCredentialResponse = {
-      projectId: opts.projectId,
-      authType: opts.authType,
-      rewroteCount: 0,
-    };
-    out.print(sample, data => renderCredentialText(data as CliProjectCredentialResponse));
-    return sample;
-  }
-
-  let credential = opts.credential;
-  if (credential === undefined && opts.credentialFile !== undefined) {
-    credential = readSecretFileGuarded('credential-file', opts.credentialFile);
-  }
-  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
-    throw missingCredential();
-  }
-
-  const body: Record<string, string> = { authType: opts.authType };
-  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
-
-  const client = makeClient(opts, deps);
-  const res = await client.put<CliProjectCredentialResponse>(
-    `/projects/${encodeURIComponent(opts.projectId)}/credential`,
-    { body, headers: { 'idempotency-key': idempotencyKey } },
-  );
-  out.print(res, data => renderCredentialText(data as CliProjectCredentialResponse));
-  return res;
-}
-
-function renderCredentialText(r: CliProjectCredentialResponse): string {
-  return [
-    `projectId    ${r.projectId}`,
-    `authType     ${r.authType}`,
-    `rewroteCount ${r.rewroteCount}`,
-  ].join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// project auto-auth — configure the recurring-token (auto-refresh) login
-// ---------------------------------------------------------------------------
-
-const AUTO_AUTH_METHODS = ['password', 'refresh_token', 'aws_cognito_refresh'] as const;
-const AUTO_AUTH_INJECTS = ['bearer', 'header', 'cookie'] as const;
-
-export interface CliProjectAutoAuthResponse {
-  projectId: string;
-  enabled: boolean;
-  method: string;
-  inject: string;
-  /**
-   * Present when the server's trial refresh failed: `enabled` is then `false`
-   * and this carries the reason (e.g. a bad refresh token). The config is still
-   * stored, but auto-auth won't run until the login succeeds.
-   */
-  lastRefreshError?: string;
-}
-
-interface AutoAuthOptions extends CommonOptions {
-  projectId: string;
-  disable?: boolean;
-  method: string;
-  inject: string;
-  injectKey?: string;
-  // password method
-  loginUrl?: string;
-  loginMethod?: string;
-  loginContentType?: string;
-  loginBodyTemplate?: string;
-  username?: string;
-  password?: string;
-  passwordFile?: string;
-  tokenPath?: string;
-  // refresh_token method
-  tokenEndpoint?: string;
-  clientId?: string;
-  clientSecret?: string;
-  clientSecretFile?: string;
-  refreshToken?: string;
-  refreshTokenFile?: string;
-  scope?: string;
-  // aws_cognito_refresh method
-  region?: string;
-  idempotencyKey?: string;
-}
-
-export async function runAutoAuth(
-  opts: AutoAuthOptions,
-  deps: ProjectDeps = {},
-): Promise<CliProjectAutoAuthResponse> {
-  const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  assertIdempotencyKey(opts.idempotencyKey);
-
-  if (!(AUTO_AUTH_METHODS as readonly string[]).includes(opts.method)) {
-    throw localValidationError(`--method must be one of: ${AUTO_AUTH_METHODS.join(', ')}`);
-  }
-  if (!(AUTO_AUTH_INJECTS as readonly string[]).includes(opts.inject)) {
-    throw localValidationError(`--inject must be one of: ${AUTO_AUTH_INJECTS.join(', ')}`);
-  }
-
-  const enabled = opts.disable !== true;
-
-  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    stderr(`idempotency-key: ${idempotencyKey}`);
-  }
-
-  if (opts.dryRun) {
-    const sample: CliProjectAutoAuthResponse = {
-      projectId: opts.projectId,
-      enabled,
-      method: opts.method,
-      inject: opts.inject,
-    };
-    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
-    return sample;
-  }
-
-  // Resolve secrets from --*-file variants so they stay out of shell history.
-  // Placed after the dry-run early return so --dry-run never touches the filesystem.
-  const password =
-    opts.password ??
-    (opts.passwordFile !== undefined
-      ? readSecretFileGuarded('password-file', opts.passwordFile)
-      : undefined);
-  const clientSecret =
-    opts.clientSecret ??
-    (opts.clientSecretFile !== undefined
-      ? readSecretFileGuarded('client-secret-file', opts.clientSecretFile)
-      : undefined);
-  const refreshToken =
-    opts.refreshToken ??
-    (opts.refreshTokenFile !== undefined
-      ? readSecretFileGuarded('refresh-token-file', opts.refreshTokenFile)
-      : undefined);
-
-  const body: Record<string, unknown> = { enabled, method: opts.method, inject: opts.inject };
-  const maybe = (k: string, v: string | undefined): void => {
-    if (v !== undefined) body[k] = v;
-  };
-  maybe('injectKey', opts.injectKey);
-  maybe('loginUrl', opts.loginUrl);
-  maybe('loginMethod', opts.loginMethod);
-  maybe('loginContentType', opts.loginContentType);
-  maybe('loginBodyTemplate', opts.loginBodyTemplate);
-  maybe('username', opts.username);
-  maybe('password', password);
-  maybe('tokenPath', opts.tokenPath);
-  maybe('tokenEndpoint', opts.tokenEndpoint);
-  maybe('clientId', opts.clientId);
-  maybe('clientSecret', clientSecret);
-  maybe('refreshToken', refreshToken);
-  maybe('scope', opts.scope);
-  maybe('region', opts.region);
-
-  const client = makeClient(opts, deps);
-  const res = await client.put<CliProjectAutoAuthResponse>(
-    `/projects/${encodeURIComponent(opts.projectId)}/auto-auth`,
-    { body, headers: { 'idempotency-key': idempotencyKey } },
-  );
-  out.print(res, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
-  return res;
-}
-
-function renderAutoAuthText(r: CliProjectAutoAuthResponse): string {
-  const lines = [
-    `projectId ${r.projectId}`,
-    `enabled   ${r.enabled}`,
-    `method    ${r.method}`,
-    `inject    ${r.inject}`,
-  ];
-  if (r.lastRefreshError) {
-    lines.push(`lastRefreshError ${r.lastRefreshError}`);
-  }
-  // A disabled result after a write means the trial login failed — call it out
-  // so the user doesn't assume auto-auth is live.
-  if (!r.enabled) {
-    lines.push(
-      'note      auto-auth was stored but is DISABLED — the trial login failed. Fix the credentials (e.g. a valid refresh token) and re-run.',
-    );
-  }
-  return lines.join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// project docs upload
-// ---------------------------------------------------------------------------
-
-/**
- * CLI-facing role flags → wire enum. Default is `api-doc` (stated in help);
- * no inference from project type in v1 (design §3.4).
- */
-const DOC_ROLES = { 'api-doc': 'API_DOC', prd: 'PRD' } as const;
-type DocRoleFlag = keyof typeof DOC_ROLES;
-type DocRoleWire = (typeof DOC_ROLES)[DocRoleFlag];
-
-/**
- * MIME type sent in step 1 and echoed on the step-2 PUT. The backend signs
- * `ContentType` into the presigned URL when supplied, so the PUT's
- * `Content-Type` header must be byte-identical to what step 1 declared —
- * both come from this one lookup, so they cannot drift.
- */
-const DOC_CONTENT_TYPES: Record<string, string> = {
-  '.json': 'application/json',
-  '.yaml': 'application/yaml',
-  '.yml': 'application/yaml',
-  '.md': 'text/markdown',
-  '.markdown': 'text/markdown',
-  '.txt': 'text/plain',
-  '.pdf': 'application/pdf',
-};
-const DEFAULT_DOC_CONTENT_TYPE = 'application/octet-stream';
-
-/** `POST /projects/{id}/docs/upload-url` response (docs facade). */
-export interface CliDocsUploadUrlResponse {
-  uploadUrl: string;
-  s3Key: string;
-  expiresInSeconds: number;
-}
-
-/** `POST /projects/{id}/docs` (register) response (docs facade). */
-export interface CliDocsRegisterResponse {
-  resourceId: string;
-  displayName: string;
-  docRole: DocRoleWire | null;
-  processStatus: string;
-}
-
-/** Success result — the JSON-mode stdout shape. */
-export interface CliDocsUploadResult {
-  resourceId: string;
-  displayName: string;
-  role: DocRoleWire | null;
-  size: number;
-  processStatus: string;
-}
-
-/** Dry-run result: the would-be plan. Zero network, nothing read beyond a stat. */
-export interface CliDocsUploadPlan {
-  dryRun: true;
-  projectId: string;
-  file: string;
-  fileName: string;
-  displayName: string;
-  role: DocRoleWire;
-  contentType: string;
-  size: number;
-  steps: string[];
-}
-
-interface DocsUploadOptions extends CommonOptions {
-  file: string;
-  projectId?: string;
-  role?: string;
-  name?: string;
-  idempotencyKey?: string;
-}
-
-/**
- * `project docs upload <file>` — upload an API spec or PRD as a project
- * source so plan generation has inputs to feed on (closes the API-project
- * cold start at `no_processed_inputs`).
- *
- * Three-step flow against the docs facade routes:
- *
- *   1. `POST /projects/{id}/docs/upload-url` — mints a one-hour presigned
- *      S3 PUT URL plus the S3 key to register afterwards.
- *   2. HTTP PUT of the file bytes to the presigned URL — **streamed**
- *      (`createReadStream` → web stream), never buffering the whole file.
- *      This request goes straight to S3: no facade base URL, no API key.
- *   3. `POST /projects/{id}/docs` — registers the S3 object with its role
- *      and display name, which starts processing + embedding.
- *
- * Reading the local file as INPUT is allowed by DR-21 (the no-local-OUTPUTS
- * rule); nothing is ever written back to disk.
- *
- * Failure modes are deliberately distinguished (design non-negotiable): a
- * step-2 failure names the presigned PUT and the fix (re-running mints a
- * fresh URL — they expire); a step-3 failure preserves the server envelope
- * and says the upload already succeeded (re-running is safe: the server
- * upserts the document by S3 key, so no duplicate is created).
- */
-export async function runDocsUpload(
-  opts: DocsUploadOptions,
-  deps: ProjectDeps = {},
-): Promise<CliDocsUploadResult | CliDocsUploadPlan> {
-  const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-
-  assertIdempotencyKey(opts.idempotencyKey);
-
-  const projectId = requireDocsProjectId(opts.projectId, deps);
-  const roleFlag = opts.role ?? 'api-doc';
-  if (!(roleFlag in DOC_ROLES)) {
-    throw localValidationError(
-      '--role must be api-doc (API spec, the default) or prd (product requirements document)',
-    );
-  }
-  const role: DocRoleWire = DOC_ROLES[roleFlag as DocRoleFlag];
-
-  if (opts.name !== undefined && opts.name.trim().length === 0) {
-    throw localValidationError('--name must not be empty or whitespace-only');
-  }
-  if (opts.name !== undefined && opts.name.length > 255) {
-    throw localValidationError('--name must be at most 255 characters');
-  }
-
-  if (opts.file === undefined || opts.file.trim().length === 0) {
-    throw localValidationError('<file> is required');
-  }
-  // Size + existence sanity via stat only — the dry-run contract is "nothing
-  // read beyond a stat", and the real path opens the file exactly once, in
-  // the streamed PUT below.
-  let stat: Stats;
-  try {
-    stat = statSync(opts.file);
-  } catch (cause) {
-    const code = (cause as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') {
-      throw localValidationError(`file does not exist: ${opts.file}`);
-    }
-    throw localValidationError(
-      `cannot stat file ${opts.file}: ${(cause as Error).message ?? String(cause)}`,
-    );
-  }
-  if (!stat.isFile()) {
-    throw localValidationError(`${opts.file} is not a regular file (is it a directory?)`);
-  }
-  if (stat.size === 0) {
-    throw localValidationError(`file is empty (0 bytes), nothing to upload: ${opts.file}`);
-  }
-
-  const fileName = basename(opts.file);
-  if (fileName.length > 255) {
-    throw localValidationError(
-      'the file name (basename) must be at most 255 characters — rename the file ' +
-        '(--name only changes the display name, not the stored file name)',
-    );
-  }
-  const displayName = opts.name ?? fileName;
-  const contentType =
-    DOC_CONTENT_TYPES[extname(fileName).toLowerCase()] ?? DEFAULT_DOC_CONTENT_TYPE;
-  const projectPath = encodeURIComponent(projectId);
-
-  if (opts.dryRun) {
-    // Same inline early-exit family as `test delete-batch --dry-run`: the
-    // command's dry-run contract (zero network, stat only, print the plan)
-    // cannot be expressed through canned fetch samples — step 2 would have
-    // to PUT somewhere. The `docsUploadUrl`/`docsRegister` entries in
-    // `samples.ts` are shape-guards/documentation, not consumed here.
-    emitDryRunBanner(stderr);
-    const plan: CliDocsUploadPlan = {
-      dryRun: true,
-      projectId,
-      file: opts.file,
-      fileName,
-      displayName,
-      role,
-      contentType,
-      size: stat.size,
-      steps: [
-        `POST /projects/${projectId}/docs/upload-url — mint a presigned S3 PUT URL for ${fileName} (${contentType})`,
-        `PUT ${stat.size} bytes to the presigned URL (streamed from disk, never buffered)`,
-        `POST /projects/${projectId}/docs — register ${displayName} as ${role}; starts processing + embedding`,
-      ],
-    };
-    out.print(plan, data => renderDocsUploadPlanText(data as CliDocsUploadPlan));
-    return plan;
-  }
-
-  const idempotencyKey = opts.idempotencyKey ?? `cli-docs-upload-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    stderr(`idempotency-key: ${idempotencyKey}`);
-  }
-
-  const client = makeClient(opts, deps);
-
-  // ── Step 1 of 3: mint the presigned upload URL ────────────────────────────
-  const minted = await client.post<CliDocsUploadUrlResponse>(
-    `/projects/${projectPath}/docs/upload-url`,
-    { body: { fileName, contentType } },
-  );
-
-  // ── Step 2 of 3: stream the file bytes to S3 ──────────────────────────────
-  // Straight to the presigned host with the raw fetch impl — NOT through
-  // HttpClient, which would attach the facade base URL and leak the API key
-  // to S3. Content-Length comes from the stat: S3 rejects chunked
-  // transfer-encoding on presigned PUTs, and Node's fetch uses the explicit
-  // header to keep identity framing with a streamed body.
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  // A remote facade must mint a non-local https URL.
-  assertSafePresignedUploadUrl(minted.uploadUrl, client.resolvedBaseUrl);
-  // Same flag > TESTSPRITE_REQUEST_TIMEOUT_MS > default resolution (and 1-600s
-  // clamp) as makeHttpClient — this leg bypasses HttpClient, so resolve here.
-  const requestTimeoutMs = resolveRequestTimeoutMs(opts, deps.env ?? process.env);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
-  // Compose the shutdown signal into the PUT abort (manual listeners, house
-  // style — no AbortSignal.any) and arm the graceful scope for the upload's
-  // duration, so Ctrl-C during a long PUT takes the honest detach path
-  // instead of being unabortable. The timer and listener stay armed through the
-  // failed-response body read below, not just through fetch's header
-  // resolution — a non-OK response can still stall its body.
-  const shutdown = deps.shutdown ?? globalShutdown;
-  const shutdownSignal = shutdown.signal;
-  const onShutdownAbort = (): void => controller.abort(shutdownSignal.reason);
-  const disarm = shutdown.arm();
-  if (shutdownSignal.aborted) onShutdownAbort();
-  else shutdownSignal.addEventListener('abort', onShutdownAbort, { once: true });
-  try {
-    const putResponse = await fetchImpl(minted.uploadUrl, {
-      method: 'PUT',
-      headers: { 'content-type': contentType, 'content-length': String(stat.size) },
-      body: Readable.toWeb(createReadStream(opts.file)) as unknown as RequestInit['body'],
-      duplex: 'half',
-      // assertSafePresignedUploadUrl vets the MINTED url, but a
-      // default `redirect: 'follow'` would let a 3xx from that host resend
-      // the request to an unvetted Location (e.g. a 303 → 169.254.169.254) —
-      // an SSRF-shaped hop the guard never sees. A real S3 presigned PUT never
-      // redirects, so refuse: the thrown TypeError falls through to the catch
-      // below as a normal `presigned_put_failed` (no new error reason).
-      redirect: 'error',
-      signal: controller.signal,
-    } as RequestInit);
-    if (!putResponse.ok) {
-      // The deadline stays armed while this reads: a storage/proxy response can
-      // send non-OK headers and then stall its body indefinitely.
-      const snippet = await readFailedPutSnippet(putResponse, controller.signal);
-      throw presignedPutError(
-        `S3 returned HTTP ${putResponse.status}${snippet ? ` — ${snippet}` : ''}`,
-        minted.expiresInSeconds,
-      );
-    }
-  } catch (cause) {
-    // Interrupt outranks the timeout mapping: a Ctrl-C-aborted fetch or body
-    // read must surface as InterruptError (exit 130/143), never as a timeout.
-    if (cause instanceof InterruptError) throw cause;
-    if (shutdownSignal.aborted) throw shutdownSignal.reason;
-    // The presigned error thrown above already carries the HTTP status and
-    // step-2 guidance — don't remap it as a network failure.
-    if (cause instanceof ApiError) throw cause;
-    // Any other abort here is ours (the per-request timer): map to the CLI's
-    // typed exit-7 timeout, same contract as HttpClient's per-request timeout.
-    if (controller.signal.aborted || isAbortError(cause)) {
-      throw new RequestTimeoutError(requestTimeoutMs);
-    }
-    throw presignedPutError(
-      `network error before S3 responded: ${describeCause(cause)}`,
-      minted.expiresInSeconds,
-    );
-  } finally {
-    clearTimeout(timer);
-    shutdownSignal.removeEventListener('abort', onShutdownAbort);
-    disarm();
-  }
-
-  // ── Step 3 of 3: register the uploaded object ─────────────────────────────
-  let registered: CliDocsRegisterResponse;
-  try {
-    registered = await client.post<CliDocsRegisterResponse>(`/projects/${projectPath}/docs`, {
-      body: { s3Key: minted.s3Key, displayName, docRole: role },
-      headers: { 'idempotency-key': idempotencyKey },
-    });
-  } catch (cause) {
-    if (cause instanceof ApiError) throw registerStepError(cause);
-    // A register timeout needs the same step-3 context — it is precisely the
-    // case where the caller can't tell whether the register landed. Class and
-    // exit 7 are preserved; only the text gains the upload-succeeded /
-    // safe-to-re-run explanation.
-    if (cause instanceof RequestTimeoutError) {
-      cause.message =
-        `Document register timed out (step 3 of 3) — the S3 upload succeeded, and the ` +
-        `register may or may not have landed. ${cause.message} Re-running the whole command ` +
-        `is safe: the server upserts the document by its S3 key (no duplicate is created; a PRD re-register re-runs the embedding compute, but the embedding charge is idempotent per document — never billed twice).`;
-      throw cause;
-    }
-    throw cause;
-  }
-
-  const result: CliDocsUploadResult = {
-    resourceId: registered.resourceId,
-    displayName: registered.displayName ?? displayName,
-    role: registered.docRole ?? role,
-    size: stat.size,
-    processStatus: registered.processStatus,
-  };
-  out.print(result, data => renderDocsUploadText(data as CliDocsUploadResult));
-  return result;
-}
-
-const PUT_ERROR_BODY_MAX_BYTES = 1_200;
-const PUT_ERROR_SNIPPET_MAX_CHARS = 300;
-
-/**
- * Read a bounded diagnostic prefix from a failed presigned PUT response.
- *
- * The caller keeps the PUT timeout/shutdown signal armed while this runs, but a
- * body that ignores the abort must not extend the request past its deadline:
- * every read races the abort signal, and the stream is cancelled without
- * waiting for the peer. At most 1,200 bytes are read — enough for 300 four-byte
- * UTF-8 code points — and at most 300 characters are displayed.
- *
- * A non-abort body error returns an empty snippet so the caller still reports
- * the already-known HTTP status. Aborts and interrupts propagate so the upload
- * maps them to the typed timeout/interrupt errors instead of swallowing them.
- */
-async function readFailedPutSnippet(response: Response, signal: AbortSignal): Promise<string> {
-  if (response.body === null) return '';
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let text = '';
-  let bytes = 0;
-  let complete = false;
-  let removeAbortListener: (() => void) | undefined;
-
-  const aborted = new Promise<never>((_resolve, reject) => {
-    let notified = false;
-    const onAbort = (): void => {
-      if (notified) return;
-      notified = true;
-      // Don't await cleanup: a peer that never ends its body must not hold up
-      // the already-known upload failure.
-      void reader.cancel().catch(() => undefined);
-      reject(signal.reason);
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-    removeAbortListener = () => signal.removeEventListener('abort', onAbort);
-    // Covers an abort racing the listener registration above.
-    if (signal.aborted) onAbort();
-  });
-
-  try {
-    while (bytes < PUT_ERROR_BODY_MAX_BYTES && text.length < PUT_ERROR_SNIPPET_MAX_CHARS) {
-      const result = await Promise.race([reader.read(), aborted]);
-      // Cancelling the reader in `onAbort` can settle the pending read as
-      // `{ done: true }` before the abort rejection wins the race. Re-check the
-      // signal so a stalled body still surfaces the timeout/interrupt.
-      if (signal.aborted) throw signal.reason;
-      const { done, value } = result;
-      if (done) {
-        complete = true;
-        text += decoder.decode();
-        break;
-      }
-      if (value === undefined) continue;
-      const prefix = value.subarray(0, PUT_ERROR_BODY_MAX_BYTES - bytes);
-      bytes += prefix.byteLength;
-      text += decoder.decode(prefix, { stream: true });
-    }
-    return text.slice(0, PUT_ERROR_SNIPPET_MAX_CHARS);
-  } catch (cause) {
-    if (signal.aborted) throw signal.reason;
-    if (cause instanceof InterruptError || isAbortError(cause)) throw cause;
-    return '';
-  } finally {
-    removeAbortListener?.();
-    // Do not let remote stream cleanup delay the already-known error.
-    if (!complete) void reader.cancel().catch(() => undefined);
-    try {
-      reader.releaseLock();
-    } catch {
-      // A pending read can hold the lock after an abort; the stream is already
-      // being cancelled and the caller must not wait on that cleanup.
-    }
-  }
-}
-
-function isAbortError(cause: unknown): boolean {
-  return cause instanceof Error && cause.name === 'AbortError';
-}
-
-function describeCause(cause: unknown): string {
-  if (!(cause instanceof Error)) return String(cause);
-  // undici wraps network failures as `TypeError: fetch failed` with the
-  // useful detail on `.cause` — surface both.
-  const nested = (cause as { cause?: unknown }).cause;
-  const nestedMsg = nested instanceof Error ? ` (${nested.message})` : '';
-  return `${cause.message}${nestedMsg}`;
-}
-
-/**
- * Defense-in-depth on the server-minted presigned URL.
- *
- * A REMOTE facade must mint a non-local `https:` URL; a localhost/private or
- * plain-http mint from a remote facade is exactly the anomaly to reject
- * (compromised/misconfigured facade or an active MITM) — the PUT would
- * otherwise send the user's file wherever that URL points, before any bytes
- * leave the machine. A facade that is ITSELF loopback (dev rig, localhost
- * e2e) is a deliberate operator configuration and is trusted to mint local
- * URLs — and ONLY loopback qualifies: the gate is a positive, fail-closed
- * check, because gating on "anything `assertNotLocal` dislikes" would
- * silently disable the guard for an unparsable base URL or a user-settable
- * private-range endpoint (`--endpoint-url https://10.1.2.3`). Literal checks
- * only (same scope as `assertNotLocal`); no host allow-listing by design.
- *
- * Known residual: a loopback facade that is really a TUNNEL to a remote
- * backend (`ssh -L`, a localhost corporate proxy) is trusted here even though
- * the real conversation is remote and MITM-able upstream. This is inherent to
- * "loopback facade = trusted dev rig" and accepted — the CLI cannot tell a
- * dev rig from a tunnel by the base URL alone.
- */
-function assertSafePresignedUploadUrl(uploadUrl: string, facadeBaseUrl: string): void {
-  if (isLoopbackFacade(facadeBaseUrl)) return;
-  const reject = (reason: string): never => {
-    throw ApiError.fromEnvelope({
-      error: {
-        code: 'VALIDATION_ERROR',
-        message: `Refusing the presigned upload URL the server returned: ${reason}.`,
-        nextAction:
-          'No bytes were uploaded. This can indicate a misconfigured or intercepted API ' +
-          'endpoint — verify --endpoint-url / TESTSPRITE_API_URL and retry.',
-        requestId: 'local',
-        details: { field: 'uploadUrl', reason: 'unsafe_presigned_url' },
-      },
-    });
-  };
-  let parsed: URL;
-  try {
-    parsed = new URL(uploadUrl);
-  } catch {
-    return reject('it is not a valid URL');
-  }
-  if (parsed.protocol !== 'https:') return reject('it is not https');
-  if (isLocalUrl(uploadUrl)) return reject('it points at a local/private address');
-}
-
-/** True when `assertNotLocal` rejects the URL (localhost, RFC1918, link-local,
- *  metadata, non-http(s), unparsable). Fail-closed in the REJECTION direction
- *  only — used to refuse a suspicious mint, never to grant trust (that side
- *  is `isLoopbackFacade`). */
-function isLocalUrl(url: string): boolean {
-  try {
-    assertNotLocal(url, {
-      field: 'upload-url',
-      helpCommand: 'testsprite project docs upload',
-    });
-    return false;
-  } catch {
-    return true;
-  }
-}
-
-/**
- * The facade-trust gate for `assertSafePresignedUploadUrl`.
- * Positive and narrow — only an explicitly-loopback facade (`localhost`,
- * a `127.0.0.0/8` literal, or `[::1]`) is trusted to mint local upload URLs.
- * Anything else — including an unparsable base URL or a private-range
- * endpoint — leaves the guard ON.
- */
-function isLoopbackFacade(url: string): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return false;
-  }
-  // `localhost.` is the fully-qualified form of `localhost` (RFC 6761).
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
-  if (host === 'localhost') return true;
-  if (/^127\.\d+\.\d+\.\d+$/.test(host)) return true;
-  return host === '[::1]';
-}
-
-/**
- * Step-2 failure: the presigned PUT to S3. Distinguished from a register
- * failure per the design non-negotiable — the fix is different (re-running
- * re-mints the URL; nothing was registered, so nothing is half-done).
- */
-function presignedPutError(detail: string, expiresInSeconds: number): ApiError {
-  return new ApiError({
-    code: 'UNAVAILABLE',
-    message: `Presigned S3 upload failed (step 2 of 3): ${detail}`,
-    nextAction:
-      'The document was NOT registered. Re-run the command — each run mints a fresh ' +
-      `upload URL (presigned URLs expire, this one after ${Math.round(expiresInSeconds / 60)} minutes).`,
-    requestId: 'local',
-    details: { reason: 'presigned_put_failed' },
-  });
-}
-
-/**
- * Step-3 failure: register. The server envelope (code, exit, requestId,
- * details) passes through unchanged; only the text gains step context so
- * the caller knows the upload itself already landed and a re-run is safe
- * (the server upserts the document by S3 key — no duplicate).
- */
-function registerStepError(cause: ApiError): ApiError {
-  return new ApiError(
-    {
-      code: cause.code,
-      message: `Document register failed (step 3 of 3) — the S3 upload succeeded, but the document is not registered yet. ${cause.message}`,
-      nextAction:
-        `${cause.nextAction ? `${cause.nextAction} ` : ''}` +
-        'Re-running the whole command is safe: the same file re-uploads and the server ' +
-        'upserts the document by its S3 key (no duplicate is created; a PRD re-register re-runs the embedding compute, but the embedding charge is idempotent per document — never billed twice).',
-      requestId: cause.requestId,
-      details: cause.details,
-    },
-    cause.httpStatus,
-    cause.retryAfterMs,
-  );
-}
-
-function formatDocSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function renderDocsUploadText(r: CliDocsUploadResult): string {
-  return [
-    `uploaded ${r.displayName} (${formatDocSize(r.size)}) — processing started`,
-    'note: generation can use this source once processing and embedding finish',
-    '      (check with `testsprite test plan generate` — it says if inputs are still processing)',
-  ].join('\n');
-}
-
-function renderDocsUploadPlanText(p: CliDocsUploadPlan): string {
-  return [
-    `would upload ${p.file} (${formatDocSize(p.size)}) to project ${p.projectId} as ${p.role}:`,
-    ...p.steps.map((step, i) => `  ${i + 1}. ${step}`),
-  ].join('\n');
 }
 
 export function createProjectCommand(deps: ProjectDeps = {}): Command {
@@ -1593,38 +597,13 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('create')
-    .description('Create a new project')
+    .description('Create a project; add where it runs with `project env create`')
     .option('--type <frontend|backend>', 'project type (required)')
     .option('--name <name>', 'project name (required)')
     .option(
-      '--url <url>',
-      'target URL (public http/https; a loopback http origin with an explicit port is frontend only; required for frontend unless --local; also required for backend on the V3 path, see `auth status`)',
+      '--instruction <text>',
+      'extra instructions: facts and rules the agent keeps in mind when it explores the app, writes tests or runs them',
     )
-    .option(
-      '--local <port>',
-      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; frontend only; runs open a tunnel automatically)',
-    )
-    .addOption(
-      new Option(
-        '--local-host <host>',
-        'deprecated loopback host override; requires --local',
-      ).hideHelp(),
-    )
-    .option('--skip-preflight', 'skip the local TCP listener check before project creation')
-    .option(
-      '--description <text>',
-      'not supported — projects have no description (test-level descriptions are set on `test create`)',
-    )
-    .option('--username <user>', 'optional auth username (give with --password)')
-    .option(
-      '--password <pw>',
-      'optional auth password, with --username (--password-file for non-interactive)',
-    )
-    .option(
-      '--password-file <path>',
-      'read password from file (if both are given, --password wins with a warning)',
-    )
-    .option('--instruction <text>', 'optional FE plan-gen instruction hint')
     .option(
       '--test-id-attributes <list>',
       'comma-separated DOM attributes the engine should prefer as locators, highest priority first ' +
@@ -1647,14 +626,6 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           ...resolveCommonOptions(command, deps.env),
           type,
           name: cmdOpts.name,
-          targetUrl: cmdOpts.url,
-          local: cmdOpts.local,
-          localHost: cmdOpts.localHost,
-          skipPreflight: cmdOpts.skipPreflight,
-          description: cmdOpts.description,
-          username: cmdOpts.username,
-          password: cmdOpts.password,
-          passwordFile: cmdOpts.passwordFile,
           instruction: cmdOpts.instruction,
           testIdAttributes:
             cmdOpts.testIdAttributes !== undefined
@@ -1668,30 +639,9 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('update <project-id>')
-    .description('Update project metadata')
+    .description("Update a project's name, extra instructions or test-id attributes")
     .option('--name <name>', 'new project name')
-    .option(
-      '--url <url>',
-      'new target URL (public http/https, or a loopback http origin with an explicit port)',
-    )
-    .option(
-      '--local <port>',
-      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; frontend only)',
-    )
-    .addOption(
-      new Option(
-        '--local-host <host>',
-        'deprecated loopback host override; requires --local',
-      ).hideHelp(),
-    )
-    .option('--skip-preflight', 'skip the local TCP listener check before the update')
-    .option('--username <user>', 'new auth username')
-    .option('--password <pw>', 'new auth password')
-    .option(
-      '--password-file <path>',
-      'read new password from file (if both are given, --password wins with a warning)',
-    )
-    .option('--instruction <text>', 'new FE plan-gen instruction hint')
+    .option('--instruction <text>', 'replace the current instructions (read them with project get)')
     .option(
       '--test-id-attributes <list>',
       'comma-separated DOM attributes the engine should prefer as locators, highest priority first ' +
@@ -1713,13 +663,6 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           ...resolveCommonOptions(command, deps.env),
           projectId,
           name: cmdOpts.name,
-          targetUrl: cmdOpts.url,
-          local: cmdOpts.local,
-          localHost: cmdOpts.localHost,
-          skipPreflight: cmdOpts.skipPreflight,
-          username: cmdOpts.username,
-          password: cmdOpts.password,
-          passwordFile: cmdOpts.passwordFile,
           instruction: cmdOpts.instruction,
           testIdAttributes:
             cmdOpts.testIdAttributes !== undefined
@@ -1762,162 +705,11 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
 
-  project
-    .command('credential <project-id>')
-    .summary('Set the static credential injected into backend tests')
-    .description(
-      'Set the static backend credential injected into every backend test. Free tier.\n' +
-        "On V3 accounts it is stored on the project's default environment.",
-    )
-    .requiredOption(
-      '--type <type>',
-      'required: public | "Bearer token" | "API key" | "basic token" (exact, lowercase)',
-    )
-    .option('--credential <value>', 'credential value (required unless --type public)')
-    .option('--credential-file <path>', 'read the credential value from a file')
-    .option(
-      '--idempotency-key <token>',
-      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
-    )
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (projectId: string, cmdOpts: CredentialFlagOpts, command: Command) => {
-      await runCredential(
-        {
-          ...resolveCommonOptions(command, deps.env),
-          projectId,
-          authType: cmdOpts.type,
-          credential: cmdOpts.credential,
-          credentialFile: cmdOpts.credentialFile,
-          idempotencyKey: cmdOpts.idempotencyKey,
-        },
-        deps,
-      );
-    });
-
-  project
-    .command('auto-auth <project-id>')
-    .summary('Configure auto-refresh login for backend tests (paid)')
-    .description(
-      'Configure the recurring-token (auto-refresh login) for backend tests (paid plans):\n' +
-        'a fresh token is fetched on each run and injected into every backend test.\n' +
-        'Each method needs its own flags (password: --login-url, --token-path, ...;\n' +
-        'refresh_token: --token-endpoint, --client-id, ...; aws_cognito_refresh: --region, ...).',
-    )
-    .requiredOption('--method <method>', 'password | refresh_token | aws_cognito_refresh')
-    .requiredOption('--inject <where>', 'bearer | header | cookie')
-    .option(
-      '--disable',
-      'turn auto-auth off, keeping stored config (--method and --inject are still required)',
-    )
-    .option('--inject-key <name>', 'header/cookie name when --inject is header/cookie')
-    // password method
-    .option('--login-url <url>', 'login endpoint (method=password)')
-    .option('--login-method <verb>', 'POST | PUT (method=password)')
-    .option('--login-content-type <ct>', 'application/json | application/x-www-form-urlencoded')
-    .option('--login-body-template <tpl>', 'login body template with {{username}}/{{password}}')
-    .option('--username <user>', 'login username (method=password)')
-    .option('--password <pw>', 'login password (method=password)')
-    .option('--password-file <path>', 'read login password from a file')
-    .option('--token-path <jsonpath>', 'JSONPath to the token in the login response')
-    // refresh_token method
-    .option('--token-endpoint <url>', 'OAuth token endpoint (method=refresh_token)')
-    .option('--client-id <id>', 'OAuth client id')
-    .option('--client-secret <secret>', 'OAuth client secret')
-    .option('--client-secret-file <path>', 'read OAuth client secret from a file')
-    .option('--refresh-token <token>', 'OAuth/Cognito refresh token')
-    .option('--refresh-token-file <path>', 'read the refresh token from a file')
-    .option('--scope <scope>', 'OAuth scope')
-    // aws_cognito_refresh method
-    .option('--region <region>', "AWS region (method=aws_cognito_refresh, e.g. 'us-east-1')")
-    .option(
-      '--idempotency-key <token>',
-      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
-    )
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (projectId: string, cmdOpts: AutoAuthFlagOpts, command: Command) => {
-      await runAutoAuth(
-        {
-          ...resolveCommonOptions(command, deps.env),
-          projectId,
-          disable: cmdOpts.disable,
-          method: cmdOpts.method,
-          inject: cmdOpts.inject,
-          injectKey: cmdOpts.injectKey,
-          loginUrl: cmdOpts.loginUrl,
-          loginMethod: cmdOpts.loginMethod,
-          loginContentType: cmdOpts.loginContentType,
-          loginBodyTemplate: cmdOpts.loginBodyTemplate,
-          username: cmdOpts.username,
-          password: cmdOpts.password,
-          passwordFile: cmdOpts.passwordFile,
-          tokenPath: cmdOpts.tokenPath,
-          tokenEndpoint: cmdOpts.tokenEndpoint,
-          clientId: cmdOpts.clientId,
-          clientSecret: cmdOpts.clientSecret,
-          clientSecretFile: cmdOpts.clientSecretFile,
-          refreshToken: cmdOpts.refreshToken,
-          refreshTokenFile: cmdOpts.refreshTokenFile,
-          scope: cmdOpts.scope,
-          region: cmdOpts.region,
-          idempotencyKey: cmdOpts.idempotencyKey,
-        },
-        deps,
-      );
-    });
-
-  const docs = new Command('docs')
-    .summary('Manage project documents (plan-generation sources)')
-    .description('Manage project documents — the sources plan generation feeds on');
-  docs
-    .command('upload <file>')
-    .summary('Upload an API spec or PRD as a project source')
-    .description(
-      'Upload an API spec or PRD as a project source: mint a presigned S3 URL, stream the file\n' +
-        'to it, register the document — which starts processing + embedding and spends credits\n' +
-        '(see `testsprite usage`). The local file is only read.\n' +
-        '\nExit codes:\n' +
-        '  0  upload registered (processing started)\n' +
-        '  3  auth error\n' +
-        '  4  project not found (or not accessible in this workspace)\n' +
-        '  5  validation error (missing/empty file, bad --role)\n' +
-        '  7  request timeout (also: backend predates the docs routes)\n' +
-        ' 10  presigned S3 PUT failed — re-run to mint a fresh URL',
-    )
-    .option('--project <id>', 'project id (required unless TESTSPRITE_PROJECT_ID is set)')
-    .option('--role <role>', 'document role: api-doc (API spec, default) | prd')
-    .option('--name <display-name>', 'display name for the document (default: file basename)')
-    .option(
-      '--idempotency-key <token>',
-      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
-    )
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (file: string, cmdOpts: DocsUploadFlagOpts, command: Command) => {
-      await runDocsUpload(
-        {
-          ...resolveCommonOptions(command, deps.env),
-          file,
-          projectId: cmdOpts.project,
-          role: cmdOpts.role,
-          name: cmdOpts.name,
-          idempotencyKey: cmdOpts.idempotencyKey,
-        },
-        deps,
-      );
-    });
-  project.addCommand(docs);
-  // `project env <verb>` — the per-project environment surface (credentials,
-  // URL, default). Own module; `deps` threaded so tests inject.
+  // `project env <verb>` — the per-project environment surface (URL, sign-in,
+  // backend credentials, default). Own module; `deps` threaded so tests inject.
   project.addCommand(createProjectEnvCommand(deps));
-  project.addCommand(createProjectSignInCommand(deps));
 
   return project;
-}
-
-interface DocsUploadFlagOpts {
-  project?: string;
-  role?: string;
-  name?: string;
-  idempotencyKey?: string;
 }
 
 interface ListFlagOpts {
@@ -1931,14 +723,6 @@ interface ListFlagOpts {
 interface CreateFlagOpts {
   type?: string;
   name?: string;
-  url?: string;
-  local?: string;
-  localHost?: string;
-  skipPreflight?: boolean;
-  description?: string;
-  username?: string;
-  password?: string;
-  passwordFile?: string;
   instruction?: string;
   testIdAttributes?: string;
   idempotencyKey?: string;
@@ -1946,13 +730,6 @@ interface CreateFlagOpts {
 
 interface UpdateFlagOpts {
   name?: string;
-  url?: string;
-  local?: string;
-  localHost?: string;
-  skipPreflight?: boolean;
-  username?: string;
-  password?: string;
-  passwordFile?: string;
   instruction?: string;
   testIdAttributes?: string;
   clearTestIdAttributes?: boolean;
@@ -1961,37 +738,6 @@ interface UpdateFlagOpts {
 
 interface DeleteFlagOpts {
   confirm?: boolean;
-  idempotencyKey?: string;
-}
-
-interface CredentialFlagOpts {
-  type: string;
-  credential?: string;
-  credentialFile?: string;
-  idempotencyKey?: string;
-}
-
-interface AutoAuthFlagOpts {
-  disable?: boolean;
-  method: string;
-  inject: string;
-  injectKey?: string;
-  loginUrl?: string;
-  loginMethod?: string;
-  loginContentType?: string;
-  loginBodyTemplate?: string;
-  username?: string;
-  password?: string;
-  passwordFile?: string;
-  tokenPath?: string;
-  tokenEndpoint?: string;
-  clientId?: string;
-  clientSecret?: string;
-  clientSecretFile?: string;
-  refreshToken?: string;
-  refreshTokenFile?: string;
-  scope?: string;
-  region?: string;
   idempotencyKey?: string;
 }
 
@@ -2069,11 +815,6 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
     render: project => project.orgName ?? project.orgId ?? '',
   },
   {
-    header: 'URL',
-    width: rows => Math.max(3, ...rows.map(project => terminalWidth(renderProjectUrl(project)))),
-    render: renderProjectUrl,
-  },
-  {
     header: 'CREATED',
     width: rows => Math.max(7, ...rows.map(project => terminalWidth(project.createdAt))),
     render: project => project.createdAt,
@@ -2091,25 +832,15 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
   },
 ];
 
-function renderProjectUrl(project: CliProject): string {
-  const url = project.targetUrl ?? '';
-  return project.originMode === 'local' ? `${url ? `${url} ` : ''}(Local)` : url;
-}
-
 /**
  * Default (no explicit `--columns`) column set. ORG is included only when
- * at least one row carries `orgId`; URL is included when a row is local.
- * Older responses retain the existing default table columns.
+ * at least one row carries `orgId`.
  */
 function defaultProjectListColumns(
   rows: readonly CliProject[],
 ): ReadonlyArray<TextTableColumn<CliProject>> {
   const hasOrgInfo = rows.some(project => project.orgId !== undefined);
-  const hasLocalProject = rows.some(project => project.originMode === 'local');
-  return PROJECT_LIST_COLUMNS.filter(
-    column =>
-      (column.header !== 'ORG' || hasOrgInfo) && (column.header !== 'URL' || hasLocalProject),
-  );
+  return PROJECT_LIST_COLUMNS.filter(column => column.header !== 'ORG' || hasOrgInfo);
 }
 
 /**
@@ -2124,7 +855,7 @@ export function renderProjectListText(
 ): string {
   if (page.items.length === 0) {
     return page.nextToken
-      ? `No projects on this page.\nnextToken: ${page.nextToken}`
+      ? `No projects on this page.\nnextToken: ${terminalSafeLine(page.nextToken)}`
       : 'No projects.';
   }
   // Explicit --columns: resolve against the FULL master set (so `org` can be
@@ -2138,50 +869,46 @@ export function renderProjectListText(
       noHeader: options.noHeader,
     }),
   ];
-  if (page.nextToken) lines.push('', `nextToken: ${page.nextToken}`);
+  if (page.nextToken) lines.push('', `nextToken: ${terminalSafeLine(page.nextToken)}`);
   return lines.join('\n');
 }
 
 function renderProjectText(p: CliProject): string {
   const lines = [
-    `id:          ${p.id}`,
-    `name:        ${p.name}`,
-    `type:        ${p.type}`,
-    `createdFrom: ${p.createdFrom}`,
-    `createdAt:   ${p.createdAt}`,
-    `updatedAt:   ${p.updatedAt}`,
+    `id:          ${terminalSafeLine(p.id)}`,
+    `name:        ${terminalSafeLine(p.name)}`,
+    `type:        ${terminalSafeLine(p.type)}`,
+    `createdFrom: ${terminalSafeLine(p.createdFrom)}`,
+    `createdAt:   ${terminalSafeLine(p.createdAt)}`,
+    `updatedAt:   ${terminalSafeLine(p.updatedAt)}`,
   ];
   if (p.orgId !== undefined) {
-    lines.push(`org:         ${p.orgName ?? '(name unknown)'} (${p.orgId})`);
+    lines.push(
+      `org:         ${terminalSafeLine(p.orgName ?? '(name unknown)')} (${terminalSafeLine(p.orgId)})`,
+    );
+  }
+  if (p.instruction !== undefined) {
+    lines.push(
+      p.instruction
+        ? `instruction:\n  ${terminalSafe(p.instruction).replaceAll('\n', '\n  ')}`
+        : 'instruction: (not set)',
+    );
   }
   if ('defaultEnvironment' in p) {
-    lines.push(`defaultEnv:  ${p.defaultEnvironment ?? '-'}`);
+    lines.push(`defaultEnv:  ${terminalSafeLine(p.defaultEnvironment ?? '-')}`);
   }
   if ('environmentCount' in p) {
     const count = p.environmentCount;
     lines.push(
-      `envs:        ${count}${count !== undefined && count > 0 ? ` (list with: testsprite project env list ${p.id})` : ''}`,
+      `envs:        ${count}${count !== undefined && count > 0 ? ` (list with: testsprite project env list ${terminalSafeLine(p.id)})` : ''}`,
     );
   }
-  // Presence, not truthiness — see the `targetUrl` docstring on `CliProject`.
-  // `'targetUrl' in p` distinguishes "the backend answered 'no URL'" (render the
-  // hint) from "this endpoint doesn't report it" (say nothing).
-  if ('targetUrl' in p) {
-    lines.push(
-      p.targetUrl
-        ? `targetUrl:   ${renderProjectUrl(p)}`
-        : `targetUrl:   (not set — set one with: testsprite project update ${p.id} --url <url>)`,
-    );
-  }
-  if (p.originMode === 'local' && !p.targetUrl) {
-    lines.push('originMode:  local (Local)');
-  }
-  // Presence-keyed like targetUrl: older backends don't report the field at all.
+  // Presence-keyed: older backends don't report the field at all.
   if ('testIdAttributes' in p) {
     lines.push(
       p.testIdAttributes && p.testIdAttributes.length > 0
-        ? `testIdAttrs: ${p.testIdAttributes.join(', ')}  (locator priority, highest first)`
-        : `testIdAttrs: (not set — engine default data-testid; set with: testsprite project update ${p.id} --test-id-attributes <list>)`,
+        ? `testIdAttrs: ${terminalSafeLine(p.testIdAttributes.join(', '))}  (locator priority, highest first)`
+        : `testIdAttrs: (not set — engine default data-testid; set with: testsprite project update ${terminalSafeLine(p.id)} --test-id-attributes <list>)`,
     );
   }
   return lines.join('\n');
@@ -2193,83 +920,32 @@ function renderProjectText(p: CliProject): string {
  * field is proven reliable) because the create response's id field name and
  * `updatedAt` presence are not guaranteed — see `CliCreateProjectResponse`.
  */
-function renderCreateProjectText(
-  p: CliCreateProjectResponse,
-  localTarget?: StoredLocalTarget,
-): string {
+function renderCreateProjectText(p: CliCreateProjectResponse): string {
   const lines = [
-    `id:          ${resolveCreatedProjectId(p) ?? '(unknown)'}`,
-    `name:        ${p.name}`,
-    `type:        ${p.type}`,
-    `createdFrom: ${p.createdFrom}`,
-    `createdAt:   ${p.createdAt}`,
+    `id:          ${terminalSafeLine(resolveCreatedProjectId(p) ?? '(unknown)')}`,
+    `name:        ${terminalSafeLine(p.name)}`,
+    `type:        ${terminalSafeLine(p.type)}`,
+    `createdFrom: ${terminalSafeLine(p.createdFrom)}`,
+    `createdAt:   ${terminalSafeLine(p.createdAt)}`,
   ];
-  if (p.updatedAt !== undefined) lines.push(`updatedAt:   ${p.updatedAt}`);
-  if (localTarget) {
-    const projectId = resolveCreatedProjectId(p) ?? '<project-id>';
-    const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
-    lines.push(
-      `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
-      'Next: write a plan and run it locally:',
-      // The only next step a --local project gets (it has no first-suite hint),
-      // so it names how to get a plan file. `--plan-from` takes the project from
-      // the file and ignores `--project`, hence "set projectId" and no flag.
-      '  testsprite test create --plan-template > plan.json',
-      `  In plan.json, set projectId to ${projectId} and edit the steps.`,
-      '  testsprite test create --plan-from plan.json',
-      '  testsprite test run <test-id>',
-      `Portal runs of this project stay blocked (free) until you set a public URL with: testsprite project update ${projectId} --url https://...`,
-    );
-  }
+  if (p.updatedAt !== undefined) lines.push(`updatedAt:   ${terminalSafeLine(p.updatedAt)}`);
   return lines.join('\n');
 }
 
-function renderUpdateText(r: CliUpdateProjectResponse, localTarget?: StoredLocalTarget): string {
+function renderUpdateText(r: CliUpdateProjectResponse): string {
   const lines = [
-    `id:            ${resolveUpdatedProjectId(r) ?? '(unknown)'}`,
-    `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
+    `id:            ${terminalSafeLine(resolveUpdatedProjectId(r) ?? '(unknown)')}`,
+    `updatedFields: ${terminalSafeLine(r.updatedFields?.join(', ') ?? '(none)')}`,
   ];
-  if (r.updatedAt !== undefined) lines.push(`updatedAt:     ${r.updatedAt}`);
-  if (r.environment !== undefined) {
-    lines.push(`environment: ${r.environment.name} (default)`);
-    const labels: Record<string, string> = {
-      'environment.url': 'Environment URL updated',
-      'environment.credentials': 'Environment credentials updated',
-      'project.name': 'Project name updated',
-      'project.instruction': 'Project instruction updated',
-      'project.testIdAttributes': 'Project test ID attributes updated',
-    };
-    for (const effect of r.effects ?? []) {
-      if (labels[effect]) lines.push(`effect:      ${labels[effect]}`);
-    }
-  }
-  if (localTarget) {
-    const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
-    lines.push(
-      `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
-      'Run its tests with: testsprite test run <test-id> (the CLI opens a tunnel automatically).',
-    );
-  }
+  if (r.updatedAt !== undefined) lines.push(`updatedAt:     ${terminalSafeLine(r.updatedAt)}`);
   return lines.join('\n');
 }
 
 function renderDeleteText(r: CliDeleteProjectResponse): string {
-  return [`projectId ${r.projectId}`, `deletedAt ${r.deletedAt}`].join('\n');
-}
-
-/**
- * `--project` resolution for `project docs upload` — mirrors test.ts's
- * resolveProjectId/requireProjectId so `TESTSPRITE_PROJECT_ID` works here the
- * same as on every other command. Flag wins over env.
- */
-function requireDocsProjectId(projectId: string | undefined, deps: ProjectDeps): string {
-  const explicit = projectId?.trim();
-  if (explicit && explicit.length > 0) return explicit;
-  const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID?.trim();
-  if (envValue && envValue.length > 0) return envValue;
-  throw localValidationError(
-    '--project <id> is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
-  );
+  return [
+    `projectId ${terminalSafeLine(r.projectId)}`,
+    `deletedAt ${terminalSafeLine(r.deletedAt)}`,
+  ].join('\n');
 }
 
 /**

@@ -1,21 +1,18 @@
 # `testsprite` CLI — Documentation
 
-The full reference for the TestSprite CLI: install verification, manual setup, every command with examples, configuration, scripting, and exit codes.
-
-> Looking for the quick tour? Start with the [README](./README.md).
-> This reference will progressively move to [docs.testsprite.com](https://docs.testsprite.com/cli/getting-started/overview); this file is the source of truth until then.
+This guide covers TestSprite CLI 0.17. Start with the [quickstart](./README.md#quickstart) to run your first test. For commands supported by an older install, check `testsprite --version` and use the [0.16 reference](https://github.com/TestSprite/testsprite-cli/blob/v0.16.0/DOCUMENTATION.md).
 
 ## Contents
 
 - [Install & verify](#install--verify)
+- [Upgrading from 0.16](#upgrading-from-016)
 - [Manual setup](#manual-setup)
 - [The complete agent loop](#the-complete-agent-loop)
 - [Agent onboarding (`agent install`)](#agent-onboarding-agent-install)
-- [Plan file format](#plan-file-format)
 - [Command reference](#command-reference)
   - [Read commands](#read-commands)
   - [Write commands](#write-commands)
-  - [Generate commands](#generate-commands)
+  - [Tests: the project's agent](#tests-the-projects-agent)
   - [Run commands](#run-commands)
   - [Local frontend testing and tunnels](#local-frontend-testing-and-tunnels)
   - [Test lists (`testlist`)](#test-lists-testlist)
@@ -53,7 +50,23 @@ testsprite --version
 testsprite project list --dry-run --output json
 ```
 
-`--dry-run` is a global flag that emits a canned sample matching the API contract without writes or charges. Credentialless previews and explicit targets remain offline. With configured credentials, `test run` may make bounded read-only metadata requests to show an automatic tunnel decision; it never mints a tunnel or dispatches runs. It's the right way to confirm an install or learn the surface before configuring auth — the response _shapes_ match the wire contract, but the data is fake.
+`--dry-run` is a global flag that emits a canned sample matching the API contract without changing your workspace or using credits. A project or multi-test run with `--wait --report junit --report-file <path>` writes a sample JUnit file locally even in dry-run mode. Credentialless previews and explicit targets remain offline. With configured credentials, `run` may make bounded read-only metadata requests to show an automatic tunnel decision; it never mints a tunnel or dispatches runs. It's the right way to confirm an install or learn the surface before configuring auth — the response _shapes_ match the wire contract, but the data is fake.
+
+## Upgrading from 0.16
+
+After upgrading, run `testsprite agent status` in your repository. For each target marked `stale`, refresh its instructions with `testsprite agent install <target> --force`. Update any shell scripts and CI jobs that call the old commands. An old command exits 5, and its error names what to use instead.
+
+| In a 0.16 workflow                                                                                              | In 0.17                                                                                                                                  |
+| --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Define, edit or delete a test with `test create`, `test update` or `test delete`                                | Describe the change with `plan`, review the proposal, then `apply`. Attach a spec with `--file` or code changes with `--diff`.           |
+| Set the app URL on `project create`                                                                             | Create the project, then add a named target with `project env create <id> --name staging --url <url>`.                                   |
+| `test run --all --project P`, `test run T`, `test rerun T`                                                      | `run --project P --wait` for a suite or `run T --wait` for a saved test.                                                                 |
+| `testlist run L --case T`                                                                                       | `run T --testlist L --wait`. Omit the positional test IDs to run the whole list.                                                         |
+| `test run T --no-auto-heal` for a strict replay                                                                 | Drop the flag. The server decides for each run whether to heal drifted generated code; code a person wrote always runs as written.       |
+| `test wait` or `test cancel`                                                                                    | Pass an **execution** ID from `runs[].runId` to `run wait` or `run cancel`. Cancellation covers the whole execution.                     |
+| Read history, steps or failure artifacts through `test result`, `test steps`, `test failure` or `test artifact` | Find a **result** ID with `result list --run R` or `result list --test T`, then `result get ID`. Add `--out <dir>` to download evidence. |
+
+In launch and wait JSON, `runs[]` contains executions and the top-level `results[]` contains individual test outcomes. A non-waiting launch can return a run ID before any results exist. A saved 0.16 per-test run ID identifies an individual result in this release. See [Output & scripting](#output--scripting) for a working shell example.
 
 ## Manual setup
 
@@ -61,14 +74,14 @@ The recommended path is `testsprite setup` (see the [README quickstart](./README
 
 ### 1. Authenticate
 
-The CLI uses API keys. Create one from your [TestSprite dashboard](https://www.testsprite.com/dashboard/settings/apikey), then configure it:
+The CLI uses API keys. Create one from your [TestSprite dashboard](https://www.testsprite.com/dashboard-v3/settings/apikey), then configure it:
 
 ```bash
 # Interactive — prompts for your API key (input is masked); endpoint defaults to prod
 testsprite setup --no-agent
 
-# Non-interactive — reads TESTSPRITE_API_KEY from the environment (CI / scripts)
-TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --no-agent
+# Non-interactive: supply TESTSPRITE_API_KEY through your CI secret or shell environment.
+testsprite setup --from-env --no-agent
 
 # Verify
 testsprite auth status
@@ -82,58 +95,48 @@ For an org-scoped API key, `auth status` additionally prints an `orgs:` line (ev
 
 ### 2. Create a project
 
+For a new frontend project, set `PROJECT_ID` to the ID printed by the first command. Replace the staging URL with your app's URL. If you already have a project and an environment, find them with `project list` and `project env list "$PROJECT_ID"`.
+
 ```bash
-# Prints the project id used in every command below
-testsprite project create --type frontend --name "My App" --url https://your-app.com
+testsprite project create --type frontend --name "Checkout"
+PROJECT_ID=your-project-id
+testsprite project env create "$PROJECT_ID" --name staging --url https://staging.example.com
 ```
 
 ### 3. Get your first tests
 
-Two ways in. Let TestSprite propose a first set (it explores your app, or reads an API spec you upload first; generating the proposals uses credits, and nothing runs until you accept them and start a run) — or describe one test yourself.
+Ask the project's agent to propose tests and show you the steps. A backend project can attach an API specification with `--file ./openapi.yaml`. For a frontend available only on your machine, attach a spec or a Git diff, then run the saved tests through a [local tunnel](#local-frontend-testing-and-tunnels).
 
 ```bash
-# Option A — propose, review, accept, run
-testsprite test plan generate --project <projectId>
-testsprite test plan accept --project <projectId>
-testsprite test run --all --project <projectId> --wait
-
-# Option B — write one plan yourself, then trigger it and wait for a verdict in one call
-testsprite test create --plan-template > ./checkout.plan.json   # set projectId to <projectId>, edit the steps
-testsprite test create \
-  --plan-from ./checkout.plan.json \
-  --run --wait --timeout 600 --output json
+testsprite plan "Verify that a guest can complete checkout" --project "$PROJECT_ID" --steps
 ```
 
-Exit `0` means the run passed; exit `1` means it failed. When it fails, pull the bundle (next section). Everything Option A can tell you — credits per stage, what a backend project needs uploaded first, Ctrl-C behavior, every precondition error — is in [Generate commands](#generate-commands). An app running only on this machine (`project create --local <port>`) takes Option B: generation cannot reach it, and you run the test with `test run <test-id>`, which opens the tunnel to the project's saved local environment (`--local <port>` also works).
+Answer a question in a text message with `testsprite reply "your answer"`. For a question card, use the **Open in the portal** link to submit your answers. Review a proposed plan and use `reject "what to change"` to request a revision. Applying a test plan saves the cases. Applying a run proposal starts an execution.
+
+```bash
+testsprite apply --output json
+```
 
 ## The complete agent loop
 
-This is the loop a coding agent runs on its own once you've onboarded it with `testsprite agent install`:
+A coding agent can now select one of the saved test IDs from `applied.tests`, or run the whole suite. For a project that already has tests, start here.
 
 ```bash
-# (one-time, per project) teach your agent the CLI
-testsprite setup
-
-# 1 — describe the behavior you want to guarantee, run it, wait
-# Set projectId in checkout-flow.plan.json to your project ID.
-testsprite test create --plan-from ./checkout-flow.plan.json \
-  --run --wait --output json
-#   → exits 1: the run failed
-
-# 2 — pull ONE self-consistent failure bundle to ./.testsprite/failure/
-#     (code + failing step + screenshots + DOM + root-cause + recommended fix)
-testsprite test failure get test_3a9f21c7 --out ./.testsprite/failure
-
-# 3 — the agent reads the bundle, edits the code, redeploys, then runs again
-testsprite test run test_3a9f21c7 --wait --output json
-#   → exits 0: passed. The test now lives in your durable suite.
+testsprite test list --project "$PROJECT_ID"
+testsprite run --project "$PROJECT_ID" --wait --output json
 ```
 
-Every artifact in the bundle shares one `snapshotId`; the CLI will not mix a failing step from one run with source code from another. Run any command with `--dry-run` first to learn its on-disk shape with zero setup.
+For a failed or blocked case, set `RESULT_ID` to its `results[].resultId` and `TEST_ID` to its `testId`. Read the error, failed step and available evidence. After fixing and redeploying the app, launch the same test again. If the test itself needs to change, start a new plan and describe the correction.
+
+```bash
+testsprite result get "$RESULT_ID"
+testsprite result get "$RESULT_ID" --out ".testsprite/results/$RESULT_ID" --failed-only
+testsprite run "$TEST_ID" --wait
+```
 
 ## Agent onboarding (`agent install`)
 
-`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and the failure-bundle layout — no prompt engineering required. It's a pure-local command: no network, no credentials.
+`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and how to read a result — no prompt engineering required. It's a pure-local command: no network, no credentials.
 
 ```bash
 testsprite agent install claude     # install the skill for Claude Code
@@ -162,55 +165,11 @@ The `codex` target uses **managed-section mode** — it writes only a sentinel-d
 
 Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf, copilot) backs up the existing file to `<path>.bak` first.
 
-## Plan file format
-
-A **plan file** is the JSON document `test create --plan-from <file>` ingests to author one **frontend** test (bulk-create takes the same shape, one spec per line/file — see [`test create-batch`](#testsprite-test-create-batch)). It holds exactly **ONE** test as a single JSON object — a top-level array is rejected (use `create-batch` for many).
-
-```json
-{
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.4.0/schemas/plan.schema.json",
-  "projectId": "prj_abc123",
-  "type": "frontend",
-  "name": "Login rejects an empty password",
-  "planSteps": [
-    {
-      "type": "action",
-      "description": "Navigate to /login and submit the form with an empty password"
-    },
-    {
-      "type": "assertion",
-      "description": "Verify an inline error says the password is required"
-    }
-  ]
-}
-```
-
-Get this exact skeleton without hand-copying it from this file: `testsprite test create --plan-template` (pure-local, prints to stdout — see [`test create`](#testsprite-test-create)). The same example is embedded in `test create --help`. **The `$schema` value above is pinned to the CLI version that generated this page (`v0.4.0`)** — `--plan-template`'s live output always pins to your actually-installed version instead, so on a later release the two will differ; run the command yourself rather than trusting this snippet's `$schema` value verbatim.
-
-| Field         | Required | Type                                                                      | Notes                                                                                                                                                                                                                            |
-| ------------- | -------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `projectId`   | yes      | string                                                                    | Returned by `testsprite project list`. Non-empty, not whitespace-only.                                                                                                                                                           |
-| `type`        | yes      | `"frontend"`                                                              | `--plan-from` only accepts `frontend` — a `backend`-typed plan is rejected pre-flight with a `nextAction` pointing at `test create --type backend --code-file <path>` (backend tests are authored from a code file, not a plan). |
-| `name`        | yes      | string                                                                    | An assertable behavior statement (subject + verb + outcome), not a noun fragment.                                                                                                                                                |
-| `description` | no       | string                                                                    | One-sentence elaboration of `name` — the condition plus the expected outcome.                                                                                                                                                    |
-| `priority`    | no       | `"p0"` \| `"p1"` \| `"p2"` \| `"p3"` \| `"high"` \| `"medium"` \| `"low"` | p0 = must-pass, p1 = important paths, p2 = edge cases, p3 = cosmetic. `high`/`medium`/`low` (any case) are stored as p0/p1/p2, like the Portal's High/Medium/Low; `p3` is treated as low.                                        |
-| `planSteps`   | yes      | `Array<{ type: "action" \| "assertion", description: string }>`           | **1–200 steps**, describing user intent in plain language, not selectors.                                                                                                                                                        |
-
-**Size cap:** the whole file must be **≤ 256 KB** (`test create-batch` caps the aggregate batch at 5 MB / 50 specs). Both caps are enforced client-side before any network call.
-
-**`{{...}}`-style placeholders are NOT substituted.** The CLI does no variable substitution — a step like `"description": "log in as {{LOGIN_USER}}"` is structurally valid (it validates and creates fine) but the browser agent types the literal braces into the field. `test create --plan-from` prints a non-fatal `[advisory]` when it detects one; store login credentials on the project instead: `testsprite project update <project-id> --username <user> --password <pw>`, or Portal → Project Settings.
-
-**`$schema` for live editor validation:** the optional `"$schema"` key above (an ordinary extra property — the CLI does not restrict a plan file to a fixed property set, so a non-string value there is exactly as valid as a string one) points VS Code's JSON language service — and by extension Copilot's inline completions — at [`schemas/plan.schema.json`](./schemas/plan.schema.json), shipped in both this repo and the npm package. Point it at a local copy instead (`node_modules/@testsprite/testsprite-cli/schemas/plan.schema.json`) if you'd rather not depend on the network URL resolving in your editor. This value is **version-pinned** (`v<CLI version>`, not `main`) — a plan authored against one CLI version keeps resolving the SAME schema later, even after `main` gains new required fields.
-
-**Machine-readable ground truth**, for tooling that wants to fetch the contract instead of parsing this page: [`schemas/plan.schema.json`](./schemas/plan.schema.json) — this schema is the ground truth for the `--plan-from` **command** end-to-end (e.g. it restricts `type` to `"frontend"` only, matching what actually succeeds, not `assertPlanShape`'s looser raw structural check in isolation); if the schema and the validator ever disagree, the validator's real acceptance behavior is authoritative and the schema is out of date. The schema file's own internal `$id` intentionally stays pinned to the canonical `main` URL — `$id` is the schema's IDENTITY (what it calls itself for cross-referencing), not a fetch instruction, so it does not need version-pinning the way the `$schema` fetch hint above does.
-
-**Multiple tests?** Draft a `plans.jsonl` (one plan object per line) or a directory of `*.json` plan files, then `test create-batch --plans <file.jsonl>` / `--plan-from-dir <dir>`. Max 50 specs / 5 MB per batch.
-
-**Zero-cost iteration loop:** `test create --plan-from <file> --dry-run` runs the exact same local validation as a real create — no network call, no auth, no credits spent — so an agent (or you) can iterate on a plan file until it validates before ever hitting the API. `test lint` runs the same validators across a whole batch, collecting every problem instead of stopping at the first.
-
 ## Command reference
 
-Every command supports the [global flags](#global-flags), and every example below pairs a real call with a `--dry-run` companion that works on a fresh install with no auth.
+Add `--help` to a command for its options, or `--dry-run` to preview it. See [global flags](#global-flags).
+
+Set the shell variables used in the examples to IDs from your workspace. Get `PROJECT_ID` from `testsprite project list` and `TEST_ID` from `testsprite test list --project "$PROJECT_ID"`. After a launch, use `runs[].runId` for `RUN_ID` and `results[].resultId` for `RESULT_ID`. For examples with two IDs, choose two distinct tests or executions.
 
 ### Read commands
 
@@ -235,679 +194,439 @@ The text table includes `DEFAULT ENV` and `ENVS` (select with `--columns default
 
 #### `testsprite project get <project-id>`
 
-Get a single project by id. Project ids look like `proj_xxxxxxxx` and come from `project list`.
+Get a single project by id. Copy the project ID from `project list` or the response to `project create`.
 
 ```bash
-testsprite project get proj_xxxxxxxx --output json
-testsprite project get proj_xxxxxxxx --dry-run --output json
+testsprite project get "$PROJECT_ID" --output json
+testsprite project get "$PROJECT_ID" --dry-run --output json
 ```
 
-When the server supplies an environment summary, text detail shows `defaultEnv:  <name>` and `envs:        <count>`, with a `testsprite project env list <project-id>` hint for a positive count. A reported null default shows `-`; older servers and V2 projects omit both lines. JSON preserves the server's fields without adding missing values.
+Read the current project instructions here before replacing them with `project update --instruction`. Text output shows the saved lines. In JSON, `instruction` holds the complete stored string or `null` when unset. Older servers omit the field.
+
+When the server supplies an environment summary, text detail shows `defaultEnv:  <name>` and `envs:        <count>`, with a `testsprite project env list <project-id>` hint for a positive count. A reported null default shows `-`; older servers omit both lines. JSON preserves the server's fields without adding missing values.
 
 #### `testsprite test list --project <id>`
 
-List tests under a project. `--project` is required. Cursor-paginated. Use `--env <name>` to show each frontend test's status in that environment; a test without a result there shows `ready`. Text output has an `ENV` column for the environment that supplied each row's status (`-` when absent). JSON retains `status` and passes through `statusByEnvironment` and `headlineEnvironment` when the backend provides them.
+List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
 
 ```bash
-testsprite test list --project proj_xxxxxxxx --output json
-testsprite test list --project proj_xxxxxxxx --type frontend --created-from portal
-testsprite test list --project proj_xxxxxxxx --env staging
-testsprite test list --project proj_xxxxxxxx --dry-run --output json
+testsprite test list --project "$PROJECT_ID" --output json
+testsprite test list --project "$PROJECT_ID" --type frontend
+testsprite test list --project "$PROJECT_ID" --dry-run --output json
 ```
 
 Common flags:
 
 - `--type <frontend|backend>` — filter by test type.
-- `--created-from <portal|mcp>` — filter by where the test was authored.
-- `--status <list>` — filter by the status of each test case's latest result (`passed|failed|blocked|cancelled|not_run`; `not_run` = never ran).
-- `--env <name>` — select the environment used for frontend status (name is case-sensitive).
 - `--page-size`, `--starting-token`, `--max-items` — pagination, same shape as `project list`.
+- `--columns <list>`, `--no-header` — text table layout.
 
 #### `testsprite test get <test-id>`
 
-Get a single test by id. Test ids look like `test_xxxxxxxx` and come from `test list`. For frontend tests, text output shows the headline environment when a result identifies one. Backend tests echo their dependency declarations — `produces` / `consumes` / `category` — when present. When a per-test timeout is set, text output includes `Step timeout: <N> ms (applies to every step)`; the line is omitted when the value is absent or cleared.
+Get one test case by id, with its steps. Test ids come from `test list` (and from `apply`). Text output lists the case's fields, then each step; backend cases echo their dependency declarations — `produces` / `consumes` — when present. When a per-test timeout is set, text output includes `stepTimeout: <N> ms (applies to every step)`. Nothing here is a result: `testsprite result list --test <test-id> --limit 1` lists the latest one, and `testsprite result get <result-id>` reads it.
 
 ```bash
-testsprite test get test_xxxxxxxx --output json
-testsprite test get test_xxxxxxxx --dry-run --output json
+testsprite test get "$TEST_ID" --output json
+testsprite test get "$TEST_ID" --dry-run --output json
 ```
 
-#### `testsprite test code get <test-id>`
+Generated test code is inspected in the Portal. The CLI has no stored-code reader.
 
-Print the generated test source. TestSprite test code is **Python**: frontend tests are Playwright (`playwright.async_api`, async), backend tests use `requests` with `pytest`-style assertions. With `--out <path>`, write it to a file instead of stdout (text mode writes the source body; JSON mode writes the wire envelope).
+#### `testsprite result list (--run <run-id> | --test <test-id>)`
+
+A run is one launch of tests; each test in it has a result. `run` prints the run as `runId` and each test's result as `resultId`. `--run` lists one run's results, newest first, results created at the same moment in a fixed order; `--test` lists one test's results across runs, newest first.
 
 ```bash
-testsprite test code get test_xxxxxxxx
-testsprite test code get test_xxxxxxxx --out ./test_xxxxxxxx.py
-testsprite test code get test_xxxxxxxx --dry-run --output json
+testsprite result list --run "$RUN_ID" --status failed,blocked
+testsprite result list --test "$TEST_ID" --limit 5 --output json
+testsprite result list --test "$TEST_ID" --env staging --dry-run
 ```
 
-#### `testsprite test steps <test-id>`
+| Flag              | With     | Meaning                                                                                                                                     |
+| ----------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--status <list>` | either   | `passed`, `failed`, `running`, `blocked`, `cancelled`; comma-separated or repeated, any case. Cancelled results are listed only when named. |
+| `--env <name>`    | `--test` | only results from this project environment; an unknown name is exit 5 and lists the valid names                                             |
+| `--limit <n>`     | `--test` | how many results, 1–100 (default 20)                                                                                                        |
 
-List the **latest run's steps** for a test (with screenshot / DOM-snapshot pointers). Use `--run-id <run-id>` for a specific run; that run must belong to the named test (otherwise exit 4). An empty latest run does not fall back to old steps: inspect `test result <test-id> --history` and choose an earlier run explicitly. Bare reads auto-paginate; older backends may still return cumulative steps, so always pin `--run-id` when comparing runs. The run-scoped response retains `{ items, nextToken: null }`.
+Exactly one of `--run` / `--test` is required, and `--env` or `--limit` with `--run` is exit 5. Text prints one line per result (`CREATED  STATUS  RESULT ID  RUN ID  ENV  TITLE`), or `No results.`; with `--test`, a stderr note says how many older results your plan's history window hides. The `--run` response includes a `run` object with the execution status. Both queries return `results[]` with `resultId`, `runId`, `caseKey`, `title`, `testStatus` and timestamps. A test history can also include `hiddenRunCount` and `retentionDays`; `testStatus` is upper case. `title` is the title the test had when that result ran. Exit `0` whatever the verdicts; `4` when the run or test is not found. A test's newest result: `result list --test <test-id> --limit 1`, then `result get <result-id>`.
+
+The text output of `result list` and `result get` shows `QUEUED` while a result is waiting for dispatch. On the wire this is `testStatus: "RUNNING"` with `processStatus: "Idle"`, so `--status running` includes queued results.
+
+#### `testsprite result get <result-id>`
+
+One result: the verdict, the error, its cause and fix, the failed step with its screenshot, the step count and the video; a result blocked at sign-in also shows the sign-in run (`signIn`). A backend test also shows its Python traceback (`trace`: the last 20 lines, at most their last 2,000 characters) and its captured output (`apiOutput`: the first 20 lines, at most their first 2,000 characters); when one is cut, a line says what was left out, above the traceback (`(N earlier lines and M characters: …)`) and below the output (`(N more lines: …)`). Both are `null` for a frontend test. A scheduled or test-list backend run has no `trace`: its traceback is in `error`, which is printed in full. `--output json` adds every step, and both in full. Exit `0` whatever the verdict; `4` when the result is not found.
 
 ```bash
-testsprite test steps test_xxxxxxxx --output json
-testsprite test steps test_xxxxxxxx --run-id run_01hx3z9p8q4k2y7a --output json
-testsprite test steps test_xxxxxxxx --dry-run --output json
+testsprite result get "$RESULT_ID"
+testsprite result get "$RESULT_ID" --output json
+testsprite result get "$RESULT_ID" --out ".testsprite/results/$RESULT_ID"
+testsprite result get "$RESULT_ID" --out ".testsprite/results/$RESULT_ID" --failed-only
+testsprite result get "$RESULT_ID" --dry-run --out ".testsprite/results/$RESULT_ID"
 ```
 
-Common flags: `--page-size`, `--starting-token`, `--max-items` — same shape as the other lists.
+With `--out <dir>` it downloads instead of printing, and stdout lists what it wrote (JSON `{ dir, written, failed }`):
 
-#### `testsprite test result <test-id>`
+| In `<dir>`                                         | What                                                                                        |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `result.json`                                      | the result, each signed link replaced by the file it was written to (`null` if not written) |
+| `video.<mp4\|webm\|mov\|mkv\|avi>`                 | the run's video                                                                             |
+| `steps/001.png`, `steps/001.html`, …               | each step's screenshot and page, by position                                                |
+| `sign-in/video.<ext>`, `sign-in/steps/001.html`, … | a result blocked at sign-in: the sign-in run's video and steps                              |
 
-Get the latest result for a test — `status`, `verdict`, `executionStatus`, started / finished timestamps, video and failure-analysis URLs, a `summary` string, and correlation fields (`snapshotId`, `runIdIfAvailable`, `codeVersion`). With `--include-analysis`, the response also carries an inline `analysis` block (root-cause hypothesis, recommended fix target, failure kind). Backend tests additionally surface the run's captured stdout (`apiOutput`) and Python traceback (`trace`): full content under `--output json` (and in `result.json` / `failure.json` inside failure bundles); text mode prints a bounded 20-line tail of each with a byte count.
-
-With `--history`, each row also carries the environment the run used: an **ENV** column shows the environment name, or `—` for rows that predate environments. A run-time `--target-url` can reuse an existing same-origin environment or use a temporary one; `--env` can supply settings while the browser visits the override URL. The `targetUrl:` detail line reports the run's target. `--env <name>` filters the history to runs on that environment (server-side; only with `--history`). The latest-result view prints an `environment:` line for the same reason. JSON consumers get `environment: { id, name } | null` on every run/result payload and `targetUrl`; `targetUrlSource` is `null` on a V3 row.
-
-```bash
-testsprite test result test_xxxxxxxx --output json
-testsprite test result test_xxxxxxxx --include-analysis --output json
-testsprite test result test_xxxxxxxx --dry-run --output json
-```
-
-With `--history`, the command lists a test's **prior runs** instead of the latest result — `{ runs: [...], nextCursor }`, where each run carries `runId`, `status`, `source` (`cli | portal | mcp | schedule | github_action`), `isRerun`, `createdFrom`, timestamps, `codeVersion`, and `failureKind`. Filter with `--source <src>` and `--since <24h|7d|ISO>`; paginate with `--page-size` (1–100, default 20) and `--cursor`. For one run's detail use `test wait <run-id>`; for its failure bundle use `test artifact get <run-id>`.
-
-`--history --env <name>` naming an environment that does not exist (or was soft-deleted) is a `VALIDATION_ERROR` (exit 5) that names the requested value and the project's current environment names — it never silently falls back to unfiltered history. A name that DOES exist but has no matching runs is an ordinary empty result (exit 0), same as `--history` with no filter finding nothing. `--env` is a V3-only filter: on a V2 (legacy) project the server returns `UNSUPPORTED` (exit 7) before reading any history, with a `nextAction` pointing at migrating the project — the same shape `test list --env` uses.
-
-```bash
-testsprite test result test_xxxxxxxx --history --output json
-testsprite test result test_xxxxxxxx --history --source cli --since 7d --output json
-testsprite test result test_xxxxxxxx --history --dry-run --output json
-```
-
-#### `testsprite test diff <run-a> <run-b>`
-
-Compare two runs of a test and print what regressed: verdict, `failureKind`, `failedStepIndex`, per-step status flips, and `codeVersion` drift. Exit `0` when the verdicts match, `1` when they differ — so a script can assert "this rerun behaves like the last known-good run" in one call.
-
-```bash
-testsprite test diff run_aaaa run_bbbb --output json
-testsprite test diff run_aaaa run_bbbb --dry-run --output json
-```
-
-#### `testsprite test failure get <test-id>`
-
-The latest-failure agent entry point. Returns one consistent snapshot of the latest failing run as a self-contained bundle: the result, the failed step plus its immediate neighbors with screenshots and DOM snapshots, the test source, a video pointer, a root-cause hypothesis, a recommended fix target, and correlation metadata. For the bundle of a _specific_ run an agent just triggered, prefer `test artifact get <run-id>` — it is keyed by `runId` and cannot be raced by another run that lands afterward.
-
-```bash
-# Print the wire envelope to stdout (good for piping into jq or an LLM)
-testsprite test failure get test_xxxxxxxx --output json
-
-# Write the bundle as a directory under --out (atomic; .partial marker on crash)
-testsprite test failure get test_xxxxxxxx --out ./.testsprite/failure/test_xxxxxxxx
-
-# Keep only the failed step plus its immediate neighbors (±1)
-testsprite test failure get test_xxxxxxxx --out ./fail --failed-only
-
-# Dry-run prints the canned wire envelope; with --out it prints what would be
-# written (no directory is created)
-testsprite test failure get test_xxxxxxxx --dry-run --output json
-testsprite test failure get test_xxxxxxxx --dry-run --out ./fail
-```
-
-Every artifact in the bundle shares one `snapshotId`; the CLI refuses to stitch data from different runs or code versions. Run `--dry-run` once to learn the on-disk shape, then run it for real.
-
-#### `testsprite test failure summary <test-id>`
-
-One-screen agent-friendly triage card (status, failure kind, root-cause hypothesis, recommended fix target) without downloading video, screenshots, or DOM snapshots. Sibling of `test failure get` — useful when an agent only needs to decide _what kind_ of failure it is looking at.
-
-```bash
-testsprite test failure summary test_xxxxxxxx --output json
-testsprite test failure summary test_xxxxxxxx --dry-run --output json
-```
-
-#### `testsprite test open <test-id>`
-
-Print the test's dashboard URL and open it in your browser; `--no-browser` only prints it. For a non-production endpoint with no built-in mapping, set `TESTSPRITE_PORTAL_URL` to your Portal origin.
-
-```bash
-testsprite test open test_xxxxxxxx --no-browser
-```
+- Raw HTML snapshots can contain credentials in form values. Exporting under `.testsprite/` creates its default `.gitignore` before the download. Existing ignore rules are preserved. For a custom export path, check which files Git can stage.
+- **Use one directory per result**, such as `.testsprite/results/<result-id>`. In an existing `<dir>`, `result.json`, `video.<mp4|webm|mov|mkv|avi>`, `steps/` and `sign-in/` are **deleted and replaced** once the download ends; every other file is kept. Never pass `--out .` or a shared folder. `<dir>` is created if missing, and a symlinked `<dir>` is followed, so do not point it at a path a checkout could plant.
+- `--failed-only` keeps the failed steps and one step on each side (every step when none failed); the videos are always downloaded. Without `--out` it is exit 5.
+- The files are staged in `<dir>/.testsprite-partial-<random>/` and moved in at the end, so Ctrl-C keeps the earlier download. A process killed outright (SIGKILL) can leave that directory behind; delete it.
+- Up to four files download at once, each tried three times. A file that still fails is listed under `failed`, the rest and `result.json` are written, and the command exits `10`; run it again, since each read signs new links. When `<dir>` already holds a download of the same result, a file that fails keeps its earlier copy (`kept: true`, and `result.json` names it).
+- A `<dir>` holding a name the filesystem takes for one this command writes (`RESULT.JSON`, `Steps/` on a case-insensitive disk) is refused (exit 5) with nothing changed. If the new files cannot be moved in and the earlier ones cannot all be put back, the command exits `1` and names the `.earlier` folder that holds them.
+- `--dry-run` lists what it would write and writes nothing.
 
 ### Write commands
 
-Require the `write:tests` scope (project commands require `write:projects`), except `test scaffold`, `test lint`, and `test create --plan-template`, which are pure-local authoring helpers — no network, no credentials, no scope.
-
-#### `testsprite test scaffold`
-
-Emit a schema-correct starter test definition — a frontend plan JSON by default, or a backend Python skeleton with `--type backend`. Pure-local: no network, no credentials. Edit the scaffold, then create the test with `--plan-from` / `--code-file`.
-
-```bash
-testsprite test scaffold > first-test.plan.json
-testsprite test scaffold --type backend --out health.py
-testsprite test scaffold --out plan.json --force     # overwrite an existing file
-```
-
-`--out` does not create parent directories (exit `5` if missing).
-
-#### `testsprite test lint`
-
-Validate plan/steps files offline with the same validators `test create` runs, collecting **every** problem instead of stopping at the first. No network, no credentials. Exit `0` when all inputs are valid, `5` otherwise.
-
-```bash
-testsprite test lint --plan-from ./checkout.plan.json
-testsprite test lint --plan-from-dir ./plans/          # every *.json checked, all errors reported
-testsprite test lint --plans ./plans.jsonl             # one plan spec per line
-testsprite test lint --steps ./refined.plan.json       # the shape `test plan put` ingests
-```
-
-#### `testsprite test create`
-
-Create a new test. Backend tests use `--code-file` (agents supply backend code directly); frontend tests use either `--code-file` or `--plan-from` (see [Plan file format](#plan-file-format)). With `--run --wait`, the CLI chains create → trigger → poll in a single invocation. `--wait` and `--timeout` act on that run, so without `--run` they are refused (exit 5), like `--env`. `--step-timeout <ms>` sets a per-test step timeout from 1 to 60000 milliseconds on the code-file path. Backend tests can declare wave-ordering dependencies at create time — `--produces <var>` / `--needs <var>` (repeatable) and `--category <setup|main|teardown>` — and amend them later via `test update`.
-
-`--plan-template` prints the canonical minimal plan-file skeleton to stdout and exits — pure-local, no network/credentials, ignores every other flag. The exact same example is embedded in `test create --help`.
-
-```bash
-# Backend test from a code file
-testsprite test create --project proj_xxxxxxxx --type backend --name "Login API" \
-  --code-file ./login.py
-
-# Frontend test from a code file with a per-test step timeout
-testsprite test create --project proj_xxxxxxxx --type frontend --name "Checkout" \
-  --code-file ./checkout.py --step-timeout 45000
-
-# Frontend test from an agent-supplied plan-steps document; trigger + wait inline
-testsprite test create --plan-from ./checkout.plan.json \
-  --run --wait --timeout 600 --output json
-
-# Print the plan-file skeleton, edit it, then create from it
-testsprite test create --plan-template > plan.json
-
-# Dry-run prints the canned wire envelope
-testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
-```
-
-`--plan-from` owns the complete test definition and does not support this setting; a supplied `--step-timeout` is warned about and ignored. Set it later with `test update --step-timeout <ms>`.
-
-#### `testsprite test create-batch`
-
-Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan files with `--plan-from-dir`). Optional `--run --max-concurrency <N>` fans out triggers. `--max-concurrency`, `--wait` and `--timeout` act on those runs, so without `--run` they are refused (exit 5), like `--env`. Without `--wait`, each run is dispatched (`status: "queued"`) and the command exits 0 when every trigger is accepted — mirroring single `test run` without `--wait`; a trigger error still exits non-zero. With `--wait`, it polls every run to terminal and exits non-zero if any run does not pass.
-
-With `--run`, each trigger's idempotency key is derived from the batch key (`<key>:run:<testId>`), so retrying the command with the same `--idempotency-key` — or the auto-minted one printed to stderr under `--output json`, `--verbose` or `--debug` — returns the runs the first attempt already started instead of starting new, billed ones. An all-public several-id `test run` is one batch request that uses the key as is; a tunnel-pool run (several ids or `--all` through `--local` or a tunneled environment) triggers each test separately with `<key>:<testId>`. A trigger routed through the tunnel also carries the tunnel's client id before the test id (`<key>:run:<clientId>:<testId>` for `create-batch`, `<key>:<clientId>:<testId>` for `test run`): a retry through the same tunnel (adopted with `--tunnel-client`) gets its runs back, while a retry through a new tunnel starts new runs, since the old ones cannot reach the app without their tunnel. A key too long to fit its suffix within 256 characters is shortened, with a digest of the full key kept so it stays unique.
-
-**JSON output with `--run`.** The top-level `results` array remains the per-test run results. A separate additive `creation` object preserves the original batch-create receipt, including failures for individual specs that were not created:
-
-```json
-{
-  "results": [
-    {
-      "testId": "test_xxxxxxxx",
-      "runId": "run_xxxxxxxx",
-      "status": "passed"
-    }
-  ],
-  "creation": {
-    "results": [
-      {
-        "specIndex": 0,
-        "testId": "test_xxxxxxxx",
-        "status": "created",
-        "dashboardUrl": "https://..."
-      },
-      {
-        "specIndex": 1,
-        "status": "validation_error",
-        "error": {
-          "code": "VALIDATION_ERROR",
-          "message": "Invalid plan"
-        }
-      }
-    ],
-    "summary": {
-      "total": 2,
-      "created": 1,
-      "failed": 1
-    }
-  }
-}
-```
-
-The `creation` object has the same `{ results, summary }` shape as create-only JSON output. Each creation result retains its `specIndex`, status, optional error and optional `dashboardUrl`; the dashboard URL is omitted when unavailable or explicitly suppressed. This receipt is also included in interrupted/partial output and `--dry-run` JSON envelopes. Existing run-result rows, text output and exit codes are unchanged.
-
-```bash
-testsprite test create-batch --plans ./plans.jsonl --run --max-concurrency 4 --output json
-testsprite test create-batch --plan-from-dir ./plans/ --dry-run --output json
-```
-
-#### `testsprite test update <test-id>`
-
-Update test metadata (name, description, priority), set a per-test timeout with `--step-timeout <ms>`, or restore the execution-engine defaults with `--clear-step-timeout`. The two timeout flags are mutually exclusive. For **backend tests**, dependency declarations are also editable: `--produces <var>` / `--needs <var>` (repeatable) and `--category <setup|main|teardown>`. Updated declarations and a numeric step timeout are echoed back by `test get`.
-
-```bash
-testsprite test update test_xxxxxxxx --name "Renamed test" --description "Updated"
-testsprite test update test_xxxxxxxx --step-timeout 30000
-testsprite test update test_xxxxxxxx --clear-step-timeout
-testsprite test update test_be_xxxx --produces session_token --category setup
-testsprite test update test_xxxxxxxx --dry-run --output json
-```
-
-**Per-test step timeout.** This is a frontend-test setting. The value is 1–60000 milliseconds and the execution engine applies it to **every step** of that test. It is unrelated to `test run --timeout`: that flag is the polling deadline under `--wait` (600 seconds by default, 1200 with `--local`). Reaching it leaves an ordinary run executing, but the CLI cancels an owned `--local` run by default before closing its tunnel. An adopted run normally detaches, except that it cancels its own run if the tunnel owner disappears. See [local timeout and ownership rules](#local-frontend-testing-and-tunnels). Test code bakes timeout values in when code is generated, so changing this setting affects runs that generate or regenerate code; it does not rewrite or change replays of previously stored code. `--clear-step-timeout` sends `null` and restores the execution-engine defaults. Because a larger per-step value can lengthen a run, successful set operations print a stderr warning to raise `test run --wait --timeout <s>` when needed.
-
-#### `testsprite test delete <test-id>` / `test delete-batch`
-
-Permanently delete one test (or many) — there is **no restore window**. `--confirm` is required; absent it, the CLI exits 5 with a local validation error. `delete-batch` prints a per-test summary (a 404 counts as skipped) and exits: a rejected key for any test → 3, else a too-old CLI for any test → 14, else any other failed deletion → 1, else 0. This holds even if other tests were deleted first; the summary still lists every test.
-
-```bash
-testsprite test delete test_xxxxxxxx --confirm
-testsprite test delete-batch test_aaaa test_bbbb --confirm
-testsprite test delete-batch --all --project proj_xxxxxxxx --confirm
-testsprite test delete-batch --all --project proj_xxxxxxxx --status not_run --confirm
-testsprite test delete test_xxxxxxxx --dry-run --output json
-```
-
-With `--all`, `--status <list>` deletes only the test cases whose latest status matches (`passed|failed|blocked|cancelled|not_run`; `not_run` = never ran). An empty, whitespace-only or commas-only `--status` exits 5 before any request; leave out `--status` to delete every test in the project.
-
-#### `testsprite test code put <test-id>`
-
-Replace the generated test code with a new file. **The replacement must be Python** — the execution engine runs the stored code with Python `exec()` (frontend: Playwright `playwright.async_api`; backend: `requests` + assertions), so a TypeScript/JavaScript file would fail at run time with a `SyntaxError`. The CLI uses an etag (`codeVersion`) for optimistic-concurrency control: it auto-fetches the current version, or pass `--expected-version` to pin one, or `--force` to skip the guard.
-
-```bash
-testsprite test code put test_xxxxxxxx --code-file ./test.py
-testsprite test code put test_xxxxxxxx --code-file ./test.py --expected-version v3
-testsprite test code put test_xxxxxxxx --code-file ./test.py --dry-run --output json
-```
-
-#### `testsprite test plan put <test-id>`
-
-Replace a frontend test's plan-steps with a refined plan. `--expected-step-count` is an optional drift guard.
-
-```bash
-testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --expected-step-count 8
-testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --output json
-```
-
-**V3-migrated accounts:** the backend returns `UNSUPPORTED` (exit 7, with an actionable `nextAction`) for this endpoint on accounts that have been migrated to V3 — plan-steps replacement isn't wired up for the V3 test-case schema yet. This is a clean, expected denial (not a bug); there is currently no CLI-side workaround.
+Require the `write:projects` scope. Tests themselves are written by the project's agent — see [Tests: the project's agent](#tests-the-projects-agent).
 
 #### `testsprite project create` / `project update`
 
-Manage projects from the CLI. Both validate `--url` before network access; supported loopback origins follow the same stored-URL path as `--local`. Projects have **no description field** — `--description` is rejected client-side with a validation error (descriptions live on tests: `test create --description`). `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, `--instruction`, `--test-id-attributes`, and `--clear-test-id-attributes`.
+A project is a name, a type (`frontend` or `backend`) and the settings its agent writes tests with. Where the app runs — URL, test account, sign-in — is an [environment](#testsprite-project-env-list--get--create--update--delete--set-default): create one with `project env create` after the project. A project with no environment cannot run (`no-target-resolvable`), and the first environment you create becomes its default. Projects have **no description field**; descriptions live on tests.
 
-`project update --url` and credential flags edit the existing default environment. When the server reports the change, text output names that environment and the fields applied; an older server keeps the previous output. If no default environment can be resolved, the server returns a conflict with the `project env set-default` next step.
+`project create` takes `--type`, `--name`, `--instruction` and `--test-id-attributes`; `project update` takes `--name`, `--instruction`, `--test-id-attributes` and `--clear-test-id-attributes`. `--instruction <text>` is extra guidance for the project's agent, on both project types.
 
-`--test-id-attributes <list>` (also on `project create`) is the project's locator attribute priority list: a comma-separated, ordered set of DOM attributes your app uses as stable test hooks (e.g. `data-element,data-testid`). The execution engine tries them in that order before any other locator strategy when it exports test code, so a tagged element is exported as `page.locator('[data-element="nav.team-selector.trigger-btn"]')`; an attribute whose value is not unique on the page is skipped. `--clear-test-id-attributes` removes the list (engine default: `data-testid`). V3-native projects only — on a V2-mirrored project the backend answers `PRECONDITION_FAILED` (`test_id_attributes_native_only`). Against a backend that predates the field, the CLI answers `UNSUPPORTED` (exit 7, `test_id_attributes_unsupported_backend`) instead of passing through the server's generic 400.
-
-```bash
-testsprite project create --type frontend --name "Checkout" --url https://staging.example.com
-testsprite project update proj_xxxxxxxx --name "Checkout v2"
-testsprite project update proj_xxxxxxxx --test-id-attributes data-element,data-testid
-```
-
-**Bootstrap a local frontend project (V3).** Start your app, then create the project without a public deployment:
+`--test-id-attributes <list>` (also on `project create`) is the project's locator attribute priority list: a comma-separated, ordered set of DOM attributes your app uses as stable test hooks (e.g. `data-element,data-testid`). The execution engine tries them in that order before any other locator strategy when it exports test code, so a tagged element is exported as `page.locator('[data-element="nav.team-selector.trigger-btn"]')`; an attribute whose value is not unique on the page is skipped. `--clear-test-id-attributes` removes the list (engine default: `data-testid`). An older project that does not support the list answers `PRECONDITION_FAILED` (`test_id_attributes_native_only`). Against a backend that predates the field, the CLI answers `UNSUPPORTED` (exit 7, `test_id_attributes_unsupported_backend`) instead of passing through the server's generic 400.
 
 ```bash
-testsprite project create --type frontend --name <name> --local <port> [--skip-preflight]
-# Set projectId in checkout.plan.json to the project ID returned above.
-testsprite test create --plan-from ./checkout.plan.json
-testsprite test run <test-id>
+testsprite project create --type frontend --name "Checkout"
 ```
 
-`project create --local` stores `http://localhost:<port>`. Alternatively, pass `--url http://localhost:<port>`, `--url http://127.0.0.1:<port>` or `--url http://[::1]:<port>` (an optional trailing `/` is preserved). Loopback stored URLs must use HTTP, an explicit port and no path; HTTPS, missing ports, other `127.x` hosts, unspecified addresses, LAN/RFC1918, link-local and metadata addresses remain refused. `--local-host` still overrides the shorthand host, but is deprecated and hidden from project/environment help; prefer an explicit URL. Existing rows retain their host spelling. `project get` and `project list` expose `originMode: 'local'` in JSON, while text output shows `(Local)`. Loopback creation is frontend-only; `--local` and `--url` remain mutually exclusive. The port is probed before creation unless `--skip-preflight` is given. V2-only accounts receive exit 7 (`local-origin-requires-v3`).
-
-Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to set `projectId` in the plan and use `test create --plan-from …` followed by `test run <test-id>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
-
-Portal runs of a local project are **BLOCKED for free** until you set a public URL:
+Set `PROJECT_ID` to the ID printed by this command. Replace the staging URL with your app's address.
 
 ```bash
-testsprite project update <project-id> --url https://staging.example.com
+testsprite project env create "$PROJECT_ID" --name default --url https://staging.example.com
+testsprite project update "$PROJECT_ID" --name "Checkout redesign"
+testsprite project update "$PROJECT_ID" --test-id-attributes data-element,data-testid
 ```
 
-A case previously run through a tunnel also has its own local-target history; see [retargeting a local case](#local-frontend-testing-and-tunnels) when running that case without a tunnel.
+**Bootstrap a local frontend project.** Start your app and set `PORT` to its listening port. Create a project for the app.
+
+```bash
+testsprite project create --type frontend --name "Checkout"
+```
+
+Set `PROJECT_ID` to the returned ID. In the app repository, save the local environment and ask the agent to plan coverage for your Git diff.
+
+```bash
+testsprite project env create "$PROJECT_ID" --name local --local "$PORT"
+testsprite plan "cover checkout" --diff --project "$PROJECT_ID"
+```
+
+Review the proposed plan and apply it when you are ready to save the tests.
+
+```bash
+testsprite apply --output json
+```
+
+Set `TEST_ID` to one of the returned IDs in `applied.tests` and run it against the local environment.
+
+```bash
+testsprite run "$TEST_ID"
+```
+
+Creation performs **no exploration**. The project's agent can't open an app on your machine either: attach your change with `plan --diff` and it works from that and the project's other environments; run what it saves through the tunnel with `run <test-id>`.
+
+Portal runs of a local environment are **BLOCKED for free** until a public environment is the project's default:
+
+```bash
+testsprite project env create "$PROJECT_ID" --name staging --url https://staging.example.com --set-default
+```
+
+Select the environment you want for each run. See [local frontend testing and tunnels](#local-frontend-testing-and-tunnels).
 
 #### `testsprite project env list | get | create | update | delete | set-default`
 
-An **environment** is a named bundle of "how to reach and log in to the app": a URL, a test account (username + password), auto-auth and OTP settings. A project with configured environments can have a default environment — it is what `project create --url` / `project update --url --username --password` have always been editing, and what a run without `--env` or a run-time target uses. `project env` manages additional ones by name (unique within the project), and `test run --env <name>` / `test rerun --env <name>` select one.
+An **environment** is a named bundle of "how to reach and log in to the app": a URL, a test account (username + password), auto-auth and OTP settings. A project's **default environment** is what a run without `--env` or a run-time target uses: the first environment you create becomes it, and `set-default` moves it. Environments are named (unique within the project), and `run --env <name>` selects one.
 
 ```bash
 # What does this project have?
-testsprite project env list proj_xxxxxxxx
-testsprite project env get proj_xxxxxxxx staging
+testsprite project env list "$PROJECT_ID"
+testsprite project env get "$PROJECT_ID" staging
 
-# A second deployed target with its own test account
-testsprite project env create proj_xxxxxxxx --name staging --url https://staging.your-app.com \
+# Read the test account passwords from local files you supply.
+testsprite project env create "$PROJECT_ID" --name staging --url https://staging.your-app.com \
   --username qa@your-app.com --password-file ./staging-pw.txt
 
-# An app that only runs on your own machine: name it by its port, the same way as `project create --local`.
-testsprite project env create proj_xxxxxxxx --name local-dev --local 5173 \
+# An app that only runs on your own machine: name it by its port.
+testsprite project env create "$PROJECT_ID" --name local-dev --local 5173 \
   --username dev@your-app.com --password-file ./local-pw.txt
-testsprite test run test_xxxxxxxx --env local-dev
+testsprite run "$TEST_ID" --env local-dev
 
-# Change, rename, promote, remove
-testsprite project env update proj_xxxxxxxx staging --url https://staging2.your-app.com
-testsprite project env update proj_xxxxxxxx staging --rename preview
-testsprite project env update proj_xxxxxxxx preview --clear-credentials
-testsprite project env update proj_xxxxxxxx preview --var REGION=west --var TENANT=trial
-testsprite project env set-default proj_xxxxxxxx preview
-testsprite project env delete proj_xxxxxxxx local-dev --confirm
+# Update the staging environment and make it the default
+testsprite project env update "$PROJECT_ID" staging --url https://staging2.your-app.com
+testsprite project env update "$PROJECT_ID" staging --rename preview
+testsprite project env update "$PROJECT_ID" preview --clear-credentials
+testsprite project env update "$PROJECT_ID" preview --var REGION=west --var TENANT=trial
+testsprite project env set-default "$PROJECT_ID" preview
 ```
 
-`create` needs exactly one of `--url <url>` or `--local <port>`. Supported HTTP loopback origins are ordinary environment URLs: `localhost`, `127.0.0.1` and `[::1]`, with an explicit port and no path. `--local` is a shorthand for `http://localhost:<port>`; the deprecated `--local-host` override remains accepted. The port is probed first unless `--skip-preflight` is given. `update --local <port>` or `update --url http://localhost:<port>` changes the stored origin; existing URLs are never normalized or merged. Run a saved environment with `test run --env <name>`: its loopback URL opens a tunnel automatically. Passwords come from `--password-file` and are never printed back. `delete` refuses the default environment; deleting any other is a soft delete, so run history keeps naming it.
+To remove the local environment when you no longer use it:
 
-`get` shows the environment id, name, URL, default status, safe login mode and variables without a password. An older server without the get route returns a clear `UNSUPPORTED` error (exit 7). Portal-only login modes are shown as managed in Portal. `--output json` returns the server response, including the environment id and `variables`; text `list` stays compact. `update --clear-credentials` removes the username and password and disables account login; it cannot be combined with `--username`, `--password` or `--password-file`. Portal-only login settings must be changed in Portal.
+```bash
+testsprite project env delete "$PROJECT_ID" local-dev --confirm
+```
+
+`create` needs exactly one of `--url <url>` or `--local <port>`. Supported HTTP loopback origins are ordinary environment URLs: `localhost`, `127.0.0.1` and `[::1]`, with an explicit port and no path. `--local` is a shorthand for `http://localhost:<port>`; the deprecated `--local-host` override remains accepted. An optional trailing `/` is preserved; HTTPS, a missing port, other `127.x` hosts, unspecified, LAN, link-local and metadata addresses are refused, and a loopback environment is frontend-only. The port is probed first unless `--skip-preflight` is given. `update --local <port>` or `update --url http://localhost:<port>` changes the stored origin; existing URLs are never normalized or merged. Run a saved environment with `run --env <name>`: its loopback URL opens a tunnel automatically. Passwords come from `--password-file` and are never printed back. `delete` refuses the default environment; deleting any other is a soft delete, so run history keeps naming it.
+
+`get` shows the environment id, name, URL, default status, safe login mode and variables without a password. An older server without the get route returns a clear `UNSUPPORTED` error (exit 7). When creating a frontend environment, choose its mode with `--sign-in public|account|otp|manual`. Change an existing environment’s sign-in mode in the Portal. For OTP, set `--otp-channel email` or `--otp-channel sms`. With manual sign-in, set the reuse window with `--session-ttl <seconds|never>` and capture the login in the Portal. OTP and manual sign-in require a public environment. A manual (SSO) environment shows whether its login is usable (signed in until when, not logged in yet, or expired) and its `session-ttl`; `list` adds the same state to the AUTH column. `get` also prints `portal:`, the environment's page in the Portal, where a manual login is captured. `--output json` returns the server response, including the environment id and `variables`; text `list` stays compact. `update --clear-credentials` removes the username and password and disables account login; it cannot be combined with `--username`, `--password` or `--password-file`.
 
 Use repeatable `--var KEY=VALUE` on `env create` and `env update` to set frontend environment variables. Update merges by key. The first `=` separates key from value, so `--var TOKEN_HINT=a=b` stores `a=b`. Keys must match `^[A-Za-z_][A-Za-z0-9_]{0,63}$` and cannot be `url`, `username`, `password`, `authType`, `credential`, `memory_hints`, `rerun_context`, `__proto__`, `constructor` or `prototype` (case-sensitive). At most 50 keys fit in one environment; a value is limited to 4096 UTF-8 bytes and the total to 32 KiB. Values are plain text in `get` and JSON, so do not use variables for secrets.
 
 Create and update require the server response to confirm requested `--var` values; update also requires confirmation that `--clear-credentials` removed the stored account. If an older server ignores either flag, the CLI exits nonzero and asks you to upgrade or retry. A mixed update's URL may already have changed before that error, so inspect the environment before retrying.
 
+##### API sign-in
+
+A backend project's environment carries how runs sign in to the API under test, the way the project's agent writes it in `environments/<name>.md`: a static credential, the extra headers every request carries, or a sign-in that refreshes the credential. The Portal's environment card edits the same fields, saved through the same server path, so a CLI change and a Portal change produce the same environment. Which endpoint needs which header is decided in the Portal.
+
+```bash
+# Supply the credential and header files for your backend test account.
+testsprite project env update "$PROJECT_ID" staging --auth bearer --credential-file ./token.txt
+testsprite project env update "$PROJECT_ID" review --auth basic --credential-file ./basic.txt
+testsprite project env create "$PROJECT_ID" --name prod --url https://api.example.com \
+  --auth apikey --credential-file ./key.txt --header "X-Org-Id: 123"
+testsprite project env update "$PROJECT_ID" staging --auth none   # send none
+
+# Extra request headers: replace the stored set; secret values from a file
+testsprite project env update "$PROJECT_ID" staging --header "X-Org-Id: 123" --header-file ./secret-headers.txt
+
+# A sign-in that refreshes the credential
+testsprite project env update "$PROJECT_ID" staging --auto-auth-file ./login.json
+```
+
+- For Basic authentication, put a UTF-8 `username:password` pair or its Base64 encoding in the credential file. A file keeps the credential out of your shell history.
+- **`--auth`** is `none`, `bearer`, `basic` or `apikey`; the value comes from `--credential-file` (or `--credential`). A new credential keeps the stored type; a new type keeps the stored credential only while the type stays the same. `none` sends no credential and drops the stored one. A static `--auth` replaces a sign-in.
+- **`--header "Name: value"`** (repeatable) and **`--header-file`** (one `Name: value` per line) together replace the environment's extra headers. Put a secret value in the file, not on the command line; `get` shows such a header as set, never its value.
+- **`--auto-auth-file`** holds a sign-in and is sent to the server as it is: a field the server does not know is refused, a secret left out (`password`, `clientSecret`, `refreshToken`) keeps its stored value, and `"enabled": false` saves it switched off. `method` is `password` (`loginUrl`, `loginBodyTemplate` with `{{username}}` / `{{password}}`, `tokenPath`; optional `loginMethod`, `loginContentType`, `username`, `password`), `refresh_token` (`tokenEndpoint`, `clientId`, `refreshToken`; optional `clientSecret`, `scope`, `tokenPath`) or `aws_cognito_refresh` (`region`, `clientId`, `refreshToken`; optional `tokenPath`). `inject` is `bearer`, `header` or `cookie`; the last two take `injectKey`. Saving it runs a trial login; when that fails the sign-in is saved switched off and `get` shows the error under `auth-error`. Saving a sign-in needs a plan with advanced environment settings (`FEATURE_GATED`, exit 13, otherwise).
+
+  ```json
+  {
+    "method": "password",
+    "inject": "bearer",
+    "loginUrl": "https://api.example.com/auth/login",
+    "loginBodyTemplate": "{\"email\":\"{{username}}\",\"password\":\"{{password}}\"}",
+    "username": "qa@example.com",
+    "password": "<secret>",
+    "tokenPath": "$.data.accessToken"
+  }
+  ```
+
+- `get` shows the environment as the agent reads it: `auth`, whether the credential or each sign-in secret is set, the sign-in's settings, and the headers with a secret value shown as `<set>`. A frontend project refuses these flags.
+
 ##### Temporary environments for run-time targets
 
 For a frontend run with `--target-url` and no `--env`, TestSprite reuses an environment that already points at the URL's origin. Otherwise a supporting backend creates a temporary environment that clones the default environment's sign-in configuration; an older backend retains its previous temporary-environment behavior. Temporary environments are hidden from `project env list`, do not count toward the environment limit, and are deleted when the run finishes; users cannot create them directly. With `--env <name> --target-url <url>`, the named environment's login and other settings are used against the override URL. The backend refuses a login-once, OTP, or manual-login environment when its origin differs from the target (`PRECONDITION_FAILED`, exit 6). Backend tests still use the URL in their generated code.
-
-#### `testsprite project sign-in get | set`
-
-Choose how runs sign in to one environment. `--env <name>` selects a named environment; omitting it uses the project default. `get` prints the mode, account password status, OTP channels and provisioned inbox/phone, or the SSO session status. `--output json` returns the server response unchanged. Text mode warns that runs **will NOT be signed in** when a manual environment has no valid captured session.
-
-```bash
-testsprite project sign-in get proj_xxxxxxxx --env staging
-testsprite project sign-in set proj_xxxxxxxx --env staging --mode account \
-  --username qa@your-app.com --password-file ./staging-pw.txt
-testsprite project sign-in set proj_xxxxxxxx --env staging --mode public
-testsprite project sign-in set proj_xxxxxxxx --env sso --mode manual --session-ttl 3600
-testsprite project env create proj_xxxxxxxx --name otp --url https://staging.your-app.com \
-  --sign-in otp --otp-channel email,sms
-testsprite project env set-default proj_xxxxxxxx otp
-```
-
-Modes are `public`, `account`, `otp`, and `manual`; aliases `none`, `credentials`, and `sso` map to `public`, `account`, and `manual`. OTP is chosen when creating an environment and cannot be switched on or off later: create a new environment and optionally make it default. `--otp-channel` accepts `email` and `sms` (comma-separated or repeated) and defaults to email. SSO login itself happens once in the Portal under Project → Settings → Environments → the environment name → Log in; the CLI can choose manual mode and report session status but cannot capture the login. SSO (`manual`) selection is behind a per-account feature flag; `--mode manual` returns `FEATURE_GATED` (exit 13, `manual-login-disabled`) when it is off. Manual `--session-ttl` accepts 1–2592000 seconds or `never`; omitting it lets the server retain an existing manual TTL or use its 1-hour default. Local environments support only public and account sign-in. A temporary environment (created for one `--target-url` run) has no settable sign-in, so `set` refuses it with exit 5; create a permanent environment for that URL instead. An SSO or OTP environment keeps no username or password, so `project env update --username/--password` (and `project update --username/--password` when it is the default environment) on one exits 6 and points at `sign-in set`; `--local` on one exits 6 too, and a temporary environment refuses credentials with exit 5. An environment with no stored account takes `--username` and `--password` together or not at all (exit 5), on `project env create` without `--sign-in` and on `project env update`; changing one half of a stored account is still a rotate. The CLI cannot tell whether a captured SSO session still fits a changed address: `project env update --url` on an SSO environment reminds you to log in again in the Portal if the site changed. Both writes accept `--idempotency-key` and support global `--dry-run` without reading password files.
-
-For `project sign-in get/set` and `project env create`, exit **0** means success; **3** means authentication or scope failure; **4** means the project or environment was not found; **5** means invalid flags or fields (including a locally rejected OTP/manual `--local` combination); **6** means a server `PRECONDITION_FAILED` refusal (including OTP fixed at creation or unsupported local sign-in) or a write conflict; **7** means `UNSUPPORTED` (V2 environments or manual/OTP in BYOC); and **13** means `FEATURE_GATED` (manual login disabled). Shared request failures can also return **10** (`UNAVAILABLE`), **11** (`RATE_LIMITED`), or **14** (`CLIENT_TOO_OLD`). Inspect the error `code` and `details.reason` in JSON mode to distinguish causes that share an exit code.
 
 #### `testsprite project delete <project-id>`
 
 Permanently delete a project and **everything under it** — its frontend/backend sub-projects, all their tests, and backend fixtures (mirrors the Portal's cascade delete). There is **no restore window**. `--confirm` is required (the CLI never prompts); absent it, the CLI exits 5 with a local validation error. `--dry-run` previews the response shape without a network call. Exit codes: 0 success, 3 auth, 4 not found (or already deleted), 5 validation.
 
 ```bash
-testsprite project delete proj_xxxxxxxx --confirm
-testsprite project delete proj_xxxxxxxx --dry-run --output json
+testsprite project delete "$PROJECT_ID" --dry-run --output json
 ```
 
-#### `testsprite project credential <project-id>`
-
-Set the **static backend credential** injected into every backend test in the project (free tier). Supported types: `public` (no credential), `"Bearer token"`, `"API key"`, `"basic token"`.
+To permanently delete the selected project:
 
 ```bash
-testsprite project credential proj_xxxxxxxx --type "Bearer token" --credential-file ./token.txt
-testsprite project credential proj_xxxxxxxx --type public
-testsprite project credential proj_xxxxxxxx --type "API key" --credential sk-live-... --dry-run --output json
+testsprite project delete "$PROJECT_ID" --confirm
 ```
 
-`--credential <value>` or `--credential-file <path>` supplies the value (required unless `--type public`). Prefer `--credential-file` in scripts so the secret never lands in shell history.
+### Tests: the project's agent
 
-#### `testsprite project auto-auth <project-id>`
-
-Configure the **recurring-token (auto-refresh) login** for backend tests (Pro): a fresh token is fetched on each run and injected into every backend test, so long-lived suites survive token expiry.
+Tests are written, changed and removed by the project's agent — the same agent the Portal has, in the same conversations. It explores the app in a real browser (frontend) or calls the API (backend), reads what you attach, and proposes changes to the suite as a plan. You apply the plan or reject it with what to change. A coding agent never edits a test: it runs tests, reads their results, and fixes product code.
 
 ```bash
-# Password login: POST the login endpoint, extract the token, inject as a Bearer header
-testsprite project auto-auth proj_xxxxxxxx \
-  --method password --inject bearer \
-  --login-url https://api.example.com/login --login-method POST \
-  --login-content-type application/json \
-  --login-body-template '{"user":"{{username}}","pass":"{{password}}"}' \
-  --username ci@example.com --password-file ./pw.txt \
-  --token-path '$.data.accessToken'
+# Run in your app repository. Replace the sample file with your own PRD.
+testsprite plan "cover the new coupon rules" --diff --file docs/coupons-prd.md --project "$PROJECT_ID"
 
-# OAuth refresh-token flow
-testsprite project auto-auth proj_xxxxxxxx \
-  --method refresh_token --inject header --inject-key X-Auth-Token \
-  --token-endpoint https://auth.example.com/oauth/token \
-  --client-id my-client --client-secret-file ./secret.txt \
-  --refresh-token-file ./refresh.txt --scope api.read
+# A test that is itself wrong goes back to the agent the same way
+testsprite plan "the checkout tests fail since the redesign; fix the tests, report real bugs"
 
-# AWS Cognito refresh
-testsprite project auto-auth proj_xxxxxxxx \
-  --method aws_cognito_refresh --inject bearer \
-  --client-id my-app-client --refresh-token-file ./refresh.txt --region us-east-1
+# Decide what it proposed
+testsprite apply                       # save it (a proposed run is started and waited for)
+testsprite apply --exclude 3,CHK-009   # without some tests; --only keeps just the named ones
+testsprite apply --answer 1=b --answer 2=a,c   # answer the questions a card asks, by letter
+testsprite apply --env staging         # start a proposed run on another environment
+testsprite reject "split the coupon test: one for the limit, one for expired codes"
 
-# Turn it off (stored config is kept)
-testsprite project auto-auth proj_xxxxxxxx --disable
+# Reply to a text message from the agent, follow its work, or stop it
+testsprite reply "use the qa-admin account for the admin pages"
+testsprite status --wait
+testsprite stop
+testsprite discard                     # drop the task and release what it holds unsaved
 ```
 
-Required flags: `--method <password|refresh_token|aws_cognito_refresh>` and `--inject <bearer|header|cookie>` (`--inject-key <name>` names the header/cookie when not `bearer`). Method-specific flags: password login uses `--login-url/--login-method/--login-content-type/--login-body-template/--username/--password[-file]/--token-path`; OAuth uses `--token-endpoint/--client-id/--client-secret[-file]/--refresh-token[-file]/--scope`; Cognito adds `--region`. File variants (`--password-file`, `--client-secret-file`, `--refresh-token-file`) keep secrets out of shell history.
+- **Which project and conversation.** `--project` defaults to `TESTSPRITE_PROJECT_ID`, else the one last used in this folder; `--conversation` defaults to the one last started from this folder.
+- **Waiting.** Each command follows the agent until it needs you (a proposal or a reply), printing its progress on stderr. In a terminal there is no limit; otherwise it stops following after 540 seconds (`--timeout <seconds>`), and the agent keeps working — pick it up with `testsprite status --wait`. `--no-wait` returns as soon as the agent has the request.
+- **Environment.** A conversation is not tied to an environment. The agent works on the project's default; to have it work on another, name it in your request (`plan "cover checkout on the staging environment"`). Each run the agent proposes names the environment it goes to. For a local-only address, the agent works from your change and project files. Run what it saves with `run <test-id> --local <port>`.
+- **What `apply` returns.** The saved test ids (`applied.tests` in JSON) and a `prSummary` you can paste into a pull request description.
+- **Documents.** `--file <path>` (repeatable, up to 10 files with the change, 50 MB each) attaches a document; a backend project needs its API spec to plan from.
+- **A card that asks questions.** The agent may ask one to four questions, each with lettered options; the conversation shows them numbered. `apply --answer <n>=<letter>` answers question n (letters comma-separated when it takes several), or `--answer <n>="your own words"`. Every question needs an answer, or the card keeps waiting; `reply` is refused while a card waits, and `reject "<what to change>"` turns the card down.
+- **A card that starts a run.** The card names the environment the run goes to: the one the agent named, else the project's default. `apply` starts it there; `apply --env <name>` starts it on another of the project's environments instead, as the portal's card lets you pick one.
+- **A card that asks for a secret.** When an environment needs a password or a token, the agent asks for it on a card of its own. `apply` takes it from a person typing it in a terminal, or from a pipe with `--secret-stdin` when nobody is at one (`printf '%s' "$PASSWORD" | testsprite apply --secret-stdin`); it is never a flag. Applied without one, nothing changes and the card keeps waiting.
+- **Stopping and discarding.** `stop` answers once the agent has stopped, and says so when it was not working. `discard` drops the task: it turns down a waiting card and puts back what the conversation changed and never saved. The conversation reads as discarded until a `reply` picks it up again.
 
-### Generate commands
-
-Ask TestSprite to write the tests for you, instead of authoring every plan by hand. `test plan generate` produces test-case **proposals** for a project and holds them for your review; `test plan accept` turns the ones you keep into real tests. `project docs upload` supplies the source material generation reads.
-
-**Everything stays on the server.** Proposals are staged in your project, not written to your disk — there is no `--out`, no plan file to manage, and no prompt to answer. You review them in the table `generate` prints (or in the Portal) and then accept.
-
-**Only the missing work runs.** `generate` checks what the project already has and picks up from there: a brand-new frontend project gets explored, gets a feature map, then gets proposals; an already-explored project skips straight ahead. Re-running never redoes a stage that is already done.
-
-Requirements: an account on the **V3 platform** (an account still on the older platform gets a clear message and exit 6 — generate plans in the Portal until the migration reaches you), and the `write:projects` scope for `generate`, `write:tests` for `accept`. `--dry-run` makes no network calls at all.
-
-#### `testsprite test plan generate`
-
-Runs whichever pipeline stages the project is still missing — exploration, then the feature map, then the proposals — and prints the staged batch. A fresh frontend project runs all three; an already-explored project skips ahead.
-
-```bash
-testsprite test plan generate --project proj_xxxxxxxx
-testsprite test plan generate --project proj_xxxxxxxx --output json
-testsprite test plan generate --project proj_xxxxxxxx --dry-run       # no network
-```
-
-```
-$ testsprite test plan generate --project proj_abc123
-[hint] 3 stages: exploration, strategy, proposals. Takes minutes. Ctrl-C is safe; re-run to continue.
-[warn] exploration signs in only with the test account stored on the project's default environment. If your app requires login and no test account is configured, the agents will explore only the public pages — a shallow result from a stage that still runs and still bills. For signed-in coverage, store a test account first: testsprite project update proj_abc123 --username <user> --password-file <path>
-stage 1/3 exploration done 4m48s
-stage 2/3 strategy done 1m12s
-stage 3/3 proposals done 55s
-2026-08-18T20:48:02.117Z 12 proposals staged
-
-12 test-case proposals staged for review (credits used: 6, balance: 144)
-
-  #  ID       TITLE                       FEATURE        PRIORITY  TYPE
-  1  prop_1   Login happy path            auth/login     p1        frontend
-  2  prop_2   Login wrong password        auth/login     p1        frontend
-  …
-
-next
-  review the list above, then:  testsprite test plan accept --project proj_abc123
-  accept a subset with:         testsprite test plan accept --project proj_abc123 --only <id ...>
-  (or review visually in the Portal before accepting)
-```
-
-The timestamped progress line is a **single line overwritten in place** (shown above at one instant); as stages advance it reads `generating strategy… (52s)`, then `proposing tests… (31s)`. It appears only in an interactive terminal — see the first bullet below.
-
-Flags:
-
-- `--project <id>` — required. V3 ids work directly; older project ids resolve through the migration bridge.
-- `--timeout <seconds>` — total wait budget, default **1800**. Exploration genuinely takes minutes, which is why this default is far larger than the run commands'.
-- `--idempotency-key <token>` — retry namespace for the trigger; auto-minted per invocation otherwise.
-
-Behavior worth knowing:
-
-- **Progress is a single stderr line**, updated in place, and only in an interactive terminal. `--output json` and CI runs get no ticker — just the final result object on stdout.
-- **Re-running joins a stage already in progress.** If a stage is already running — including one you started in the Portal — the command waits for it instead of failing or starting a second one.
-- **If proposals are already staged, nothing is started.** The command prints the existing batch and says so. Regenerating a batch you don't like is a Portal action for now: accept or discard the staged batch there first.
-- **Ctrl-C pauses, it does not cancel.** The stage in progress finishes on its own; the stages after it wait until you run the command again. Exit 130/143/129; stdout still gets a partial `{ projectId, status: "running", stagesRemaining, … }` object so a redirected file is never empty, and stderr says which stage you paused in and how many are left.
-- **On `--timeout` (exit 7)** the same partial is printed with a `Continue:` line; running the identical command again picks up where it left off. Raise `--timeout` if you want one run to cover every stage.
-- **Stage progress lines.** In text mode one `stage i/N <name> done <elapsed>` line is printed as each stage finishes and stays in scrollback; the live progress line (`exploring app… (resources 3/8, 4m10s)`) redraws in place beneath it on a terminal and is cleared before each stage line is written, so the two never share a row.
-- **A stage that fails server-side exits 1** with the server's error. Stages that already completed stay completed, so a re-run resumes rather than restarts.
-- **The result line reports what this invocation actually charged** (`credits used: N, balance: M`), from the server's own figures. It is best-effort — against a backend that cannot supply it the line simply omits those numbers, and a run that charged nothing (for example a re-run that found proposals already staged) omits `credits used` rather than repeating old spend. `testsprite usage` shows your balance any time.
-- **In `--output json`, read `creditsUsedThisInvocation` for this run's spend** — a top-level number that is this invocation's charge alone, not the project's lifetime total. It is `null` when the spend can't be determined (the billing read was unavailable at either end of the run); a script must treat `null` as "unknown", not as zero. Prefer it over summing `credits.charged[]`, which is the project's cumulative ledger.
-
-When a prerequisite is missing the error names the exact fix rather than prompting:
-
-```
-$ testsprite test plan generate --project proj_new789
-Error: The project's environment has no URL, so the app cannot be explored.
-Set the app URL first: testsprite project update proj_new789 --url https://staging.your-app.com
-requestId: req_20260813_a1b2c3
-# exit 6
-```
-
-The three preconditions and their fixes: no environment URL on a frontend project (`project update … --url`), no processed input sources on an API project (`project docs upload`, below — or add sources in the Portal; a source you just added may still be processing, so retrying shortly can also be the answer), and an account not yet on the V3 platform (use the Portal for now).
-
-One warning fires before browser exploration starts: exploration signs in only with the test account stored on the project's default environment, so if your app requires login and no test account is configured, the agents explore public pages only — a shallow result from a stage that still ran. It warns rather than blocking, because the CLI cannot tell whether your app needs sign-in. The remedy is in the CLI: `testsprite project update <project-id> --username <user> --password-file <path>` stores the account and turns sign-in on for exploration (both flags are required together).
-
-#### `testsprite test plan accept`
-
-Converts staged proposals into real test cases — all of them, or a subset.
-
-```bash
-testsprite test plan accept --project proj_xxxxxxxx
-testsprite test plan accept --project proj_xxxxxxxx --only prop_2 prop_5 prop_9
-testsprite test plan accept --project proj_xxxxxxxx --only prop_2,prop_5
-```
-
-```
-$ testsprite test plan accept --project proj_abc123
-12 proposals accepted — 12 test cases created
-
-next
-  testsprite test list --project proj_abc123
-  testsprite test run --all --project proj_abc123 --wait
-```
-
-- `--only <ids...>` takes the ids from the `generate` table, space- or comma-separated. **Accepting a subset discards the rest** — the staging area is cleared either way — and the output states how many were discarded.
-- A `--only` that names **any unknown id** — even alongside valid ones — is a validation error (exit 5) and **the request is never sent**; the message names the unknown ids alongside the ids that are actually staged. The strictness is a deliberate guard, not pedantry: a wrong id usually means the staged batch is not the one you reviewed, and an empty selection means "reject everything" to the server, which would destroy the batch.
-- Nothing staged → exit 6, pointing at `test plan generate`. Scripts can tell "accepted" from "nothing to accept".
-- **API test code is generated when the tests first run**, not at accept, so that note appears only when API cases were among the ones you accepted. From here the ordinary `test list` / `test run` commands take over.
-- Editing a proposal before accepting is not available from the CLI yet — accept the ones you want, then revise in the Portal.
-
-#### `testsprite project docs upload <file>`
-
-Upload an API spec or a PRD as a project **source**. Generation reads these sources to build the feature map, so for an API project this is usually the first step — without any source, `test plan generate` stops at "no processed inputs". Requires `write:projects`.
-
-```bash
-testsprite project docs upload ./openapi.yaml --project proj_xxxxxxxx --role api-doc
-testsprite project docs upload ./product-spec.md --project proj_xxxxxxxx --role prd --name "Checkout PRD"
-testsprite project docs upload ./openapi.yaml --project proj_xxxxxxxx --dry-run
-```
-
-```
-$ testsprite project docs upload ./openapi.yaml --project proj_new789 --role api-doc
-uploaded openapi.yaml (48 KB) — processing started
-note: generation can use this source once processing and embedding finish
-      (check with `testsprite test plan generate` — it says if inputs are still processing)
-```
-
-- `--role api-doc|prd` — defaults to `api-doc`. Nothing is inferred from the project type.
-- **Cost:** an `api-doc` upload is free. A `prd` upload bills **0.5 credits** when the document is registered — PRDs are embedded for retrieval, and the embedding is the charge. The command itself prints no spend line today, so this is the disclosure.
-- `--name <display-name>` — defaults to the file's basename. It only changes the display name, not the stored file name.
-- **A document is stored under its file name, so uploading a different file with the same name replaces the earlier one.** This is what makes re-uploading the _same_ file safe (it updates in place rather than piling up duplicates), but it also means `./v1/api.yaml` and a later `./v2/api.yaml` collide on `api.yaml` and the second silently replaces the first — the folder is not part of the stored name. Give distinct files distinct names if you need to keep both. This is platform behavior (the same as the Portal), not specific to the CLI.
-- The upload is a three-step flow (mint a signed upload URL, send the bytes, register the document). The file is **streamed**, never read into memory, so large specs upload at constant memory cost. The local file is only read — nothing is written back to disk.
-- **If the upload step fails (exit 10), nothing was registered**: re-run the command and it mints a fresh URL. Signed URLs expire after an hour, so a re-run is the fix rather than a retry of the same URL.
-- **If the register step fails, the bytes already landed** — the error says so, and re-running the whole command is safe: the server stores the document by its storage key and replaces rather than duplicates it. One caveat: a retried register re-runs the processing pipeline (and for a `prd` document, the embedding compute), but the 0.5-credit embedding charge is **idempotent per document** — the billing ledger deduplicates it, so a retry is never billed twice. You pay the 0.5 credits at most once per document, whether the first register landed or the retry did.
-- `--dry-run` reads nothing but the file's size and prints the three steps it would take. No network.
-
-There is no `project docs list` or `docs delete` yet; the Portal is the place to review or remove a project's sources.
+Exit codes: `0` the agent proposed something or replied; `1` the agent stopped before it finished, or the conversation ended; `5` invalid input (no project, a missing file, `--diff` outside a repository); `6` the conversation is not waiting for this (e.g. `apply` with nothing proposed); `7` still working at `--timeout`; `13` the agent is not enabled for this account.
 
 ### Run commands
 
-Require the `run:tests` scope.
+Require `run:tests` (`run wait` needs only `read:tests`; `run cancel` needs both); `tunnel *` needs only `run:tunnel`, and a run that opens a tunnel also needs it.
 
-#### `testsprite test run <test-id>`
+#### `testsprite run`
 
-Trigger a run for a test. Without `--wait`, prints `{ runId, status: "queued", enqueuedAt, codeVersion, targetUrl }` and exits 0. With `--wait`, polls until terminal — exit 0 on `passed`, exit 1 on `failed | blocked | cancelled`, exit 7 on `--timeout`. After the trigger response, stderr immediately prints `Run <runId>` and, when the response supplies a dashboard/execution URL, `Dashboard: <url>` — before polling, including with `--output json`. Keep that id even if the process is later interrupted; stdout remains the normal JSON result channel. On timeout, stdout still receives a partial run object with `runId` before exit 7. Ordinary runs and adopted tunnels whose owner remains alive get a `test wait <run-id>` hint; owned `--local` runs and adopted runs whose owner disappears are cancelled by default (see below).
+```bash
+# Run the project and wait for its complete execution
+testsprite run --project "$PROJECT_ID" --wait
+# Named tests are grouped by their owning project
+testsprite run "$TEST_ID" "$SECOND_TEST_ID" --wait
+# Saved list, or only named members of that list
+testsprite run --testlist "$LIST_ID" --wait
+testsprite run "$TEST_ID" "$SECOND_TEST_ID" --testlist "$LIST_ID" --wait
+# Resume or cancel execution run IDs, without starting a new run
+testsprite run wait "$RUN_ID" "$SECOND_RUN_ID" --timeout 600
+testsprite run cancel "$RUN_ID" "$SECOND_RUN_ID"
+```
 
-**Several ids, `--status` and `--skip-dependencies`.** `test run <id> <id> …` accepts any number of ids and dispatches them as batches: ids are grouped per project and sent 50 per request, one chunk after another, with the same wave ordering, `--wait`, `--report`, `--summary-file` and exit codes as `--all`. If a request fails after earlier ones were accepted, nothing further is sent and the command exits with that request's exit code, which outranks every other code (rate-deferred 7, failed verdict 1, credits 12, conflict 6). Without `--wait` the output lists every run id the earlier requests accepted and the ids never sent, and nothing is polled. With `--wait` every accepted run (and every in-flight run it joined) is polled to its verdict first: stdout, `--summary-file` and the JUnit report carry those verdicts, and the ids never sent appear on stderr, in `notRunTestIds` and as `not dispatched` rows. A run that sends a single request and fails is rethrown unchanged. `--all --status <list>` (comma-separated: `passed|failed|blocked|cancelled|not_run`) runs only the test cases whose latest status (the status of their latest result; `not_run` is a test case that never ran) matches, so `--status failed,blocked` runs what did not pass; `--env <name>` only picks where to run, and an empty `--status` is a usage error (exit 5). `--filter`/`--status` that match nothing exit 5 unless `--allow-empty`. `--skip-dependencies` (backend test cases only) runs the named test cases without the test cases they depend on; the backend confirms it in the response, and a batch whose response does not is cancelled and exits 7 (`skip-dependencies-not-honored`), while a single or `--local` run prints an advisory.
+Positional launch IDs always identify tests. `--project` and `--testlist` are
+mutually exclusive; `--project` cannot combine with positional IDs. Without
+IDs or `--testlist`, `--project` defaults to `TESTSPRITE_PROJECT_ID`; no configured
+project is a validation error (exit 5). Named tests and explicit lists ignore
+that environment variable. Explicit blank selectors fail instead of falling back.
+`--filter` narrows only a project selection. The four former command paths
+`test run`, `test wait`, `test cancel` and `testlist run` are removed without
+aliases (exit 5). Root `run` rejects `--all` and `--case`: use `--project` and
+positional list members instead.
 
-**Queueing.** A batch is accepted whole: each request starts one run on the server, and its results report `queued` (in the live progress line and in JSON) until they start, as in the Portal. The CLI refuses nothing for how many of your runs are already in flight and resends nothing; only the limit of 60 run triggers per minute per API key and the 409 for a test case that already has a run in flight apply. `deferred[]` can still appear in rare cases (a request spanning several projects where one project's lock stayed busy, or a test case that went in flight during dispatch): the command lists those ids (stdout `deferred`, a stderr line, not-dispatched rows in the summary and JUnit report), never resends them, still awaits the accepted runs under `--wait`, and exits 7.
+Put lifecycle flags after the child: `run wait <run-id> --timeout 600`.
+Launch-only flags before `wait` or `cancel` are rejected; global options such as
+`--output json` may precede the child.
 
-`--all --project <id>` runs every test in the project in wave order. Add `--target-url <url>` to point its frontend tests at a run-time target. On the current unified engine that means **all tests, frontend and backend**; on the legacy backend-only engine, frontend tests can't run — they are skipped and enumerated in `skippedFrontend` with a stderr advisory.
+Run JSON has the same shape for named tests, project selections, saved test lists and `run wait`. Each `runs[]` entry identifies an execution by `runId`. Each `results[]` entry identifies a test result by `resultId` and carries its `runId`, status and title when known. A dispatch receipt can have an empty results list while the server enumerates the run. Waiting adds a count-only `summary`. A completed failing run exits 1 and includes its results. Only a timeout or interruption that leaves work unfinished adds `partial: true`. Use `testsprite result get <result-id>` for steps, video, screenshots, traceback and failure details. In text mode each run prints `Dashboard: <url>`, its page in the Portal, when the server sends one (`runs[].dashboardUrl` in JSON); a saved list launched without `--wait` prints none, and `run wait <run-id>` does.
 
-With `--all`, `--filter <substr>` narrows the selection to test names containing a non-empty substring (case-insensitive); omit the flag to run every project test. An explicitly empty value (`--filter ""` or `--filter=`) fails with `VALIDATION_ERROR` / exit **5** before any request, including on single-test and `--dry-run` paths. Non-empty values are used as written, including whitespace.
+Waiting reads the execution's result listing until its authoritative `run.status` is `finished`. Passed results do not finish a run during the gap before integration tests appear. A cancelled execution fails even when its existing results all passed or no results exist. The summary counts each test result once and includes one skipped row per undispatched test. Nonzero counts for blocked and cancelled results and result-read errors appear as `blocked`, `cancelled` and `errors`. Execution-level failures appear separately in `runFailures`. Results with a block explanation carry `TEST_BLOCKED` or a more specific dispatch reason in `errorCode`. Exit 0 means passed, 1 means failed/blocked/cancelled, and 7 means timeout. A deadline or interrupt preserves the latest results and acknowledged launch receipts. Ordinary waits detach with `run wait <run-id>` and `run cancel <run-id>` guidance; owned tunnels cancel unfinished owned executions before closing.
 
-`testsprite test run list` — a literal `list` where a test id goes — is a usage error (exit 5), not a run against a test named "list": there is no `test run list` subcommand. It points you at `test result <test-id> --history`, which lists a test's prior runs.
+**Several IDs and dependencies.** `run <id> <id> …` groups IDs by project and sends exactly one request per project, without chunking or client dispatch pacing. Each named project selection has a 5000-ID payload limit; exceeding it fails before dispatch. Unfiltered public `run --project <id>` sends no `testIds`, leaving selection to the server. `--skip-dependencies` requests only the selected backend tests; the server owns dependency expansion and dispatch.
 
-The server controls whether a fresh run auto-heals drifted generated code by default. When healing is enabled, the agent re-authors stale code and runs the new version instead of replaying a script that can only fail. Healing saves the new code as the test's stored version.
+If a later request fails, output retains earlier launch receipts. `notRunProjects` names projects not launched; `unconfirmedProjects` identifies requests that may have started but returned no receipt, with their per-project request keys. Inspect those projects before retrying. To replay the original command, pass the top-level `retryIdempotencyKey` to `--idempotency-key`. Server error messages, actions and details are preserved. No later project is submitted after a failure.
 
-When healing is on only because it is the server's default, it does not re-author code **you** wrote (`test code put`, a file passed to `test create --code-file`, or a hand-edit in the portal): that code is run as written. A healed verdict can mask a real regression, so use `--no-auto-heal` to ask the server for a strict stored-code replay when available. The flag is accepted by `test run` (one id, several ids, or `--all`) and the deprecated `test rerun`; its effect depends on the command and server.
+**Queueing and held tests.** The server queues execution work and applies `--max-concurrency` to each execution. `blocked[]` identifies seeded blocked results; `held[]` identifies tests already owned by another run. Waiting can join only verified matching held results, scoped to their result IDs. Incompatible held work is retained with a separate skipped diagnostic; CI's `--fail-on-skipped` controls that gate. No held work is resubmitted. `--allow-empty` explicitly permits a launch with no newly dispatched tests.
 
-Stored-code replay is not available in every workspace. Where unavailable, the server rejects `--no-auto-heal`. Where replay is available but a frontend test has no replayable stored code yet, the server can refuse the run with `no_stored_code` rather than authoring it; run the test once without the flag first. On the deprecated `test rerun`, `--no-auto-heal` applies to frontend reruns and is ignored for backend reruns.
+`run --project <id>` runs the project's tests, including later integration work. `--target-url` applies to frontend tests. For a backend project outside a CI preview, the override is ignored, omitted from the launch request and explained on stderr; `--env` still selects its environment. A CI pull-request preview clones that environment with the preview target and runs against the clone.
+
+With a project selection, `--filter <substr>` narrows the selection to test names containing a non-empty substring (case-insensitive); omit the flag to run every project test. An explicitly empty value (`--filter ""` or `--filter=`) fails with `VALIDATION_ERROR` / exit **5** before any request, including on `--dry-run` paths. Non-empty values are used as written, including whitespace.
+
+`testsprite run list` — a literal `list` where a test id goes — is a usage error (exit 5), not a run against a test named "list": there is no `run list` subcommand. It points you at `result list --test <test-id>`, which lists a test's results across runs.
+
+The server decides whether a fresh run heals drifted generated code. When healing is on, the agent re-authors stale code and runs the new version instead of replaying a script that can only fail, and saves the new code as the test's stored version. Code a person wrote (a hand-edit in the portal) is never re-authored: it runs as written. There is no flag for this on `run`; the launch's `autoHeal` in `--output json` says what the server decided.
 
 ```bash
 # Trigger and return immediately
-testsprite test run test_xxxxxxxx --output json
+testsprite run "$TEST_ID" --output json
 
 # Trigger against a run-time URL and wait for terminal status
-testsprite test run test_xxxxxxxx --target-url https://staging.example.com \
+testsprite run "$TEST_ID" --target-url https://staging.example.com \
   --wait --timeout 600 --output json
 
-# Dry-run prints a canned queued response (no network, no credentials)
-testsprite test run test_xxxxxxxx --dry-run --output json
+# Dry-run previews the project request without dispatch or tunnel writes
+testsprite run "$TEST_ID" --dry-run --output json
 
 # Batch run with JUnit XML for CI (sidecar; --output json unchanged)
-testsprite test run --all --project proj_xxxxxxxx --wait \
+testsprite run --project "$PROJECT_ID" --wait \
   --report junit --report-file ./results.xml --output json
 
 # Optional custom suite name (default: testsprite:<projectId>)
-testsprite test run --all --project proj_xxxxxxxx --wait \
+testsprite run --project "$PROJECT_ID" --wait \
   --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
 
 # GitHub-native CI output: ::error:: annotations + job-summary table + machine summary
-testsprite test run test_xxxxxxxx --wait --summary-file ./summary.json --output json
+testsprite run "$TEST_ID" --wait --summary-file ./summary.json --output json
 ```
 
-Batch `--report` flags apply only to `test run --wait` with `--all` or several ids. `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name.
+Use `--report` with `run --wait` for a project, several test IDs, or a saved test list. `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name.
 
-**GitHub-native CI output** (contributed in [#264](https://github.com/TestSprite/testsprite-cli/pull/264)): when `GITHUB_ACTIONS=true`, any `test run --wait` (single test or `--all`), any batch `test run --wait`, and `testlist run --wait` additionally emit one workflow-command line per non-passed run (annotating the PR checks tab — `::error::` for a dispatched run that failed or timed out, `::warning::` for a test that never dispatched) and append a Markdown results table to the job summary (`$GITHUB_STEP_SUMMARY`). Pass `--gh-output` to force the annotations outside Actions (previewable locally), and `--summary-file <path>` to also write the reduced machine summary JSON (`{total, passed, failed, skipped, timedOut, runs[]}`). Everything is written even when the command exits non-zero — including a batch where nothing dispatched at all (every test already in flight → exit 6, or every test rate-deferred → exit 7), which still surfaces its verdict in CI rather than failing silently. Every write is best-effort — a failed write never changes the exit code. Tests that never dispatched (rate-deferred, conflicted, not found) appear as non-passed rows counted under `skipped` — never under `failed`, so the artifact always agrees with the exit code — and a partial batch still cannot read as all-passed. Annotation and table content is escaped, so run-error text cannot inject workflow commands or break the table.
+If a wait is interrupted, results whose last observed status was `running` count toward `summary.running`. GitHub Actions omits error annotations for those rows. JUnit records them as skipped with the reason `Still running when the wait ended`. Actual failures keep their verdicts.
 
-**`--target-url` with `--all` (the CI deployment gate).** The flag applies to a batch too: `test run --all --project <id> --target-url https://pr-42.preview.example.com` runs every **frontend** test in the project against that URL — the shape a PR gate needs, where the URL is this PR's preview deployment and differs on every run. The project's configured environment is never modified; the URL is applied as a per-run override, exactly as on a single run. A **backend** test is unaffected (its base URL is baked into its generated code) and the CLI prints an advisory saying so. The reachability preflight runs once for the whole batch before anything is dispatched or billed; use `--skip-preflight` if the preview is still warming up. If the server does not echo the exact URL, the command exits **7** (`target-url-not-honored`) after attempting to cancel only the runs accepted in the unconfirmed dispatch. Runs confirmed by an earlier dispatch are reported as not awaited and remain running. Cancellation and refunds are best-effort; the CLI prints each refund status returned by the server. With `--wait`, this failure also writes the requested JUnit and machine summary files, GitHub annotations, and the job summary.
+**GitHub-native CI output** (contributed in [#264](https://github.com/TestSprite/testsprite-cli/pull/264)): when `GITHUB_ACTIONS=true`, `run <test-id> --wait`, project or named batches with `--wait`, and `run --testlist <list-id> --wait` additionally emit one workflow-command line per failed, timed-out or undispatched test (annotating the PR checks tab — `::error::` for a dispatched test that failed or timed out, `::warning::` for a test that never dispatched) and append a Markdown results table to the job summary (`$GITHUB_STEP_SUMMARY`). Pass `--gh-output` to force the annotations outside Actions (previewable locally), and `--summary-file <path>` to also write the reduced machine summary JSON (`{total, passed, failed, blocked?, cancelled?, errors?, skipped, timedOut, running?, results[]}`, one row per test with its `resultId` and `runId`). Everything is written even when the command exits non-zero — including a batch where nothing dispatched at all (every test already in flight → exit 6, or every test rate-deferred → exit 7), which still surfaces its verdict in CI rather than failing silently. Every write is best-effort — a failed write never changes the exit code. Tests that never dispatched (rate-deferred, conflicted, not found) appear as non-passed rows counted under `skipped` — never under `failed`, so the artifact always agrees with the exit code — and a partial batch still cannot read as all-passed. Annotation and table content is escaped, so run-error text cannot inject workflow commands or break the table.
 
-`--target-url` accepts public URLs and supported loopback URLs such as `http://localhost:3000`, `http://127.0.0.1:3000` and `http://[::1]:3000`. A loopback target on `test run` uses the same tunnel path as `--local <port>` with that host. Other private, unspecified, link-local and metadata addresses remain refused. Tunnels are frontend-only and need `run:tunnel`; a scope refusal names the missing scope (exit 3). Existing keys receive it on backend v0.18.0 or later unless deliberately narrowed.
+**Preview targets.** Use `--target-url` for a frontend preview. For backend tests, select the API's saved environment with `--env`. In a GitHub pull request, `ci run --env <name> --target-url <url>` can clone that environment at the preview address. Backend code that reads `VAR_{url}` uses the selected environment's URL. A hard-coded URL keeps its original destination. See [CI integration](#ci-integration-ci-init).
 
-**`--env <name>` — the origin and sign-in configuration.** Select a named environment, or omit it for the project default (see [`project env`](#testsprite-project-env-list--get--create--update--delete--set-default)). A saved loopback URL automatically opens a tunnel on frontend `test run` (one/many/`--all`), `test create --run`, `test create-batch --run` and `testlist run`. The stored URL is sent verbatim, so `localhost`, `127.0.0.1` and `[::1]` remain distinct origins. `--no-wait` disables automatic tunneling; drop it to run through a tunnel. If the environment list cannot be read, the CLI sends the previous request and renders the server's refusal. Backend tests keep their previous cloud behavior.
+`--target-url` accepts public URLs and supported loopback URLs such as `http://localhost:3000`, `http://127.0.0.1:3000` and `http://[::1]:3000`. A loopback target on `run` uses the same tunnel path as `--local <port>` with that host. Other private, unspecified, link-local and metadata addresses remain refused. Tunnels are frontend-only and need `run:tunnel`; a scope refusal names the missing scope (exit 3). Existing keys receive it on backend v0.18.0 or later unless deliberately narrowed.
 
-`--target-url` and `--local` can supply an ad-hoc origin while `--env` supplies its sign-in configuration and run attribution. When no saved origin matches and no `--env` is selected, a supporting backend clones the project default's sign-in configuration into a temporary environment. Explicit `--local` can use a public environment's sign-in configuration on a new backend; an older backend's refusal is rendered verbatim and the tunnel is closed. Unknown environment names remain validation errors with the available names. `--env` is also accepted by `--all` and several ids.
+**`--env <name>` — the origin and sign-in configuration.** Select a named environment, or omit it for the project default (see [`project env`](#testsprite-project-env-list--get--create--update--delete--set-default)). A saved loopback URL automatically opens a tunnel on frontend `run` (one/many/project selection) and `run --testlist <list-id>`. The stored URL is sent verbatim, so `localhost`, `127.0.0.1` and `[::1]` remain distinct origins. `--no-wait` disables automatic tunneling; drop it to run through a tunnel. If the environment list cannot be read, the CLI sends the previous request and renders the server's refusal. Backend tests keep their previous cloud behavior.
 
-**Reachability preflight (refuse before charge).** For a public `--target-url`, the CLI probes **before dispatching** (and before anything is billed): a DNS resolve plus a lightweight HTTP request, sharing an 8-second budget. A stalled DNS lookup produces an advisory when that budget expires; interruption stops waiting immediately without dispatching a run. Loopback tunnel targets use a TCP probe of the stored host and port instead. A confirmed-dead target — DNS `NXDOMAIN`, connection refused, or a `502`/`503`/`504` gateway error (the signature of a tunnel that has gone away) — is refused with a validation error (exit 5) instead of dispatching a run that can only fail against a URL nobody is serving. A resolved address that lands in private/loopback/link-local space is always refused (the hostname passed the literal check but actually points somewhere unreachable from the runner). A redirect to Vercel's login wall (`vercel.com/sso-api`, a preview behind Vercel Deployment Protection) is refused too (exit 5, `details.reason: 'target-protected'`), since every test would run against the login page: turn off Vercel Authentication for previews, or pass a Protection Bypass for Automation secret as `--target-url "<preview>?x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true"` (with `&` instead of `?` when the URL already has a query). Ambiguous signals — a timeout, a TLS error, an odd status — only produce a stderr warning and never block; behind a configured HTTP(S) proxy, a local DNS failure is also downgraded to a warning, since resolution really happens at the proxy. `--skip-preflight` (on `test run`, `test create`, and `test create-batch`) skips these probes; metadata reads needed to resolve an environment still occur. Note: for a backend test the probe is a heuristic (the test's own base URL is baked into its code) — reach for `--skip-preflight` if a refusal surprises you there.
+`--target-url` and `--local` can supply an ad-hoc origin while `--env` supplies its sign-in configuration and run attribution. When no saved origin matches and no `--env` is selected, a supporting backend clones the project default's sign-in configuration into a temporary environment. Explicit `--local` can use a public environment's sign-in configuration on a new backend; an older backend's refusal is rendered verbatim and the tunnel is closed. Unknown environment names remain validation errors with the available names. `--env` is accepted by project and named-test selection; saved lists use their pinned environment mappings.
 
-The `[advisory]` about `--target-url` on V3-routed accounts is now **response-driven**: the CLI reads the run's actual trigger response rather than guessing from account flags, so it fires only when the override genuinely did not take effect (newer backends apply `--target-url` to fresh frontend runs on V3; older ones ignore it and the advisory says so). The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
+**Reachability before launch.** The CLI checks a public target from the machine running the command. A confirmed DNS failure, refused connection, gateway error or redirect to a protected Vercel login can stop dispatch with exit 5. An inconclusive probe prints a warning. For a loopback target the CLI checks the local listener. Use `--skip-preflight` when the runner can reach a target that this machine cannot probe.
 
-**`--wait` exit-code precedence (shared across batch `test run` and `testlist run`).** When a fan-out poll ends with a mix of outcomes, the process exit code is resolved through one shared precedence table — batch-wide non-retriable first: auth (3) and client-too-old (14), then per-run non-retriable (12 insufficient credits, 13 feature-gated), then per-run errors (4/5/6), then transient (11 rate-limited, 10 unavailable), then timeout (7), then the generic failure (1). A per-member poll error now surfaces its real code instead of folding into 7/1. Batch conflicts are **reason-aware**: a `run_in_flight` conflict with a known `runId` is auto-resumed under `--wait` (the CLI polls the in-flight run to its verdict instead of exiting 6) — but only after the same check the single run makes: the in-flight run must be on the requested `--env` (or the project default) and, with `--target-url`, against that URL, or it stays a hard conflict rather than another environment's verdict reported as this batch's — and other causes — a view-only mirror project, an un-runnable/local environment, an unknown id, a billing refusal (`insufficient_credits` / `billing_hold`, carrying the server's message), a dispatch error — are named individually rather than reported as a blanket "already in flight". A batch where **nothing** dispatched, nothing was rate-deferred, and every conflict is `insufficient_credits` exits `12` (`INSUFFICIENT_CREDITS`, with the billing `nextAction`) — the same shape a single `test run` answers — instead of a generic conflict `6`; a newer backend answers that case with the 402 envelope directly and the CLI maps it identically. A batch refused **entirely** for a billing hold is answered by the current backend with the standard `403` `FEATURE_GATED` envelope (`details.reason: 'billing_hold'`, plus the hold `state`) — surfaced as `FEATURE_GATED`, exit `13`, with the server's `nextAction`, exactly like a single `test run`; only a mixed batch (some cases dispatched) carries per-case `billing_hold` conflicts, and an older backend that folds every case into such conflicts still exits `6` with the hold named in the message. Rate-deferred tests are retried on a time budget: retries continue until `--timeout` minus a reserved final poll window (60 s, or a third of the timeout for short timeouts), rather than a fixed attempt count.
+If a project launch receipt reports an unexpected target URL or environment, or a concurrency limit above the one requested, the CLI exits 7 (`UNSUPPORTED`). With `--output json`, read `error.details.field` on stderr (`targetUrl`, `environment`, `previewName` for a CI preview, or `maxConcurrency`). Use `error.details.runId` to inspect the execution before retrying.
+
+For a retry of the same command, pass the single key printed to stderr as `--idempotency-key`. A single-project launch uses this key unchanged. Multiple projects get deterministic project-specific suffixes, shortened with a digest when needed to stay within 256 characters. There are no chunk suffixes. Reuse the same key only with the same request body; changing a tunnel binding changes the body and can produce an idempotency mismatch. Inspect an unconfirmed launch before retrying.
+
+**When a wait fails**, inspect stdout for acknowledged executions and test outcomes, and stderr for the error code and recovery hint. A transient throttle can be retried up to the wait deadline. A standing rate limit exits 11. When a saved list leaves members undispatched, check their individual reasons and address them before launching again. [Exit codes](#exit-codes)
 
 #### Local frontend testing and tunnels
 
-A tunnel connects the cloud frontend agent to an app running on **this machine**. It supports the **Free plan**; ordinary run credits still apply: a V3 frontend `--local` run costs **0.5 credit**, like any frontend run. The API key needs `run:tunnel` in addition to the scopes for running tests. The CLI identifies a missing scope; a key deliberately narrowed without it needs a key that includes it.
+A tunnel connects the cloud frontend runner to an app running on your machine. Ordinary test credits apply. The API key needs `run:tunnel` as well as permission to run tests. Check the workspace balance with `testsprite usage`.
 
-**Transport security and bounded retry.** The control plane is WebSocket over TLS at `wss://control.tun.testsprite.com/ws`. The data plane carries both the tunnel secret and proxied traffic over TLS at `data.tun.testsprite.com:443`, with the certificate verified by Node's default trust store: its bundled Mozilla roots, plus certificates supplied through `NODE_EXTRA_CA_CERTS` and the system CAs when Node is started with `--use-system-ca`. Node 20 retains `NODE_EXTRA_CA_CERTS` when explicit roots are also configured. Certificate verification cannot be disabled, and the CLI never falls back from TLS to plaintext. On a network that re-signs TLS, export your organisation's root CA to a PEM file and set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` before running `testsprite`. Plaintext connects and TLS handshakes each have a 10-second timeout. The first failed attempt opens a **60-second** retry episode. A successful `TunnelHello` write does not establish the session: only the first inbound tunnel stream or a socket that remains open for 5 seconds after the hello ends the episode. The deadline remains armed across backoff and later attempts, destroys any in-flight socket when it expires, reports one terminal data-plane error, and stops the client. An owned `test run --local` run is then cancelled and refunded and the command exits **10**; `tunnel start` exits **10**. Intentional shutdown reports no data-plane error. When a self-hosted or older TestSprite server does not advertise a TLS endpoint, the CLI instead prints a one-time warning and uses the legacy plaintext data port **7400** under the same retry rules. `tunnel start` makes the selected mode visible as `transport: tls` or `transport: plaintext`.
+**Transport security and bounded retry.** The control plane is WebSocket over TLS at `wss://control.tun.testsprite.com/ws`. The data plane carries both the tunnel secret and proxied traffic over TLS at `data.tun.testsprite.com:443`, with the certificate verified by Node's default trust store: its bundled Mozilla roots, plus certificates supplied through `NODE_EXTRA_CA_CERTS` and the system CAs when Node is started with `--use-system-ca`. Node 20 retains `NODE_EXTRA_CA_CERTS` when explicit roots are also configured. Certificate verification cannot be disabled, and the CLI never falls back from TLS to plaintext. On a network that re-signs TLS, export your organisation's root CA to a PEM file and set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` before running `testsprite`. Plaintext connects and TLS handshakes each have a 10-second timeout. The first failed attempt opens a **60-second** retry episode. A successful `TunnelHello` write does not establish the session: only the first inbound tunnel stream or a socket that remains open for 5 seconds after the hello ends the episode. The deadline remains armed across backoff and later attempts, destroys any in-flight socket when it expires, reports one terminal data-plane error, and stops the client. An owned `run --local` run is then cancelled (the server attempts a refund) and the command exits **10**; `tunnel start` exits **10**. Intentional shutdown reports no data-plane error. When a self-hosted or older TestSprite server does not advertise a TLS endpoint, the CLI instead prints a one-time warning and uses the legacy plaintext data port **7400** under the same retry rules. `tunnel start` makes the selected mode visible as `transport: tls` or `transport: plaintext`.
 
 ```bash
 # A saved loopback environment opens a tunnel and waits automatically
-testsprite test run <test-id> --env local-dev --output json
+testsprite run "$TEST_ID" --env local-dev --output json
 # Or supply an ad-hoc loopback target
-testsprite test run <test-id> --target-url http://localhost:3000 --output json
+testsprite run "$TEST_ID" --target-url http://localhost:3000 --output json
 # Several frontend tests share one tunnel and run five at a time by default
-testsprite test run <id> <id> --local 3000 --max-concurrency 5 --output json
-testsprite test run --all --project <project-id> --local 3000 --output json
+testsprite run "$TEST_ID" "$SECOND_TEST_ID" --local 3000 --max-concurrency 5 --output json
+testsprite run --project "$PROJECT_ID" --local 3000 --output json
 # A different loopback listener, or a longer run
-testsprite test run <test-id> --env local-dev --timeout 1800
+testsprite run "$TEST_ID" --env local-dev --timeout 1800
 ```
 
 | Flag                          | Local-run behavior                                                                                                                                                                                                                                                                                                                                                                                      |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--local <port>`              | Frontend only; port 1–65535. Opens one tunnel for the invocation and implies `--wait`. Mutually exclusive with `--target-url` (exit 5).                                                                                                                                                                                                                                                                 |
-| `--max-concurrency <n>`       | With tunnel batches, at most 1–10 runs in flight; default **5**. The timeout applies to each run from its own trigger.                                                                                                                                                                                                                                                                                  |
+| `--max-concurrency <n>`       | With a tunnel, the server dispatch limit for each project execution: 1–15, default **5**. The command has one shared wait deadline; no client-side capacity loop splits the limit.                                                                                                                                                                                                                      |
 | `--local-host <host>`         | With `--local` only; `localhost`, `127.0.0.1`, or `::1`. Deprecated on project/environment writes. The shorthand defaults to the selected loopback environment's host, else the one host agreed by saved non-temporary loopback environments on that port, else `localhost`; unreadable lists retain `127.0.0.1`. Chooses the loopback name in the run's target URL; LAN/RFC1918 addresses are refused. |
 | `--tunnel-client <client-id>` | Borrows the non-secret client id from `tunnel start` for a loopback target or selected environment. Still implies waiting, but ownership stays with the separate tunnel process.                                                                                                                                                                                                                        |
 | `--timeout <seconds>`         | 1–3600; default **600** for ordinary waits, **1200** for tunnel runs, including adopted tunnels.                                                                                                                                                                                                                                                                                                        |
 | `--no-cancel-on-interrupt`    | For tunnel runs; opts out of automatic cancellation when an owned tunnel closes or a borrowed tunnel's owner disappears. The run can no longer reach the app and remains billable.                                                                                                                                                                                                                      |
 | `--skip-preflight`            | Skips the local port probe. Normally a dead port is refused before minting a tunnel or charging a run (exit 5). It does not bypass flag, scope, or backend preconditions.                                                                                                                                                                                                                               |
 
-**Concurrency.** Run several frontend tests with `test run <id> <id> … --local <port>` or all frontend tests in a project with `test run --all --project <id> --local <port>`. One invocation mints one binding and runs up to **5** tests concurrently by default (`--max-concurrency` accepts 1–10); `--all` reports backend tests as skipped. A user can have **5 live tunnel bindings**. The `tunnel_binding_limit` reason is exit 11 and is **not auto-retried**: stop an unused tunnel or reuse an existing one with `--tunnel-client` before retrying. Ctrl-C stops queuing, cancels unfinished runs on an owned tunnel by default, and prints one partial JSON object with `not-run` rows; tunnel loss also stops queuing and exits 10. The minted client id is printed before connecting so a failed connection still identifies the binding.
+**Concurrency.** Run several frontend tests with `run <id> <id> … --local <port>` or all frontend tests in a project with `run --project <id> --local <port>`. One invocation mints one binding and sends one launch request per project, with at most 5000 named IDs and no client chunking. `--max-concurrency` is the server limit for **each execution** (1–15, default **5**); it is not a shared budget divided across runs. `run --project <id> --local <port>` reports backend tests as skipped. A user can have **5 live tunnel bindings**. The `tunnel_binding_limit` reason is exit 11 and is **not auto-retried**: stop an unused tunnel or reuse an existing one with `--tunnel-client` before retrying. Ctrl-C cancels owned unfinished executions by default and prints one partial JSON object with acknowledged native references, cancellation receipts and unattempted or unconfirmed projects; tunnel loss also cancels owned work and exits 10. A backend that does not confirm the tunnel or an effective cap no greater than requested has its acknowledged owned executions cancelled, and the command exits 7. The minted client ID is printed before connecting so a failed connection still identifies the binding.
 
-**Login and execution.** Tunnels serve frontend tests. An explicit loopback target on a backend test fails client validation (exit 5); single backend tests keep their previous cloud path; tunnel batches skip only backend tests whose own selected environment is loopback, and include their IDs in `skipped`. Public-environment backend tests dispatch normally. The project environment's username/password are passed to the cloud agent, which logs in inline through the tunnel. OTP environments are refused **before charge** with exit 6 (`tunnel-otp-auth-unsupported`). V3 `--local` runs always use the agent path, never saved-code replay, and **do not overwrite the test's saved code**. Saved loopback environments also open tunnels for reruns. Rerun and test-list tunnel batches use one `--timeout` deadline, including capacity waits. Explicit public-environment sign-in against a local origin is announced once on stderr. Rerun/test-list responses must echo the tunnel client id; if an old server strips it, the CLI attempts to cancel what started and exits with a clear error.
+**Login and execution.** Tunnels serve frontend tests. An explicit loopback target on a backend test fails client validation (exit 5); single backend tests keep their previous cloud path; tunnel batches skip only backend tests whose own selected environment is loopback, and include their IDs in `skipped`. Public-environment backend tests dispatch normally. The project environment's username/password are passed to the cloud agent, which logs in inline through the tunnel. OTP environments are refused **before charge** with exit 6 (`tunnel-otp-auth-unsupported`). `--local` runs always use the agent path, never saved-code replay, and **do not overwrite the test's saved code**. Test-list tunnel launches use one `--timeout` deadline and have no client capacity waits. Distinct effective target URLs may form separate requests, each with the same requested server cap. Explicit public-environment sign-in against a local origin is announced once on stderr. Test-list responses must confirm the tunnel client ID and a positive integer effective cap no greater than requested; a missing or invalid confirmation causes owned executions to be cancelled and exits with a clear error.
 
-**Timeout, cancellation, and refunds.** When a single owned `--local` run stops waiting before a terminal result, the CLI cancels it by default and closes its tunnel. This includes `--timeout` (exit 7), Ctrl-C (exit 130), and non-terminal polling/tunnel failures. In a local batch, each test has its own timeout measured from its trigger: a timed-out run is cancelled on an owned tunnel, the other tests continue, and the tunnel closes after the batch settles. Cancellation can race completion or fail; read the reported outcome instead of assuming it succeeded. **A run cancelled before it finished is refunded.** Cancelling an already-finished run does not replace its result or refund it. After an owned local timeout, start a **new** run with `testsprite test run <test-id> --env <name> --timeout 1800`; `test wait` cannot restore the closed tunnel. `--no-cancel-on-interrupt` detaches instead, but does not keep an owned tunnel alive.
+**Timeout, cancellation, and refunds.** Local runs share one `--timeout` deadline across whole executions, including queued work and later integration results. There are no per-test timers, wave allowances or client-side concurrency shares. When an owned tunnel stops waiting before execution completion, the CLI cancels its unfinished owned executions by default and closes the tunnel. This includes deadline expiry (exit 7), Ctrl-C (exit 130), and non-terminal polling or tunnel failures. Cancellation can race completion or fail; read the reported outcome instead of assuming it succeeded. The server attempts settlement for cancelled results regardless of test type; each `refund` reports `refunded`, `not_charged` or `failed`, and a failed refund can be retried by cancelling the same run again. Finished verdicts are not replaced. After an owned local timeout, start a **new** run with `testsprite run <test-id> --env <name> --timeout 1800`; `run wait` cannot restore the closed tunnel. `--no-cancel-on-interrupt` detaches instead, but does not keep an owned tunnel alive.
 
-A borrowed `--tunnel-client` run is not cancelled on Ctrl-C/SIGTERM: the borrower detaches, never closes or deletes the adopted tunnel, and `test wait <run-id>` can resume polling while the owner keeps it alive. If liveness reports that the owner is gone while the run is non-terminal, the borrower cancels **its own run** exactly as an owned doomed run does. The message names the run id and the observed result (`cancelled`, `already finished`, or `skipped`), then points to the run read before a retry. A run cancelled before it finished is refunded. `--no-cancel-on-interrupt` skips the owner-gone cancel too, leaving the run executing and billable without a working tunnel.
+A borrowed `--tunnel-client` run is not cancelled on Ctrl-C/SIGTERM: the borrower detaches, never closes or deletes the adopted tunnel, and `run wait <run-id>` can resume polling while the owner keeps it alive. If liveness reports that the owner is gone while the run is non-terminal, the borrower cancels **its own run** exactly as an owned doomed run does. The message names the run id and the observed result (`cancelled`, `already finished`, or `skipped`), then points to the run read before a retry. For a frontend test cancelled before a terminal verdict the server attempts a refund; read the reported `refund`. `--no-cancel-on-interrupt` skips the owner-gone cancel too, leaving the run executing and billable without a working tunnel.
 
-**Retargeting a local case.** Cloud runs such as Portal Run and schedules cannot reach a loopback environment and are **free BLOCKED** with reason `tunnel-required`. A CLI frontend run opens a tunnel when the resolved saved environment is loopback. Select that environment with `--env <name>`, or explicitly retarget the case using `test run <test-id> --target-url https://staging.example.com`. For a project created with `project create --local`, also set its public project URL with `project update <id> --url https://…` to enable Portal runs.
+**Retargeting a local case.** Cloud runs such as Portal Run and schedules cannot reach a loopback environment and are **free BLOCKED** with reason `tunnel-required`. A CLI frontend run opens a tunnel when the resolved saved environment is loopback. Select that environment with `--env <name>`, or explicitly retarget the case using `run <test-id> --target-url https://staging.example.com`. For a project whose default environment is loopback, add a public environment and make it the default (`project env create <id> --name staging --url https://… --set-default`) to enable Portal runs.
 
 #### `testsprite tunnel start` / `list` / `status` / `stop`
 
-Keep a tunnel alive across runs by running its owner in a separate terminal:
+Start the tunnel in one terminal. In a second terminal, set `CLIENT_ID` to the ID printed by the first and `TEST_ID` to a saved frontend test. This example uses an app listening on port 5173.
 
 ```bash
 # Terminal A — no positional port; keep this process running
 testsprite tunnel start --ttl 3600
-# Terminal B — use the clientId printed by terminal A
-testsprite test run <test-id> --env local-dev --tunnel-client <client-uuid>
+```
+
+```bash
+# Terminal B — use the printed client ID and the port your frontend listens on
+testsprite run "$TEST_ID" --env local-dev --local 5173 --tunnel-client "$CLIENT_ID"
 testsprite tunnel list
-testsprite tunnel status <client-uuid>
-testsprite tunnel stop <client-uuid>
+testsprite tunnel status "$CLIENT_ID"
+testsprite tunnel stop "$CLIENT_ID"
+```
+
+To revoke **all** live bindings on the account, including those used by other terminals and CI jobs:
+
+```bash
 testsprite tunnel stop --all --confirm
 ```
 
@@ -923,162 +642,117 @@ Hit the tunnel limit? List your bindings with `testsprite tunnel list`, then sto
 
 A second `tunnel start` or process using the same credential takes over, and the first exits **10**. Dev servers can take a minute per page through the tunnel; for a heavy dev server, test a built server with `npm run build`, then the framework's preview/start command.
 
-| Exit | Meaning and next step                                                                                                                                                               |
-| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `3`  | Authentication/scope error; if `run:tunnel` is missing, mint a new API key.                                                                                                         |
-| `5`  | Validation: dead local port, invalid port/host/UUID, incompatible flags, or no runnable frontend tests in a local batch (unless `--allow-empty`).                                   |
-| `6`  | Precondition, including `tunnel-required`, `tunnel-offline`, or `tunnel-otp-auth-unsupported`; resolve the named condition before retrying.                                         |
-| `7`  | Wait timeout or unsupported operation, including `tunnel-unsupported-for-backend-test` and `local-origin-requires-v3`. An owned local timeout requires a new run, not reattachment. |
-| `10` | Unavailable: transport/service failure, tunnel lost, or the owner observed revocation/expiry.                                                                                       |
-| `11` | Rate limited, including `tunnel_binding_limit`; the binding-cap reason is not auto-retried.                                                                                         |
+| Exit | Meaning and next step                                                                                                                                |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `3`  | Authentication/scope error; if `run:tunnel` is missing, mint a new API key.                                                                          |
+| `5`  | Validation: dead local port, invalid port/host/UUID, incompatible flags, or no runnable frontend tests in a local batch (unless `--allow-empty`).    |
+| `6`  | Precondition, including `tunnel-required`, `tunnel-offline`, or `tunnel-otp-auth-unsupported`; resolve the named condition before retrying.          |
+| `7`  | Wait timeout or unsupported operation, including `tunnel-unsupported-for-backend-test`. An owned local timeout requires a new run, not reattachment. |
+| `10` | Unavailable: transport/service failure, tunnel lost, or the owner observed revocation/expiry.                                                        |
+| `11` | Rate limited, including `tunnel_binding_limit`; the binding-cap reason is not auto-retried.                                                          |
 
-#### `testsprite test rerun [test-id...]`
+#### `testsprite run wait <run-id...>`
 
-> **Deprecated.** Use `testsprite test run` — it takes the same flags, several ids and `--all --status`. `test rerun` keeps working unchanged and is removed in 0.17.0. See [Deprecations](#deprecations).
-
-Re-execute one or more tests as a **replay** — distinct from `test run`, which starts a fresh run. A frontend rerun uses the saved script (verbatim unless AI heal-on-drift engages); a backend rerun re-runs the named test together with its producer/teardown dependency closure. Frontend reruns request auto-heal by default; the server controls the default for fresh test runs. A rerun needs a saved run, and a backend rerun expands the dependency closure. A rerun is billed the same as a fresh run — 0.5 credits per FE rerun, 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free). Without `--wait`, prints the queued run(s) and exits 0; with `--wait`, polls to terminal with the same exit-code matrix as `test run --wait`.
-
-```bash
-# Frontend test — replay of the saved script
-testsprite test rerun test_xxxxxxxx --wait --output json
-
-# Backend test — reruns the dependency closure (producers + teardowns)
-testsprite test rerun test_be_xxxx --wait --output json
-
-# Backend test — just the named test, skip the closure
-testsprite test rerun test_be_xxxx --skip-dependencies --output json
-
-# Rerun every test in a project (batch)
-testsprite test rerun --all --project proj_xxxxxxxx --wait --max-concurrency 4 --output json
-
-# Batch rerun with JUnit XML for CI
-testsprite test rerun --all --project proj_xxxxxxxx --wait \
-  --report junit --report-file ./results.xml --output json
-
-# Optional custom suite name (default: testsprite:<projectId>)
-testsprite test rerun --all --project proj_xxxxxxxx --wait \
-  --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
-
-# Several specific tests
-testsprite test rerun test_aaaa test_bbbb --wait --output json
-
-# Replay against a named environment (its credentials / auto-auth); see `project env`
-testsprite test rerun test_xxxxxxxx --env staging --wait --output json
-```
-
-Batch `--report` flags apply only to batch `--wait` reruns (`--all` or multiple test ids). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. When `--project` is omitted, the CLI infers `projectId` from polled run rows for classname / default suite naming; if inference fails, pass `--project <id>` explicitly (required under `--dry-run`).
-
-Flags:
-
-- `--all` — rerun every test in the resolved project; requires `--project <id>`.
-- `--filter <substr>` — with `--all`, rerun only tests whose name contains this non-empty substring (case-insensitive); omit it to rerun every project test. An explicitly empty value fails with `VALIDATION_ERROR` / exit **5** before any request, including on single-test and `--dry-run` paths. Whitespace is preserved.
-- `--wait`, `--timeout <s>` — block until terminal; same exit matrix as `test run --wait`.
-- `--no-auto-heal` — ask for a verbatim replay instead of frontend AI heal-on-drift, which is on by default for frontend reruns. When healing engages, the agent re-authors the test and the new code replaces the stored version — a rerun asks for healing explicitly, so this includes code you wrote yourself; pass `--no-auto-heal` to replay it verbatim. Ignored for backend reruns. What a heal costs depends on which execution engine answers — on the current engine it is a full agent run, billed as the run with nothing extra; on legacy V2 accounts a verbatim-replay pass is free and only a heal engage costs credit. `testsprite usage` reports the figure that applies to your account. Unlike `test run --no-auto-heal`, a rerun gets no echo of the server's effective decision, so a dropped opt-out cannot be detected here — there is no advisory on this path.
-- `--skip-dependencies` — backend only: rerun just the named test without expanding the producer/teardown closure.
-- `--max-concurrency <n>` — with `--wait`, cap on in-flight polls during a batch rerun.
-- `--idempotency-key <key>` — auto-minted when omitted (the minted key is printed to stderr under `--output json`, `--verbose`, or `--debug`).
-- `--report junit --report-file <path>` — with batch `--wait`, write a JUnit XML sidecar after polling (atomic write). Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name. Requires `--wait`; not available on single-test reruns.
-- `--gh-output` / `--summary-file <path>` — with batch `--wait`: GitHub-native CI output, same behavior as on `test run` (see above) — `::error::` annotations for failed/timed-out runs, `::warning::` annotations for never-dispatched tests, a job-summary table under GitHub Actions, and the reduced machine summary JSON. Not available on single-test reruns.
-- `--allow-empty` — with `--all`: exit 0 when the resolved rerun set is empty (no tests match `--filter`/`--status`/`--skip-terminal`, or the project has none). Default is to fail with exit 5, since a rerun step that greens on zero dispatched runs is an unsafe CI gate.
-
-A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `deferred[]` for any test shed by the per-key run-rate limit; under `--wait`, a non-empty `deferred[]` exits 7 with a `nextAction` you can retry with a fresh idempotency key. A batch where **every** requested id lands in `notFound` (no replayable run) exits **4** — nothing was queued, so the run must not pass; a mixed batch surfaces its `notFound` ids as `skipped` rows in the CI summary without failing an otherwise-passing batch.
-
-#### `testsprite test flaky <test-id>`
-
-> **Deprecated.** No replacement: run `testsprite test run <test-id>` again to sample a test. `test flaky` keeps working unchanged and is removed in 0.17.0. See [Deprecations](#deprecations).
-
-Detect a **flaky** test by replaying it several times and reporting how often it passes. Each attempt is a rerun with auto-heal **off** (a strict verbatim replay), so healed drift can't disguise a nondeterministic pass/fail — this measures the replay stability of the saved script against the configured URL. Each replay is billed as a rerun, same as a fresh run: 0.5 credits for a frontend replay, 0.2 credits for a backend replay (legacy V2 accounts: FE rerun remains free) — so `--runs N` costs roughly N×0.5 credits for a frontend test. A one-line stderr advisory is printed before a backend replay.
+Wait for each execution's authoritative `run.status` to become `finished`,
+including integration results added after earlier results passed. A cancelled
+execution fails even with an empty or all-passed result list. Each read includes
+all result statuses. One shared `--timeout` (default 600 seconds, maximum 3600)
+bounds the wait. Each distinct run is read independently, without a polling
+concurrency flag; execution dispatch limits belong to `run` and `run --testlist <list-id>`.
 
 ```bash
-# Replay 10 times and print a stability score
-testsprite test flaky test_xxxxxxxx --runs 10
-
-# Fast "is it flaky at all?" — stop at the first non-passing attempt
-testsprite test flaky test_xxxxxxxx --runs 10 --until-fail
-
-# Machine-readable stability report for CI
-testsprite test flaky test_xxxxxxxx --runs 10 --output json
+testsprite run wait "$RUN_ID" "$SECOND_RUN_ID" --timeout 900 --output json
 ```
 
-Flags:
+JSON includes `runs[]` for execution receipts, top-level `results[]` for individual results and `summary` for counts. A timeout
+or interrupt preserves the last observed results. Resume an ordinary run with
+`run wait`; this cannot reopen a closed owned tunnel. Read detailed evidence
+with `testsprite result get <result-id>`.
 
-- `--runs <n>` — number of replays (1–10, default 5).
-- `--until-fail` — stop at the first attempt that does not pass.
-- `--timeout <s>` — per-attempt polling deadline (same semantics as `test wait`).
+Transient outages and throttling are retried within the shared deadline. A
+persistent outage exits 10 with its original server envelope; a transient
+throttle still pending at the deadline is timeout 7. Standing-condition 429
+errors retain exit 11. Auth, not-found, server and transport errors keep their
+normal classification. One final bounded read can observe a last-minute verdict
+within a two-second grace. Local resume/cancel advice is separate from server
+error messages and actions.
 
-`--output json` emits `{ testId, runs, passed, failed, stableRatio, verdict, failures: [{ attempt, runId, outcome, failureKind }] }`. Exit codes: **0** when every observed attempt passed (`stable`); **1** when any attempt did not pass (`flaky` or `failing`); **4** when the test has no replayable run (trigger `testsprite test run <id>` first); **5** on a validation error.
+#### `testsprite run cancel <run-id...>`
 
-#### `testsprite test wait <run-id...>`
-
-Block until one **or more** runs reach a terminal status. With a single `run-id` the behavior is unchanged: same exit-code matrix as `test run --wait`. With several ids, the runs are polled concurrently under one shared `--timeout` and the CLI prints a `{ results, summary }` envelope — the worst status wins the exit code — so every re-attach hint the CLI prints can be pasted back as one command. `--max-concurrency <n>` (1–100, default 10) caps concurrent polls. Used to resume polling after an ordinary timed-out `--wait`, or after detaching from an adopted tunnel whose owner is still running. For an owned tunnel timeout, start a new `test run <test-id> --env <name> --timeout 1800`; polling cannot restore its closed tunnel.
+Send one cancellation POST per unique execution, without first listing members.
+The server owns current and later membership, terminal races and refunds.
+An already finished or cancelled execution is an idempotent HTTP 200 result.
 
 ```bash
-testsprite test wait run_01hx3z9p8q4k2y7a --timeout 600 --output json
-testsprite test wait run_aaaa run_bbbb run_cccc --timeout 900 --output json
-testsprite test wait run_01hx3z9p8q4k2y7a --dry-run --output json
+testsprite run cancel "$RUN_ID" "$SECOND_RUN_ID" --output json
 ```
 
-With several ids, a per-member poll error (e.g. one id not found) is recorded as `error:<CODE>` in that run's row and folded into exit 7, rather than aborting the whole batch. Polling is handled automatically — the CLI uses server-driven long-poll where supported and exponential backoff with jitter otherwise, honoring `Retry-After`.
+JSON contains native cancellation responses in `runs[]`, with `runId`,
+`alreadyCancelled`, `alreadyFinished` and per-result status/refund rows. Summary
+arrays name executions; errors carry `runId`. A first signal retains responses
+so far, `interrupted` and `notAttempted` execution IDs, then exits 128 + signal.
+Per-result refunds can be `refunded`, `not_charged` or `failed`, for frontend and
+backend tests alike. A failed refund is visible and retryable by cancelling the
+same run again. Finished verdicts are not overwritten.
 
-A network outage does not end a wait. Once TestSprite has answered (the command's own trigger counts, so only `test wait` starts without it), a failed connection (DNS, refused, reset, or a gateway 408/502/504) or a 503 `UNAVAILABLE` poll is re-polled after 2s, 4s, 8s, then every 15s (with jitter, or after the server's `Retry-After`) until the `--timeout` deadline, because the run keeps executing server-side. A poll that gets no answer at all for its long-poll window plus 20 seconds (45 seconds for the usual 25-second window), as when a Wi-Fi switch, a VPN reconnect or a laptop sleep drops the connection without an error, is aborted and re-polled on a fresh connection the same way, instead of sitting silent for up to 300 seconds; a retry wait inside that poll (a 429's `Retry-After`) does not count as silence. This applies to every `--wait` (`test run`, `test rerun`, `test create --run`, `test create-batch --run`, `testlist run`, `test run --all`, `test wait`). If the deadline passes while TestSprite is still unreachable, the command exits **10** (`UNAVAILABLE`), and a single-run wait still prints `{runId, status}` on stdout with the `test wait` re-attach hint. `--verbose` prints each retry and the reconnection. A `test wait` whose first poll cannot reach the API, such as one against a mistyped `--endpoint-url`, still fails fast with exit 10. A 429 or 500 keeps its own retry budget.
-
-Apart from those outages, a `RATE_LIMITED` (429) poll is the one per-member error that is retried before it becomes an outcome: each member re-polls up to 3 times, sleeping the server's `Retry-After` (except a standing limit such as `tunnel_binding_limit`, which is not auto-retried). Each backoff is clamped to the shared `--timeout` deadline, and a backoff interrupted by Ctrl-C detaches normally; if the deadline is reached during one, that member reports a **timeout** (exit 7), not a rate limit.
-
-If the throttle outlasts the retry budget **and** nothing else went wrong — no timeouts, no failed runs, no other error codes, and no repeated run id in the argument list — the exit code is **11** (rate limited) rather than 7, because the correct next action is to back off before re-attaching, not to retry immediately. Any timeout or non-passed run in the same invocation keeps the usual 7 / 1.
-
-One caveat this does not fix: the HTTP layer's own 429 retries (up to 3, honoring `Retry-After`) are bounded by their own budget, not by `--timeout`, so a sustained throttle can still overshoot the deadline by roughly one retry chain before the command gives up. That is pre-existing behavior on every polling command, not something this retry loop introduced — the outer loop re-checks the deadline before each of its own attempts.
-
-#### `testsprite test cancel <run-id...>`
-
-Cancel one or more in-flight runs — the counterpart to Ctrl-C, which only **detaches** (the server-side run keeps executing and billing) for an ordinary run. An owned `--local` run is the exception: Ctrl-C already cancels it by default (its tunnel closes with the process, so there is nothing left to detach from — see `--no-cancel-on-interrupt` to opt out). A borrowed run also cancels itself if it observes that its tunnel owner disappeared, but an ordinary borrower Ctrl-C remains a detach. A run cancelled before it finished is refunded. Cancelling is idempotent: an already-cancelled run reports `alreadyCancelled` as an advisory, not an error; a run that already reached a terminal verdict is a conflict — the verdict is never overwritten, and no credits are refunded. With one id, prints the run card, and a failed request exits with its own code (an unknown id → 4, a run already terminal → 6). With several, prints a `{ cancelled, alreadyCancelled, conflicts, notFound, errors }` summary; exit codes with several ids: a rejected key on any id → 3, else a too-old CLI on any id → 14, as with a single id; else any unknown id → 4; else any other failed request → 1; else any conflict → 6; else 0.
-
-```bash
-testsprite test cancel run_01hx3z9p8q4k2y7a
-testsprite test cancel run_aaaa run_bbbb --output json
-testsprite test cancel run_01hx3z9p8q4k2y7a --dry-run --output json
-```
-
-#### `testsprite test artifact get <run-id>`
-
-Download the failure bundle for a specific `runId`. Same on-disk layout as `test failure get`, but addressed by `runId` instead of `testId`, so an agent can fetch the bundle for the exact run it just triggered — never a newer failure on the same test. Default `<dir>` is `./.testsprite/runs/<run-id>/`. The CLI enforces `meta.runId === <run-id>` as an integrity check; a mismatch exits 5 rather than silently writing the wrong bundle.
-
-```bash
-testsprite test artifact get run_01hx3z9p8q4k2y7a --output json
-testsprite test artifact get run_01hx3z9p8q4k2y7a --out ./.testsprite/runs/run_01hx3z9p8q4k2y7a
-testsprite test artifact get run_01hx3z9p8q4k2y7a --failed-only
-testsprite test artifact get run_01hx3z9p8q4k2y7a --dry-run --output json
-```
-
-Returns 404 (CLI exit 4) when the run passed (`details.reason: "no_failing_run"`), is still in flight (`run_not_ready`), was cancelled (`cancelled_no_artifacts`), or its test was deleted (`no_code`).
+Ordinary waits detach on Ctrl-C. An owned tunnel instead cancels each unfinished
+owned execution once and closes, unless cancellation was explicitly disabled.
+Borrowed tunnels stay open; joined results are never owned by the CLI.
 
 ### Test lists (`testlist`)
 
-A **test list** is a saved, named collection of tests — the CLI surface for the portal's `Tools → Test Lists`. A list can span multiple projects, and each project in it can be pinned to a specific environment (`--project-env <projectId>:<envName>`) so `testlist run` executes every case against the environment the list configured. **Test lists are V3-only**: a non-V3 account gets `UNSUPPORTED` (exit 7). `testId` on the wire is the logical test id (the same id `test list` / `test get` return); no translation is needed.
+A **test list** is a saved, named collection of tests — the CLI surface for the portal's `Tools → Test Lists`. A list can span multiple projects, and each project in it can be pinned to a specific environment (`--project-env <projectId>:<envName>`) so `run --testlist <list-id>` executes every case against the environment the list configured. `testId` on the wire is the logical test id (the same id `test list` / `test get` return); no translation is needed.
+
+Set `LIST_ID` from `testsprite testlist list` or the ID returned by `testlist create`. For two projects, choose `PROJECT_ID` and `SECOND_PROJECT_ID` from `testsprite project list` and substitute their saved environment names. To run a subset, choose two test IDs already in that list.
 
 ```bash
-# Read
 testsprite testlist list                                  # all lists visible to the key
-testsprite testlist list --output text                    # aligned table (ID / NAME / CASES / LAST_EXEC / UPDATED)
-testsprite testlist get <list-id>                         # the list with its cases + pass/fail stats
+testsprite testlist list --output text                    # aligned table (ID / NAME / CASES / LAST RUN / UPDATED)
+testsprite testlist get "$LIST_ID"                         # the list with its cases + pass/fail stats
 
 # Write (each mutation takes an auto-minted Idempotency-Key; pass --idempotency-key to control it)
 testsprite testlist create --name "Checkout smoke" \
-  --project-env proj_aaaa:staging --project-env proj_bbbb:prod
-testsprite testlist update <list-id> --name "Renamed"     # rename
-testsprite testlist update <list-id> --project-env proj_aaaa:prod   # replace the env mapping
-testsprite testlist update <list-id> --clear-project-env  # remove all env mappings (distinct from omitting the flag)
-testsprite testlist add <list-id> <test-id...>            # add tests
-testsprite testlist remove <list-id> <test-id...>         # remove tests
-testsprite testlist delete <list-id> --confirm            # destructive — requires --confirm
+  --project-env "${PROJECT_ID}:staging" --project-env "${SECOND_PROJECT_ID}:prod"
+testsprite testlist update "$LIST_ID" --name "Renamed"     # rename
+testsprite testlist update "$LIST_ID" --project-env "${PROJECT_ID}:prod"   # replace the env mapping
+testsprite testlist update "$LIST_ID" --clear-project-env  # remove all env mappings (distinct from omitting the flag)
+testsprite testlist add "$LIST_ID" "$TEST_ID" "$SECOND_TEST_ID"            # add tests
 
 # Run — dispatch the list's cases and return pollable run ids
-testsprite testlist run <list-id>                         # fire-and-return; prints accepted runIds, exit 0
-testsprite testlist run <list-id> --case <test-id> --case <test-id>   # run only a subset
-testsprite testlist run <list-id> --wait --timeout 600 --output json  # poll every run to a verdict
-testsprite testlist run <list-id> --wait --report junit --report-file ./results.xml
+testsprite run --testlist "$LIST_ID"                         # prints the launch receipt; results may arrive later
+testsprite run "$TEST_ID" "$SECOND_TEST_ID" --testlist "$LIST_ID"   # run only a subset
+testsprite run --testlist "$LIST_ID" --wait --timeout 600 --output json  # wait for each execution to finish
+testsprite run --testlist "$LIST_ID" --wait --report junit --report-file ./results.xml
 ```
 
-**`testlist run`** dispatches each case through its project's configured environment and returns a pollable `runId` per case (the same id `test wait` / `runs` accept). Without `--wait` it exits 0 once every case is accepted (a fire-and-return, like `test run` without `--wait`). With `--wait` it polls every run to terminal and the exit code reflects the batch: **0** all passed, **1** any failed, **4** a partial `--case` miss — some requested ids are not members of the list (checked after the poll, so a genuine failure or timeout on the matched subset is reported first; the missed ids are warned to stderr at dispatch and carried on `notFound` in the JSON), **6** nothing new was dispatched because every targeted case conflicted — causes are named individually (already in flight, view-only mirror project, un-runnable environment, unknown id, dispatch error), and this exits 6 on the non-`--wait` path too, **7** any run timed out (against `--timeout`, default 600 s) or was rate-deferred (also on the non-`--wait` path — a partial dispatch never passes CI silently). A per-member poll error surfaces its real exit code through the shared `--wait` precedence table (see `test run`). `--case <test-id>` (repeatable) runs a subset; an empty match (no accepted, no conflicts) returns a `reason` and exits 0. `--report junit --report-file <path>` writes a JUnit sidecar after polling (suite name defaults to `testsprite:testlist:<listId>`; override with `--report-suite-name`; each `<testcase>` is named by the test's title, falling back to the test id when there is no title; members that ran carry their run duration (`time="0"` when timing is unavailable, as for never-dispatched or timed-out members); every row keeps the test id as a `testId` attribute, and rows with a run also carry `runId`). Under `GITHUB_ACTIONS=true` (or `--gh-output` to force it locally) a `--wait` run also emits annotations (`::error::` for failed/timed-out members, `::warning::` for never-dispatched ones) + a job-summary table, and `--summary-file <path>` writes the reduced machine summary JSON (`{total, passed, failed, skipped, timedOut, runs[]}`); both require `--wait`, and non-dispatched members (conflicted, not-found) fold into the summary as `skipped` rows — visible, but never counted as `failed` — so a partial run cannot read as all-passed and the artifact cannot contradict the exit code.
+To remove specific cases from the list:
+
+```bash
+testsprite testlist remove "$LIST_ID" "$TEST_ID" "$SECOND_TEST_ID"
+```
+
+To delete the list and its schedules:
+
+```bash
+testsprite testlist delete "$LIST_ID" --confirm
+```
+
+List mode uses each project's pinned environment or its default. Update a pin with `testlist update --project-env`. The launch takes its selection from list membership and any positional test IDs. Launch overrides such as `--env`, `--local` and `--target-url` are unavailable here. Use named or project selection when you need these options.
+
+`runs[].runId` identifies each execution. `results[].resultId` identifies each individual outcome. A list can produce multiple executions. A saved loopback environment opens a tunnel and waits automatically. Otherwise add `--wait` for a verdict. List concurrency defaults to 10 (range 1–50), or 5 with a tunnel (1–10). The default wait is 600 seconds in either case.
+
+If only some positional IDs belong to the list, `notFound` contains the others and the command exits **4**. With `--wait`, it polls the matched tests first, so a failed run (**1**) or a timeout (**7**) takes precedence. With or without `--wait`, if every member conflicts, the command exits **6** (**12** for insufficient credits, **13** for a billing hold). Rate deferral can also cause exit **7** in either mode. An empty list can exit **0**.
+
+Use `--wait --summary-file <path>` for a machine summary, or `--wait --report junit --report-file <path>` for a JUnit report.
+
+When a list dispatches only some members, the text output names each refused
+member and its reason and shows how many did not dispatch. A CI job that
+requires every member to run can check the JSON summary with `jq`:
+
+```bash
+testsprite run --testlist "$LIST_ID" --wait --output json > run.json &&
+  jq -e '.summary.total > 0 and .summary.skipped == 0' run.json
+```
 
 Every mutation (`create`/`update`/`delete`/`add`/`remove`) is refused with a billing-hold envelope on a **paused** team workspace (matching the portal's read-only wall); `delete` also removes the list's schedules and their triggers, so it requires `--confirm`. All commands accept the global `--output json|text` and `--dry-run` (offline shape-accurate sample).
 
@@ -1086,30 +760,34 @@ Every mutation (`create`/`update`/`delete`/`add`/`remove`) is refused with a bil
 
 A **schedule** runs a project or a test list on a cron, unattended — the CLI surface for the portal's Monitoring view. Every firing is a full test run, billed like any other, so the CLI states how often a cron works out to **before** it sends the request. Schedules are **entitlement-gated**: a plan that does not include them gets `FEATURE_GATED` (exit 13), and an account or backend that does not serve schedules at all gets `UNSUPPORTED` (exit 7).
 
+Use a test-list ID or project ID for the target. Set `SCHEDULE_ID` from `testsprite schedule list` or the schedule creation output. For the environment update, use the ID of a project-target schedule as `PROJECT_SCHEDULE_ID`.
+
 ```bash
 # Read
 testsprite schedule list                       # table: ID / NAME / STATUS / TARGET / ENVIRONMENT / CRON / TZ / LAST RUN
 testsprite schedule list --columns id,name,cron --no-header   # pick + reorder columns for scripts
-testsprite schedule get <schedule-id>          # one schedule, one field per line
-testsprite schedule run list <schedule-id>     # past runs: RUN ID / STATUS / TOTAL / PASS / FAIL / BLOCK / STARTED
+testsprite schedule get "$SCHEDULE_ID"          # one schedule, one field per line
 
 # Create (each mutation sends an auto-minted Idempotency-Key; pass --idempotency-key to control it)
 testsprite schedule create --name "Nightly checkout" \
-  --target-type testList --target-id tl_aaaa \
+  --target-type testList --target-id "$LIST_ID" \
   --cron "0 3 * * *" --timezone America/New_York \
   --send-to oncall@example.com,qa@example.com
 testsprite schedule create --name "Staging nightly" \
-  --target-type project --target-id proj_aaaa --env staging --cron "0 3 * * *"
+  --target-type project --target-id "$PROJECT_ID" --env staging --cron "0 3 * * *"
 
 # Update, pause, resume
-testsprite schedule update <schedule-id> --name "Renamed"
-testsprite schedule update <project-schedule-id> --env staging
-testsprite schedule update <schedule-id> --cron "0 6 * * 1"   # re-states the new frequency first
-testsprite schedule update <schedule-id> --pause              # stop it firing, keep the schedule
-testsprite schedule update <schedule-id> --resume
+testsprite schedule update "$SCHEDULE_ID" --name "Renamed"
+testsprite schedule update "$PROJECT_SCHEDULE_ID" --env staging
+testsprite schedule update "$SCHEDULE_ID" --cron "0 6 * * 1"   # re-states the new frequency first
+testsprite schedule update "$SCHEDULE_ID" --pause              # stop it firing, keep the schedule
+testsprite schedule update "$SCHEDULE_ID" --resume
+```
 
-# Delete — removes the schedule AND its run history, and stops future triggers
-testsprite schedule delete <schedule-id> --confirm
+To permanently remove the schedule and its run history and stop future triggers:
+
+```bash
+testsprite schedule delete "$SCHEDULE_ID" --confirm
 ```
 
 **Target.** `--target-type project` runs the project's **entire live suite** on every tick — there is no way to schedule a subset of a project's tests, so use a test list for that. `--target-type testList` runs the list's cases, each through its project's configured environment (see [Test lists](#test-lists-testlist)). `--target-id` is the matching project id or test-list id, and a target that does not resolve is a `404` (exit 4). Deleting a test list also deletes its schedules.
@@ -1118,19 +796,20 @@ testsprite schedule delete <schedule-id> --confirm
 
 Text output derives `staging (pinned)`, `project default (inherits)` or `-` from the API response. The list's `ENVIRONMENT` column is appended after all existing columns; get/update append the environment detail line. JSON preserves exact `environment` and `environmentMode` fields, including `null` or omission. For explicit `--env`, the CLI first reads existing schedules: a project schedule with no environment mode proves the server is too old and returns `UNSUPPORTED` (exit 7) before a write. An empty or unreadable list is inconclusive, so response confirmation still applies. An unconfirmed create is best-effort deleted, reporting the exact created id and whether it was removed; an unconfirmed update reports the schedule id and other requested fields that may have been applied. Commands without `--env` add no capability read and retain their previous output when the server omits environment fields.
 
-**What a project tick dispatches.** The project's own type decides how its cases run: a **frontend** project's cases go through a shared rolling pool, so a nightly cannot open the whole suite's browser sessions against your site at once — the same cap a portal-triggered run gets; a **backend** project's cases are dispatched together as one fan-out — a scheduled tick does not currently order them producers-before-consumers the way `test run --all` does. Integration cases are not dispatched as targets: a full run re-assembles them from the units they compose once those have run, which is also why the per-run cost counts only the non-integration cases.
+**What a project tick dispatches.** The project's own type decides how its cases run: a **frontend** project's cases go through a shared rolling pool, so a nightly cannot open the whole suite's browser sessions against your site at once — the same cap a portal-triggered run gets; a **backend** project's cases are dispatched together as one fan-out — a scheduled tick does not currently order them producers-before-consumers the way `run --project <project-id>` does. Integration cases are not dispatched as targets: a full run re-assembles them from the units they compose once those have run, which is also why the per-run cost counts only the non-integration cases.
 
 **Cron.** `--cron` is a standard 5-field expression — `minute hour day-of-month month day-of-week` — where day-of-week is `0-7`, with both `0` and `7` meaning Sunday. Constrain day-of-month **or** day-of-week, not both. `--timezone` takes an IANA zone and defaults to `UTC`. `--start` (default: a few minutes from now) and `--end` (default: open-ended) take ISO 8601 instants.
 
 **The frequency is stated before the request, the cost as soon as the server prices it.** `create` — and `update --cron`, since retiming an existing schedule is the same order-of-magnitude mistake as creating one badly — print the frequency to stderr before sending, so a `*/5` typo is visible before it bills. The cost line follows the response, because the price comes from the API — except under `--dry-run`, which prints both offline against a canned figure:
 
 ```console
-$ testsprite schedule create --name Nightly --target-type project --target-id proj_aaaa \
+$ testsprite schedule create --name Nightly --target-type project --target-id "$PROJECT_ID" \
     --cron "0 3 * * *" --dry-run
-This schedule will run ~30 time(s)/month (daily at 03:00). Each run is a full test run. Check your balance with `testsprite usage`.
+This schedule will run ~30 time(s)/month (daily at 03:00). Each run is a full run. Check your balance with `testsprite usage`.
 [dry-run] sample response — not from the server
 Estimated cost: ~5 credits/run, ~152 credits/month, based on the target's current case count.
 id: sch_dryrun_2026
+environment: project default (inherits)
 ```
 
 Both lines also appear under `--dry-run`, so that is reproducible offline with no key exactly as shown — the id and the per-run figure are the canned dry-run sample; a real create prices the run from the API. Compare a mistyped `--cron "* * * * *"`, which reads `~43800 time(s)/month` and `~219000 credits/month` before anything is created.
@@ -1139,7 +818,7 @@ Outside `--dry-run` the cost line appears only when the API priced the run — n
 
 **Status: `ENABLED` / `PAUSED` / `AUTO_PAUSED`.** `PAUSED` is what `update --pause` produces. `AUTO_PAUSED` means the platform disabled the schedule itself after repeated failures — currently 10 consecutive finished runs in which no test passed — reported as its own status precisely so it is not read as someone having paused it, and `schedule get` adds an `autoPaused:` timestamp line. `update --resume` re-enables either, and clears that failure streak.
 
-**A tick with nothing to run reads as `failed` with a total of `0`.** Three things end a tick without dispatching anything: the target was deleted, it holds no live cases, or the previous tick is still running because the interval is shorter than a run takes. Each is recorded as a finished run — the history stays honest about the tick having happened — and `schedule run list` reports it as `failed` with `TOTAL 0`, deliberately: calling "nothing ran" a pass is the one answer that would let a dead schedule look healthy. So a `failed` row with `TOTAL 0` means nothing ran, not that tests failed. A tick skipped because the balance ran out records no row at all and resumes on its own once the balance recovers.
+**Past runs.** Inspect a schedule's execution history in the Portal. The former CLI history reader was removed without an alias; old invocations exit 5 as unknown commands.
 
 **`update` sends only the flags you passed.** With no field, no `--pause` and no `--resume` it exits 5 (`nothing to update`) rather than issuing an empty request; `--pause` together with `--resume` is refused (exit 5) rather than silently resolved to one of them. `--send-to` replaces the recipient list rather than adding to it.
 
@@ -1147,26 +826,57 @@ Outside `--dry-run` the cost line appears only when the API priced the run — n
 
 **Idempotency.** `create`, `update`, and `delete` each send an auto-minted `Idempotency-Key`, so a retried command cannot double-apply; `--idempotency-key <key>` sets it yourself (reuse the same key to retry safely). An auto-minted key is echoed to stderr under `--output json`, `--verbose`, or `--debug`.
 
-**Neither list is paginated.** `schedule list` and `schedule run list` return the full set — there is no cursor flag. Both take `--columns <keys>` and `--no-header` for scripting, and every subcommand accepts the global `--output json|text` and `--dry-run`.
+**`schedule list` is not paginated.** It returns the full set, with no cursor flag, and takes `--columns <keys>` and `--no-header` for scripting. Every subcommand accepts the global `--output json|text` and `--dry-run`.
 
 Exit codes on top of the [shared set](#exit-codes): **7** schedules are not available on this account, **13** not available on your plan (`create` also uses 13 when the plan limit is reached), **4** schedule — or, for `create`, the target — not found, **6** idempotency conflict. Every subcommand's `--help` embeds its own list.
 
 ### CI gate (`ci run`)
 
-`ci run` runs a project's tests and waits for the verdicts with CI defaults. In a GitHub Actions pull request it tests **that pull request's preview deployment**, the way a GitHub App run does:
+`ci run` runs a project's tests and waits for the verdicts with CI defaults. In a GitHub Actions pull request it tests **that pull request's preview deployment**. Set `PREVIEW_URL` to its deployed URL for the first example.
 
 ```bash
-testsprite ci run --project proj_xxxxxxxx --env staging --target-url "$PREVIEW_URL"
-testsprite ci run --project proj_xxxxxxxx --env staging                      # a fixed environment (nightly, shared dev)
-testsprite ci run --project proj_xxxxxxxx --filter checkout --fail-on-skipped
-testsprite ci run --project proj_xxxxxxxx --summary-file testsprite-summary.json
+testsprite ci run --project "$PROJECT_ID" --env staging --target-url "$PREVIEW_URL"
+testsprite ci run --project "$PROJECT_ID" --env staging                      # a fixed environment (nightly, shared dev)
+testsprite ci run --project "$PROJECT_ID" --env staging --wait-for-status "Vercel" --target-url-template "https://app-git-{branch-slug}-team.vercel.app"
+testsprite ci run --project "$PROJECT_ID" --filter checkout --fail-on-skipped
+testsprite ci run --project "$PROJECT_ID" --summary-file testsprite-summary.json
 ```
 
-`--project` defaults to `TESTSPRITE_PROJECT_ID`. All project tests are selected unless `--filter <substr>` narrows them (case-insensitive, non-empty substring); `--all` is optional. An explicitly empty `--filter` fails with `VALIDATION_ERROR` / exit **5** before any request, including with `--dry-run`; omit the flag to select every test. Whitespace is preserved. `--env <name>` names the environment whose sign-in the run uses; the name must be one of the project's environments (`testsprite project env list <id>`), and an unknown name is refused **before** anything dispatches or charges, even with `--allow-empty`. That check fails closed: an environment list that cannot be read is that error (a bad key exits **3**, a backend that is down **10**), never a run that goes on to dispatch unchecked; only a backend answering that the project has no environment surface (a V2 project, or an older backend without the route) leaves the name to the batch's own validation. `--target-url <url>` is a publicly reachable address to test, typically a pull request's preview deployment; `--skip-preflight` skips its reachability probe when the preview is still warming up. `ci run` refuses loopback targets, including a selected environment's stored loopback URL when no `--target-url` overrides it, with exit **5** and zero-valued step outputs. For a local app, use `testsprite test run --all --env <name> --wait` (see [`test run`](#testsprite-test-run-test-id)). Backend tests use the URL in their own code, not `--target-url`.
+`--project` defaults to `TESTSPRITE_PROJECT_ID`. All project tests are selected unless `--filter <substr>` narrows them (case-insensitive, non-empty substring); `--all` is optional. An explicitly empty `--filter` fails with `VALIDATION_ERROR` / exit **5** before any request, including with `--dry-run`; omit the flag to select every test. Whitespace is preserved. `--env <name>` names the environment whose sign-in the run uses; the name must be one of the project's environments (`testsprite project env list <id>`), and an unknown name is refused **before** anything dispatches or charges, even with `--allow-empty`. That check fails closed: an environment list that cannot be read is that error (a bad key exits **3**, a backend that is down **10**), never a run that goes on to dispatch unchecked; only a backend answering that the project has no environment surface (an older project, or an older backend without the route) leaves the name to the batch's own validation. `--target-url <url>` is a publicly reachable address to test, typically a pull request's preview deployment; `--skip-preflight` skips its reachability probe when the preview is still warming up. `ci run` refuses loopback targets, including a selected environment's stored loopback URL when no `--target-url` overrides it, with exit **5** and zero-valued step outputs. For a local app, use `testsprite run --project <project-id> --env <name> --wait` (see [`run`](#testsprite-run)). `--target-url-template <pattern>` is the same address written as a pattern and filled on the runner from the pull request — `{pr}`, `{pr-number}`, `{branch}`, `{branch-slug}`, `{sha}`, `{short-sha}`, the GitHub App's own placeholders, so a pattern copied from a Portal trigger renders the same URL (`https://app-git-{branch-slug}-team.vercel.app`; `{branch-slug}` is the branch lowercased with runs of anything else collapsed to `-`, as Vercel and Cloudflare Pages spell it). It replaces `--target-url` (passing both is refused), and a pattern this run cannot fill — `{pr}` outside a pull request — is refused with exit **5** naming the placeholder, never guessed. A placeholder in the host part must render to letters, digits and `-` (what `{branch-slug}`, `{pr}` and the sha placeholders always do); a raw `{branch}` whose value would change the host (`attacker.example/x`) is refused the same way, so the environment's sign-in is never sent to an address the pattern did not name. `--wait-for-status <name>` holds the run until the platform's own check on the head commit succeeds; see "When the platform posts only a commit status" below. In a pull request the run happens in a `github-pr-<N>` clone of `--env` at `--target-url`, so backend tests whose code uses `VAR_{url}` follow the preview too; outside one they use the environment's own URL — `--env`'s, or the project default's (see [`--target-url` with a project selection](#testsprite-run)).
 
-**One execution.** Every selected test is seeded into one execution and the server paces dispatch under the project's execution settings, exactly as for a GitHub App run — a CI run is one row in the Portal, never a first batch plus a rate-deferred retry. A backend that cannot honor this is refused with exit **7** (`admission-not-honored`) after the outputs are published; the batch is never silently cut to the per-key budget.
+**One execution per project gate.** The CLI submits the selected cases in one request. The server handles dispatch and later integration work. If the launch receipt does not confirm the requested settings, use the same [error fields as `run`](#testsprite-run) to inspect the execution. If `--wait-for-status` times out before launch, `error.details.reason` is `preview-status-timeout`.
 
-**In a pull request.** Under GitHub Actions, `ci run` reads the pull request from the job: a `pull_request` event names it, and a `deployment_status` event (the platform-deploys-every-PR shape) only names the commit, so the PR is looked up with the job's `GITHUB_TOKEN` (`pull-requests: read`). With `--env X --target-url U`, the run then happens in a temporary clone of X pointed at U, named `github-pr-<N>` — the GitHub App's own mechanism, so the Portal shows `github-pr-<N>` as the run's environment, links the run back to the pull request ("View on Github"), and releases the environment when the run finishes. X must sign in with a username and password or not at all: a recorded (SSO) session cannot be cloned and is refused before anything is charged. A draft pull request, or a deployment that belongs to no open pull request, is skipped with a `::notice::` and exit **0** — there is nothing to gate; the step outputs are still written, as zeros, so a later step reading them gets a number. Outside a pull request (a push, a schedule, a shell), `--env X --target-url U` keeps `test run`'s semantics: X's sign-in against U, recorded under X.
+**In a pull request.** Under GitHub Actions, `ci run` reads the pull request from the job: a `pull_request` event names it, and a `deployment_status` event (the platform-deploys-every-PR shape) only names the commit, so the PR is looked up with the job's `GITHUB_TOKEN` (`pull-requests: read`). With `--env X --target-url U`, the run then happens in a temporary clone of X pointed at U, named `github-pr-<N>` — the GitHub App's own mechanism, so the Portal shows `github-pr-<N>` as the run's environment, links the run back to the pull request ("View on Github"), and releases the environment when the run finishes. X must sign in with a username and password or not at all: a recorded (SSO) session cannot be cloned and is refused before anything is charged. A draft pull request, or a deployment that belongs to no open pull request, is skipped with a `::notice::` and exit **0** — there is nothing to gate; the step outputs are still written, as zeros, so a later step reading them gets a number. Outside a pull request (a push, a schedule, a shell), `--env X --target-url U` keeps `run`'s semantics: X's sign-in against U, recorded under X.
+
+**When the platform posts only a commit status (shape C).** Some platforms create no GitHub deployment for a pull request — Vercel projects with the "deployment_status Events" toggle off, builds skipped by an Ignored Build Step, Cloudflare Pages — and leave only a commit status or check run on the head commit (`Vercel`, `netlify/<site>/deploy-preview`, `Cloudflare Pages`), whose link points at the platform's dashboard, not the site. A `pull_request` workflow then starts at the same moment the build does and has no event carrying the URL. `--wait-for-status <name>` polls both of GitHub's APIs for that name — `GET …/commits/{sha}/status` (`statuses[].context`) and `GET …/commits/{sha}/check-runs` (`check_runs[].name`), matched exactly, so which one the platform writes does not matter — backing off 5s → 30s for up to `--status-timeout` (default 900s; its own budget, not `--timeout`'s), with `GITHUB_TOKEN` (`statuses: read`, `checks: read`). Success → the run goes on; a failed, errored, skipped or cancelled check, or a success whose description says Ignored / Canceled / Skipped (Vercel's Ignored Build Step) → a `::notice::`, a one-line job summary ("no preview for this commit — tests not run"), zero step outputs and exit **0** — nothing was tested and nothing is read as green; still pending at the deadline → exit **7**, listing every status and check name seen on the commit so a misspelled name is obvious. `ci run` never falls back to the environment's URL or production. The name is whatever the pull request shows (`gh api repos/{o}/{r}/commits/{sha}/status --jq '.statuses[].context'`, `…/check-runs --jq '.check_runs[].name'`).
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+jobs:
+  testsprite:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft && github.actor != 'dependabot[bot]'
+    permissions: { contents: read, pull-requests: read, statuses: read, checks: read }
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: npm install -g @testsprite/testsprite-cli
+      - run: >-
+          testsprite ci run --env default
+          --wait-for-status "Vercel"
+          --target-url-template "$PREVIEW_URL_TEMPLATE"
+        env:
+          TESTSPRITE_PROJECT_ID: ${{ vars.TESTSPRITE_PROJECT_ID }}
+          TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PREVIEW_URL_TEMPLATE: ${{ vars.PREVIEW_URL_TEMPLATE }}
+```
+
+Set the repository variable `TESTSPRITE_PROJECT_ID` to the project ID and the secret `TESTSPRITE_API_KEY` to its workspace key. For the status-based workflow, also set `PREVIEW_URL_TEMPLATE` to your platform's URL pattern (for example, `https://app-git-{branch-slug}-team.vercel.app`) and replace `Vercel` with the check name your platform posts.
 
 **`ci run` does not filter deployments — the workflow does.** A `deployment_status` event fires for every state of every deployment (`pending`, `failure`, `success`, …) and for every environment (preview and production alike). `ci run` reads only the deployment's commit; it never looks at `state` or `environment`. A hand-written workflow therefore needs the job's `if:` to select the deployments worth gating, or a failed deployment is gated against a URL that never came up and a production deploy is gated like a preview:
 
@@ -1174,23 +884,33 @@ testsprite ci run --project proj_xxxxxxxx --summary-file testsprite-summary.json
 on: deployment_status
 jobs:
   testsprite:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, pull-requests: read }
     if: >-
       github.event.deployment_status.state == 'success' &&
+      !github.event.deployment.production_environment &&
       github.event.deployment.environment != 'production'
     steps:
-      - run: testsprite ci run --env staging --target-url "${{ github.event.deployment_status.environment_url }}"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: npm install -g @testsprite/testsprite-cli
+      - run: testsprite ci run --env staging --target-url "$PREVIEW_URL"
         env:
+          TESTSPRITE_PROJECT_ID: ${{ vars.TESTSPRITE_PROJECT_ID }}
           TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
+          PREVIEW_URL: ${{ github.event.deployment_status.environment_url }}
 ```
 
 (Vercel marks its Production deployments with `production_environment: false`, so filter on the environment name, not on that flag.)
 
-Failed or blocked tests exit **1**; a polled run that times out exits **7**. Tests that never dispatched — conflicts, deferred tests, unsupported frontend tests, and assembled integration tests — share one `skipped` counter. They warn by default; `--fail-on-skipped` makes any skipped test fail the gate. Missing test ids always exit **4**. A batch where nothing dispatched exits **5**; `--allow-empty` accepts an empty selection (no tests, a filter that matched nothing, runs already in flight elsewhere) but never a batch the backend refused.
+Failed or blocked tests exit **1**; a test that times out exits **7**. Tests skipped at dispatch, including incompatible in-flight tests, contribute to `skipped`. Later integration results belong to the execution and are included in the wait. They warn by default; `--fail-on-skipped` makes any skipped test fail the gate. Missing test ids always exit **4**. A batch where nothing dispatched exits **5**; `--allow-empty` accepts an empty selection (no tests, a filter that matched nothing, runs already in flight elsewhere) but never a batch the backend refused.
 
-CI polls only runs accepted by this invocation. An already-running conflict is skipped even if its `currentRunId` is available: that run may target another deployment. `--timeout <seconds>` defaults to 600 (1–3600); `--max-concurrency <n>` limits simultaneous polls (1–100). Idempotency keys are auto-minted; pass `--idempotency-key <key>` to control them.
+CI waits on owned executions and may join only explicitly verified matching held results. Incompatible held work remains skipped because it may target another deployment. `--timeout <seconds>` defaults to 600 (1–3600); `--max-concurrency <n>` sets the server execution dispatch limit (1–100). Idempotency keys are auto-minted; pass `--idempotency-key <key>` to control them.
 
-The JSON envelope's `summary`, `--summary-file`, GitHub job summary, annotations, and step outputs all use the same `CiSummary`: `{total, passed, failed, skipped, timedOut, runs[]}`. On a backend that serves execution reports, `ci run` also fetches the **execution report** for the batch's execution — the same content the GitHub App posts as its PR comment (verdict headline, AI narrative, per-test rows with error details, suggested fix prompts and screenshots, evaluation notes) — polling until it is ready for up to `--execution-report-timeout <seconds>` (default 60). When it arrives, the job summary is that report's Markdown instead of the results table, `summary.executionReport` carries the structured report (in the JSON envelope and `--summary-file`), and two step outputs name the files it was written to under `$RUNNER_TEMP`: `execution-report-file` (JSON) and `execution-report-markdown-file` (Markdown) — so a later step can `jq` the fix prompts or post the Markdown as a PR comment with its own token. When the CLI's own counts disagree with the report's (a run it could not read or that timed out, a test refused before dispatch, a retry error — things the execution does not contain; a red run whose failures the report also shows agrees), the summary opens with a one-line **CI gate** warning stating the local counts and appends the rows the report cannot carry, so the summary never reads "all passed" under a red check. `--no-execution-report` keeps the job summary to the local results table and reads and writes nothing for the report. A run that timed out means the execution is not finished, so no report is read; otherwise the step can take up to `--timeout` plus `--execution-report-timeout`. Ctrl-C/SIGTERM while waiting for the report stops the wait: the finished batch's summary and outputs are still written with the local table, then the CLI exits with the signal's code (130/143). The two report files under `$RUNNER_TEMP` are written owner-only (`0600`). Screenshot URLs in the report are presigned public links. Note the audience: the job summary is readable by everyone who can read the repository (on a public repository, by anyone), whereas the App's PR comment only exists where the App is installed; the report's narrative, error details, fix prompts and screenshots are the same unredacted content in both places, so treat the summary as you would the PR comment. Without a report (an older backend, or not ready in time) the results table is written as before and nothing else changes. Under Actions, the job summary and annotations enable automatically; `--gh-output` forces them elsewhere. When `GITHUB_OUTPUT` is set, `total`, `passed`, `failed`, `skipped` and `timedOut` are appended as step outputs. Every output is written before the exit code is decided, refusals included.
+The JSON envelope's `summary` and `--summary-file` use the same `CiSummary`: `{total, passed, failed, blocked?, cancelled?, errors?, skipped, timedOut, running?, results[]}`, one row per test with its `resultId` and `runId`. Without a report, the job summary is a `Run <run-id>` line and a results table (`Test | Status | Result`). On a backend that serves execution reports, `ci run` also fetches the **execution report** for the batch's run — the same content the GitHub App posts as its PR comment (verdict headline, AI narrative, per-test rows with error details, suggested fix prompts and screenshots, evaluation notes) — polling until it is ready for up to `--execution-report-timeout <seconds>` (default 60). When it arrives, the job summary is that report's Markdown instead of the results table, `summary.executionReport` carries the structured report, its run as `runId` (in the JSON envelope and `--summary-file`), and two step outputs name the files it was written to under `$RUNNER_TEMP`: `execution-report-file` (JSON) and `execution-report-markdown-file` (Markdown) — so a later step can `jq` the fix prompts or post the Markdown as a PR comment with its own token. When the CLI's own counts disagree with the report's (a run it could not read or that timed out, a test refused before dispatch, a retry error — things the run does not contain; a red run whose failures the report also shows agrees), the summary opens with a one-line **CI gate** warning stating the local counts and appends the rows the report cannot carry, so the summary never reads "all passed" under a red check. `--no-execution-report` keeps the job summary to the local results table and reads and writes nothing for the report. A run that timed out is not finished, so no report is read; otherwise the step can take up to `--timeout` plus `--execution-report-timeout`. Ctrl-C/SIGTERM while waiting for the report stops the wait: the finished batch's summary and outputs are still written with the local table, then the CLI exits with the signal's code (130/143). The two report files under `$RUNNER_TEMP` are written owner-only (`0600`). Screenshot URLs in the report are presigned public links. Note the audience: the job summary is readable by everyone who can read the repository (on a public repository, by anyone), whereas the App's PR comment only exists where the App is installed; the report's narrative, error details, fix prompts and screenshots are the same unredacted content in both places, so treat the summary as you would the PR comment. Without a report (an older backend, or not ready in time) the results table is written as before and nothing else changes. Under Actions, the job summary and annotations enable automatically; `--gh-output` forces them elsewhere. When `GITHUB_OUTPUT` is set, the numeric step outputs include `total`, `passed`, `failed`, `blocked`, `failedOnly`, `skipped` and `timedOut`. For compatibility, the Actions `failed` step output still includes blocked and cancelled results, read errors and failed executions without a corresponding adverse result. The `timedOut` step output includes execution-only timeouts. `failedOnly` and JSON `summary.failed` count failed test verdicts. Use the process exit code for a CI gate that also handles execution failures. Every output is written before the exit code is decided for a run that dispatched, for a skipped gate (draft pull request, no pull request) and when the command can report a partial execution; an unknown `--env` or a whole-batch API refusal exits before any output is written.
 
 JUnit is opt-in: `--report junit --report-file results.xml` (optional `--report-suite-name`). It carries the same rows as the summary — every test that did not dispatch is a skipped `<testcase>` with its reason — so a partial batch can never read as a full one. Upload reports in a subsequent `if: always()` step. `--dry-run` previews dispatch without starting runs or writing result files (a credentialed dry run may read environment metadata). PR comments are not yet part of `ci run`.
 
@@ -1201,24 +921,25 @@ JUnit is opt-in: `--report junit --report-file results.xml` (optional `--report-
 ```bash
 # Scaffold — auto-detects your project if the key has exactly one
 testsprite ci init github
-testsprite ci init github --project proj_xxxxxxxx      # pin a specific project
+testsprite ci init github --project "$PROJECT_ID"      # pin a specific project
 testsprite ci init github --env staging                # sign in with this environment's settings
 testsprite ci init github --timeout 1800               # how long ci run waits for a verdict
 testsprite ci init github --dry-run                    # preview the file, write nothing
 testsprite ci init github --force                      # overwrite an existing workflow
 
-# Optionally set the repo secret in the same step (needs gh installed + authenticated)
-testsprite ci init github --set-secret --repo owner/name
+# Optional: set GITHUB_REPOSITORY to owner/name and authenticate gh to set the repo secret.
+testsprite ci init github --set-secret --repo "$GITHUB_REPOSITORY"
 ```
 
 **Replace the placeholder step.** The step marked `REPLACE ME` fails the job until you do. Pick the shape that matches how your PRs deploy:
 
 - **A — your platform deploys every PR** (for example the Vercel or Netlify git integration): change the trigger to `on: deployment_status`, delete the placeholder step, and keep the rest. A repository that deploys **several** projects gets one deployment per project for the same commit (Vercel names them `Preview – <project>`); pin the one to gate with `&& github.event.deployment.environment == 'Preview – <project>'` in the `if:`, or the gate tests whichever project's URL arrives. The run step reads the URL from `github.event.deployment_status.environment_url`, and `ci run` finds the pull request behind the deployment's commit with `GITHUB_TOKEN`; a deployment that belongs to no open pull request is skipped with a notice. The job only runs for successful, non-production deployments (it checks both `production_environment` and the environment name, because Vercel reports `production_environment: false` on its production deployments). This shape needs the repository to actually receive deployment events from your platform; confirm it with one real pull request.
 - **B — you deploy in the workflow**: keep `on: pull_request`, replace the placeholder's commands with your deploy, and end it with `echo "url=<preview address>" >> "$GITHUB_OUTPUT"`. Your platform token goes in its own repo secret.
+- **C — your platform posts only a commit status or check** (no deployment event: Vercel with `deployment_status` events turned off, Cloudflare Pages): keep `on: pull_request`, delete the placeholder step, and in the `ci run` step replace the `PREVIEW_URL` env and the `--target-url "$PREVIEW_URL"` line with `--wait-for-status "<the check's name on the PR>" --target-url-template "<pattern>"` (the two flags cannot be combined with `--target-url`), then add `statuses: read` and `checks: read` under `permissions:`. The pattern is the preview address with the per-PR part as a placeholder (`https://app-git-{branch-slug}-team.vercel.app`, `https://{branch-slug}.app.pages.dev`, `https://deploy-preview-{pr}--site.netlify.app`); copy it from the platform's comment on a recent pull request. See "When the platform posts only a commit status" under `ci run`.
 
 Concurrency groups include the workflow filename from `--path` so separate generated workflows do not cancel each other. The filename keeps its extension and URI-escapes special characters rather than discarding them; because GitHub compares group names case-insensitively, uppercase letters are escaped too, so `TestSprite.yml` and `testsprite.yml` stay separate. Regenerating the same file keeps its group; the PR number or deployment SHA still identifies runs within that workflow. Both examples below use `.github/workflows/testsprite.yml`.
 
-The two finished shapes, with the template's comments left out (the generated file carries them):
+The complete examples below read the project ID from the repository variable `TESTSPRITE_PROJECT_ID`. A workflow generated by `ci init` includes the selected project's ID directly.
 
 ```yaml
 # A — the platform deploys every pull request (Vercel / Netlify git integration)
@@ -1241,6 +962,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      TESTSPRITE_PROJECT_ID: ${{ vars.TESTSPRITE_PROJECT_ID }}
       TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
@@ -1255,7 +977,7 @@ jobs:
           PREVIEW_URL: ${{ github.event.deployment_status.environment_url }}
         run: >-
           testsprite ci run
-          --project "proj_xxxxxxxx"
+          --project "$TESTSPRITE_PROJECT_ID"
           --env "default"
           --target-url "$PREVIEW_URL"
           --fail-on-skipped
@@ -1291,6 +1013,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      TESTSPRITE_PROJECT_ID: ${{ vars.TESTSPRITE_PROJECT_ID }}
       TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
@@ -1314,7 +1037,7 @@ jobs:
           PREVIEW_URL: ${{ steps.preview.outputs.url || github.event.deployment_status.environment_url }}
         run: >-
           testsprite ci run
-          --project "proj_xxxxxxxx"
+          --project "$TESTSPRITE_PROJECT_ID"
           --env "default"
           --target-url "$PREVIEW_URL"
           --fail-on-skipped
@@ -1330,7 +1053,7 @@ jobs:
 
 The last step runs `testsprite ci run --project <id> --env <name> --target-url <preview>`. In a pull request, the run uses a temporary copy of that environment pointed at the preview (named `github-pr-<N>`, like GitHub App runs, and released when the run finishes), so the Portal shows which pull request it tested.
 
-What the generated workflow fixes in place: it installs `@testsprite/testsprite-cli@latest` (results are decided by the backend, which is not versioned with the CLI, so a pinned client would only freeze old behaviour); it requests `contents: read` and `pull-requests: read`; it skips fork pull requests (they run without repository secrets), Dependabot pull requests (Dependabot secrets are not Actions secrets) and draft pull requests (it runs again on `ready_for_review`); it passes `--fail-on-skipped`, so a test that never ran fails the gate instead of warning; under shape B a new push to the pull request cancels the previous job; under shape A the concurrency group is **per commit** (Vercel sets the deployment's `ref` to the commit SHA, so there is no branch to key on) and a new push does not cancel the previous commit's job — either way, cancelling only stops that job's CLI; the TestSprite run it started keeps executing and reports in the Portal, and the new push starts its own run. The group is declared on the job, so deployment events the `if:` drops (`pending`, `inactive`, another project's deployment of the same commit) never cancel a running gate; and it uploads `ci run`'s summary file even when the job fails.
+What the generated workflow fixes in place: it installs `@testsprite/testsprite-cli@latest`; it requests `contents: read` and `pull-requests: read`; it skips fork pull requests (they run without repository secrets), Dependabot pull requests (Dependabot secrets are not Actions secrets) and draft pull requests (it runs again on `ready_for_review`); it passes `--fail-on-skipped`, so a test that never ran fails the gate instead of warning; under shape B a new push to the pull request cancels the previous job; under shape A the concurrency group is **per commit** (Vercel sets the deployment's `ref` to the commit SHA, so there is no branch to key on) and a new push does not cancel the previous commit's job — either way, cancelling only stops that job's CLI; the TestSprite run it started keeps executing and reports in the Portal, and the new push starts its own run. The group is declared on the job, so deployment events the `if:` drops (`pending`, `inactive`, another project's deployment of the same commit) never cancel a running gate; and it uploads `ci run`'s summary file even when the job fails.
 
 > **Forks and shape A.** A `deployment_status` event runs the workflow file **at the deployed commit**, with the repository's secrets, and the event does not say whether that commit came from a fork. The `if:` can skip fork pull requests on `pull_request` events, not on deployments. If your hosting platform deploys pull requests from forks, turn that off on the platform (Vercel: fork protection / require authorization for fork deployments), or a fork's edit of the workflow runs with your `TESTSPRITE_API_KEY`.
 
@@ -1342,22 +1065,20 @@ The API key comes from a `TESTSPRITE_API_KEY` repo secret; `ci init` prints the 
 
 #### Checking that deployment events reach the repo
 
-A workflow triggered by deployments (`on: deployment_status`) only fires if the repo actually **receives** GitHub Deployment events — written by whatever deploys your app (Vercel's GitHub App writes them when the project is git-linked). When the platform is not linked, nothing is written and the gate stays silent, with no error anywhere. Read the history yourself:
+A workflow triggered by deployments (`on: deployment_status`) only fires if the repo actually **receives** GitHub Deployment events — written by whatever deploys your app (Vercel's GitHub App writes them when the project is git-linked). When the platform is not linked, nothing is written and the gate stays silent, with no error anywhere. Set `GITHUB_REPOSITORY` to the repository in `owner/name` form and read its deployment history with an authenticated GitHub CLI.
 
 ```bash
-gh api repos/OWNER/REPO/deployments --jq '.[] | "\(.environment) \(.ref[0:8]) \(.created_at)"'
+gh api "repos/$GITHUB_REPOSITORY/deployments" --jq '.[] | "\(.environment) \(.ref[0:8]) \(.created_at)"'
 ```
 
 Judge preview and production records separately — a PR gate keys on preview deployments, so production-only means "enable preview deploys on the platform". A newest preview months old is stale. If `gh` is missing or unauthenticated, that is "could not check", not "not linked". History is evidence, not configuration: no records can mean "linked but not deployed yet", and old records can mean "unlinked since" — the proof is one real pull request. To link a Vercel project, use the Vercel dashboard (project → Settings → Git) or Vercel's own CLI, `npx vercel link --project <name> --non-interactive` then `npx vercel git connect --non-interactive` (never `--yes`; `vercel link` writes `.env.local` and may edit `.gitignore`). Linking only affects future pushes, so push a commit on a branch afterwards and check for a new preview record. The `testsprite-ci` agent skill (`testsprite agent install`) walks a coding agent through exactly this.
 
-> `testsprite ci doctor` and `testsprite ci connect` (0.13.0) are **deprecated**: hidden from `--help`, still working with the same exit codes, and each run prints a one-line notice naming the commands above. They will be removed in a later release.
-
-**Self-hosted pipeline?** You don't need any of this — report each deploy to GitHub yourself and every trigger path works identically, because they all consume the same event:
+**Self-hosted pipeline?** You don't need any of this — report each deploy to GitHub with its commit SHA (`SHA`) and deployed URL (`PREVIEW_URL`). Authenticate the GitHub CLI with deployment write access to `GITHUB_REPOSITORY`.
 
 ```bash
 ID=$(printf '{"ref":"%s","environment":"preview","auto_merge":false,"required_contexts":[]}' "$SHA" \
-  | gh api repos/OWNER/REPO/deployments --input - --jq .id)
-gh api repos/OWNER/REPO/deployments/$ID/statuses -f state=success -f environment_url=$PREVIEW_URL
+  | gh api "repos/$GITHUB_REPOSITORY/deployments" --input - --jq .id)
+gh api "repos/$GITHUB_REPOSITORY/deployments/$ID/statuses" -f state=success -f environment_url="$PREVIEW_URL"
 ```
 
 `required_contexts: []` is not optional in practice: without it GitHub refuses to create the deployment with a `409 Conflict` whenever any commit status on that SHA is failing — which, on a PR whose checks are still red, is exactly when your pipeline is deploying a preview. The JSON-input form is used because `gh api -f` sends everything as a string, and an empty array has to stay an array.
@@ -1366,7 +1087,7 @@ gh api repos/OWNER/REPO/deployments/$ID/statuses -f state=success -f environment
 
 #### `testsprite usage` (alias: `testsprite credits`)
 
-Account pre-flight before a large batch: resolves the active key to its identity (`userId`, `keyId`, `env`) and surfaces the credit balance / plan fields when the backend supplies them. Useful right before a `test run --all` fan-out. For an org-scoped key, also prints the `orgs:` / `org binding:` lines described under [Authenticate](#1-authenticate).
+Account pre-flight before a large batch: resolves the active key to its identity (`userId`, `keyId`, `env`) and shows its organization wallet (plan, balance, seats, and workspace state) when the backend supplies it. Useful right before a `run --project <project-id>` fan-out. For an org-scoped key, also prints the `orgs:` / `org binding:` lines described under [Authenticate](#1-authenticate).
 
 ```bash
 testsprite usage --output json
@@ -1381,14 +1102,14 @@ One-shot environment diagnostic. Runs a fixed checklist — CLI version, Node.js
 ```bash
 testsprite doctor
 testsprite doctor --output json
-testsprite doctor && testsprite test run test_xxxxxxxx --wait
+testsprite doctor && testsprite run "$TEST_ID" --wait
 ```
 
 Every check reuses the same helpers the real commands use, so the report reflects exactly what a subsequent command would resolve. For an org-scoped key, the report also lists `Organizations` (account-wide membership list) and `Org binding` (this key's bound organization) checks.
 
 #### `testsprite auth remove`
 
-Delete the active profile's stored credentials on this machine (`--profile <name>` for another). The API key is not revoked, and `TESTSPRITE_API_KEY` still authenticates. `auth logout` is a deprecated alias.
+Delete the active profile's stored credentials on this machine (`--profile <name>` for another). The API key is not revoked, and `TESTSPRITE_API_KEY` still authenticates.
 
 #### `testsprite completion [bash|zsh|fish]`
 
@@ -1404,15 +1125,15 @@ Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one
 
 These apply to every command:
 
-| Flag                          | Purpose                                                                                            |
-| ----------------------------- | -------------------------------------------------------------------------------------------------- |
-| `--profile <name>`            | Pick a named profile (default: `default`)                                                          |
-| `--endpoint-url <url>`        | Override the API host                                                                              |
-| `--output json\|text`         | JSON is the stable automation contract; text is human-friendly                                     |
-| `--request-timeout <seconds>` | Per-request wall-clock timeout (default 120, range 1–600)                                          |
-| `--verbose`                   | Human-readable HTTP retry / backoff / polling messages to stderr                                   |
-| `--debug`                     | Method / URL / request-id / latency / retry decisions to stderr (the API key is never included)    |
-| `--dry-run`                   | Preview without writes or charges; configured `test run` may read metadata for its tunnel decision |
+| Flag                          | Purpose                                                                                         |
+| ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| `--profile <name>`            | Pick a named profile (default: `default`)                                                       |
+| `--endpoint-url <url>`        | Override the API host                                                                           |
+| `--output json\|text`         | JSON is the stable automation contract; text is human-friendly                                  |
+| `--request-timeout <seconds>` | Per-request wall-clock timeout (default 120, range 1–600)                                       |
+| `--verbose`                   | Human-readable HTTP retry / backoff / polling messages to stderr                                |
+| `--debug`                     | Method / URL / request-id / latency / retry decisions to stderr (the API key is never included) |
+| `--dry-run`                   | Preview without remote writes or charges; configured `run` may read tunnel metadata             |
 
 ### Secrets in output
 
@@ -1424,9 +1145,9 @@ method/body behavior and are limited to 20 hops.
 
 Any field named like `password`, `token`, `secret`, `apiKey` / `api_key`, `authorization`, `cookie`, or `credential(s)` — at any depth, inside arrays too — is replaced with `[REDACTED]` in an error envelope's `details` and in `--debug` request tracing, in both `--output json` and text. `--dry-run` previews never contain a secret in the first place: they show presence flags (such as `hasCredentials`) and field names, not credential values. This is a second, independent layer: the backend already redacts its own error envelopes, but the CLI redacts again on the way out. Ordinary fields that merely contain one of those words as a substring — a boolean presence flag like `hasCredentials`, a file path like `credentialsPath`, or a pagination cursor like `nextToken` — are left alone; only the credential-shaped field itself is blanked.
 
-**Success output is never redacted.** A command's result — generated test code, plans, backend-test fixtures — is the caller's own data and must round-trip byte-identical (`test code get --output json` piped through an edit into `test code put`, `test plan get` into `test plan put`): it prints exactly as the server stored it, even when it legitimately contains a literal `Authorization: Bearer …` header or a `password` key. Redaction only ever touches error envelopes and request traces, never a success payload.
+**Success output is never redacted by the CLI.** A command's result — plans, backend-test output and fixtures — is the caller's own data: it prints exactly as the server stored it, even when it legitimately contains a literal `Authorization: Bearer …` header or a `password` key. Redaction only ever touches error envelopes and request traces, never a success payload.
 
-`project env create/update` also reject conflicting credential flags before a `--dry-run` plan. For backward compatibility, `project create/update` keep `--password` precedence when `--password-file` is also given, with a one-line stderr warning; the ignored file is never read.
+`project env create/update` also reject conflicting credential flags before a `--dry-run` plan.
 
 ### Environment variables
 
@@ -1435,7 +1156,7 @@ Any field named like `password`, `token`, `secret`, `apiKey` / `api_key`, `autho
 | `TESTSPRITE_API_KEY`                       | API key - overrides the credentials file                                                                                                                                      |
 | `TESTSPRITE_API_URL`                       | API endpoint - overrides the credentials file                                                                                                                                 |
 | `TESTSPRITE_PROFILE`                       | Active profile (below `--profile`, above `default`)                                                                                                                           |
-| `TESTSPRITE_PROJECT_ID`                    | Default project for `test list`, `test create`, and `test run --all` when `--project` is omitted                                                                              |
+| `TESTSPRITE_PROJECT_ID`                    | Default project for `test list`, `run` without named IDs or a list, and the agent commands when `--project` is omitted                                                        |
 | `TESTSPRITE_REQUEST_TIMEOUT_MS`            | Per-request timeout in **milliseconds** (default `120000`, range `1000`-`600000`)                                                                                             |
 | `TESTSPRITE_NO_UPDATE_NOTIFIER`            | Any non-empty value disables the once-per-24h "new version available" notice                                                                                                  |
 | `NO_COLOR`                                 | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/))                                                                                       |
@@ -1451,7 +1172,7 @@ Authenticated runs send one best-effort "command outcome" event per invocation
 to TestSprite (`POST /api/cli/v1/telemetry`) so we can measure which commands
 run and diagnose failures. Each event carries only:
 
-- the command name (e.g. `test run`), the outcome (`success`/`error`),
+- the command name (e.g. `run`), the outcome (`success`/`error`),
   the exit code, a machine error **code** (e.g. `VALIDATION_ERROR`), and the
   duration;
 - context: CLI version, OS, Node version, output mode, CI-vs-interactive (`ci`),
@@ -1462,27 +1183,31 @@ run and diagnose failures. Each event carries only:
   `other`) and `repoHash` — the first 16 hex chars of a salted SHA-256 of
   `GITHUB_REPOSITORY`, so runs from one repository can be grouped without the
   repository name ever being sent;
-- for `test run --all`, `testlist run` and `test run <id> --wait`: outcome
+- for `run --project <project-id>`, `run --testlist <list-id>` and `run <id> --wait`: outcome
   **counts** only — `accepted`, `conflicts`, `deferred`, `skipped`, and the
   verdicts `passed` / `failed` / `blocked` / `timedOut` (disjoint; `failed`
   excludes blocked runs) — plus `conflictReason`, the most frequent reason a
   case did not dispatch (`in_flight`, `insufficient_credits`, `billing_hold`,
   `mcp_view_only`, `local_address`, `tunnel-required`, `error`);
-- `local=true` for an explicit `--local` invocation (including borrowed/refused runs and project creation) or an automatically opened tunnel; tunnel runs also record `localConcurrencyLimit` and `localPeakInFlight`, the chosen limit and maximum number of active tunnel runs;
+- `local=true` for an explicit `--local` invocation (including borrowed/refused runs and project creation) or an automatically opened tunnel; tunnel runs also record `localConcurrencyLimit`, the requested per-execution dispatch limit; no client-observed peak is recorded;
 - for `ci init`: `platform`, whether `--force` was passed, whether a workflow
   file already existed at the target path (`workflowExisted`), and whether the
   project came from `--project` or auto-detection (`projectResolved`);
 - for `ci run`: `ciRunOutcome` — what the gate did (`gated`; `skipped_draft` /
-  `skipped_no_pr` when there was nothing to gate; `refused_admission` /
+  `skipped_no_pr` / `skipped_no_preview` when there was nothing to gate — the last when
+  `--wait-for-status` learned the preview was never built; `timeout_preview` when it saw
+  nothing terminal in time; `refused_url_template` when `--target-url-template` could not
+  be filled; `refused_admission` /
   `refused_env` / `refused_preview_name` / `refused_loopback` / `refused_billing` /
   `refused_other` when it was refused before or at dispatch; `empty` when nothing was selected),
-  `executionId` — the server's UUID for the execution a gated run belongs to, so
-  the event can be joined to that execution's report (never a URL), and
+  the run's id (an internal event property, named `executionId`): the server's UUID for the
+  run a gated test belongs to, so the event can be joined to that run's execution report
+  (never a URL), and
   `reportReady` — whether the execution report reached the job summary or the
   local table was written instead.
 
 It **never** sends: your API key, target URLs, free-form flag or argument values, test or
-run ids (other than the `ci run` execution id above — the server's own UUID, which names nothing about you or your code), repository names, or error **messages**. The event is a fixed
+run ids (other than the `ci run` run id above — the server's own UUID, which names nothing about you or your code), repository names, or error **messages**. The event is a fixed
 allowlist; timeout seconds and the local concurrency limit are bounded numeric controls. It is bounded to ~1s and fully best-effort — it never delays beyond that,
 never changes a command's behavior or exit code, and is skipped entirely when no
 API key is configured, under `--dry-run`, or when the command is interrupted (Ctrl-C / SIGTERM / SIGHUP).
@@ -1517,46 +1242,41 @@ backend may also reject a too-old client outright with HTTP 426 - surfaced as
 
 API-key scopes gate the write and run surfaces:
 
-| Scope            | Required by                                                                      |
-| ---------------- | -------------------------------------------------------------------------------- |
-| `read:me`        | `auth status`, `usage`, `doctor` (connectivity check)                            |
-| `read:projects`  | `project list / get`                                                             |
-| `read:tests`     | every `test *` read command                                                      |
-| `write:tests`    | `test create / create-batch / update / delete / code put / plan put`             |
-| `write:projects` | `project create / update / delete / credential / auto-auth`                      |
-| `run:tests`      | `test run / wait / cancel / artifact get` (and the deprecated `rerun` / `flaky`) |
-| `run:tunnel`     | frontend runs that open a tunnel, `tunnel start / list / status / stop`          |
+| Scope            | Required by                                                             |
+| ---------------- | ----------------------------------------------------------------------- |
+| `read:me`        | `auth status`, `usage`, `doctor` (connectivity check)                   |
+| `read:projects`  | `project list / get`, `project env list / get`                          |
+| `read:tests`     | every `test *` read command, `result list / get`, `run wait`, `status`  |
+| `write:tests`    | the project's agent: `plan / reply / apply / reject / stop / discard`   |
+| `write:projects` | `project create / update / delete`, `project env` writes                |
+| `run:tests`      | `run` / `run cancel` (cancel also needs `read:tests`)                   |
+| `run:tunnel`     | frontend runs that open a tunnel, `tunnel start / list / status / stop` |
 
-New API keys include the full scope set. Backend v0.18.0 or later grants `run:tunnel` to existing keys unless deliberately narrowed; older backends may require a new key. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
+Schedules use `read:schedules` for list/get and `write:schedules` for changes. Check the active key and workspace with `testsprite auth status`. Backend v0.18.0 or later grants `run:tunnel` to existing keys unless deliberately narrowed; older backends may require a new key. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
 
 ## Output & scripting
 
-JSON is the stable, machine-readable contract; pipe it straight into `jq` or a coding agent:
+For a single project on a hosted environment, capture the launch receipt and resume the same execution. This example requires `jq` and a shell with `PROJECT_ID` set. Save the script in its own file so the final `exit` returns the verdict to your caller.
 
 ```bash
-# Grab the runId of a freshly triggered run
-RUN_ID=$(testsprite test run test_xxxxxxxx --output json | jq -r '.runId')
+#!/usr/bin/env bash
+set -eu
+receipt=$(testsprite run --project "$PROJECT_ID" --no-wait --output json)
+run_id=$(jq -er '.runs[0].runId' <<<"$receipt")
 
-# Wait on it and branch on the exit code
-testsprite test wait "$RUN_ID" --timeout 600 --output json || echo "run did not pass"
+wait_status=0
+testsprite run wait "$run_id" --timeout 600 --output json > wait.json || wait_status=$?
+if [ "$wait_status" -eq 1 ]; then
+  jq -r '.results[]? | select(.status == "failed" or .status == "blocked") | .resultId' wait.json |
+    while IFS= read -r result_id; do
+      testsprite result get "$result_id" --out ".testsprite/results/$result_id" ||
+        echo "Evidence incomplete for $result_id" >&2
+    done
+fi
+exit "$wait_status"
 ```
 
-### Deprecations
-
-A deprecated command still runs with its old behavior, exit codes and output. Each invocation prints one `[deprecated]` line to stderr (before argument validation, also under `--dry-run`), and a success JSON object on stdout gains a trailing `deprecations` array of `{ command, replacement, removedIn }`. The key is not added to `--summary-file`, JUnit sidecars or error envelopes, and text output keeps stdout clean. `test rerun` and `test flaky` are deprecated in 0.16 and removed in 0.17.0. They are hidden aliases: `test --help` no longer lists them, and `testsprite test rerun --help` still shows their own help. `replacement` is a template (`test run`), not a command to run as is: carry your ids and flags over.
-
-| Instead of                                    | Use                                                                                       |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `test rerun <id>`                             | `test run <id>`                                                                           |
-| `test rerun <id> --no-auto-heal`              | `test run <id> --no-auto-heal`                                                            |
-| `test rerun <id> <id> …`                      | `test run <id> <id> …`                                                                    |
-| `test rerun --all --project <p>` (`--filter`) | `test run --all --project <p>` (`--filter`)                                               |
-| `test rerun --all --status <list>`            | `test run --all --status <list>`, with only `passed\|failed\|blocked\|cancelled\|not_run` |
-| `test rerun --all --skip-terminal`            | `test run --all --status not_run`                                                         |
-| `test rerun <be-id> --skip-dependencies`      | `test run <be-id> --skip-dependencies`                                                    |
-| `test flaky <id> --runs N`                    | no replacement; run `test run <id>` again to sample a test                                |
-
-`test run` starts a fresh run, so it does not require a saved run the way a replay does, and it follows the server's auto-heal default unless you pass `--no-auto-heal`.
+A launch receipt can precede the first result. Read `results[]` after waiting. A cancelled execution or an execution-level failure can produce a nonzero exit even when no test row failed. Inspect `runFailures` when present. To list a test's previous outcomes, use `result list --test "$TEST_ID"`. Its `results[].testStatus` uses upper-case values such as `FAILED`. Reading a result succeeds even when that test failed.
 
 ## Continuous integration
 
@@ -1564,45 +1284,37 @@ Run TestSprite as a required check in any CI system: install the CLI, authentica
 
 ### GitHub Actions (fastest)
 
-Scaffold a PR gate that tests each pull request's preview deployment:
+Set `ENV_NAME` to a saved environment from `testsprite project env list "$PROJECT_ID"` and scaffold a PR gate for that project:
 
 ```bash
-testsprite ci init github --env <environment>
+testsprite ci init github --project "$PROJECT_ID" --env "$ENV_NAME"
 ```
 
 This writes `.github/workflows/testsprite.yml`, which installs the CLI and runs `testsprite ci run` against the pull request's preview. Replace its one placeholder step with where your preview URL comes from (your platform's deployment event, or a deploy step in the workflow). See [CI integration (`ci init`)](#ci-integration-ci-init) for both shapes, every flag and the repo-secret setup.
 
 ### Any CI (generic recipe)
 
-The CLI needs only two environment variables — no `~/.testsprite/credentials` file — so it drops into any runner. Store your key as a secret and export it:
+Configure `TESTSPRITE_API_KEY` as a masked CI secret and set `PROJECT_ID` to the project's ID. Add `TESTSPRITE_API_URL` only for a custom endpoint.
 
 ```bash
-# 1. Install the current CLI
-npm install -g @testsprite/testsprite-cli@latest
-
-# 2. Authenticate from the environment (a masked secret in your CI)
-export TESTSPRITE_API_KEY="…"                          # required
-export TESTSPRITE_API_URL="https://api.testsprite.com" # only for a non-prod endpoint
-
-# 3. Run every test in a project to a verdict — the exit code gates the job
-testsprite ci run --project proj_xxxxxxxx \
+npm install -g @testsprite/testsprite-cli
+testsprite ci run --project "$PROJECT_ID" \
   --summary-file testsprite-summary.json
 ```
 
-- **Waiting is automatic.** The command follows accepted runs to a terminal verdict (or `--timeout`, default 600 s). Skipped tests warn by default; add `--fail-on-skipped` for a strict gate.
+- **Waiting is automatic.** The command follows every accepted test to a terminal verdict (or `--timeout`, default 600 s). Skipped tests warn by default; add `--fail-on-skipped` for a strict gate.
 - **`--report junit --report-file <path>`** optionally writes a JUnit XML sidecar. Skipped tests appear as `<skipped>` testcases with their reasons; the unified summary includes them.
-- **`--summary-file <path>`** writes a compact machine summary (`{ total, passed, failed, skipped, timedOut, runs[] }`) you can read from any step — `failed` counts only dispatched runs that failed; tests that never dispatched (deferred / conflicted / not found / skipped) count under `skipped`. **`--gh-output`** additionally emits a job-summary table and annotations (`::error::` for failures/timeouts, `::warning::` for never-dispatched tests); it auto-enables under `GITHUB_ACTIONS=true`, so you rarely pass it by hand.
+- **`--summary-file <path>`** writes a compact machine summary (`{ total, passed, failed, blocked?, cancelled?, errors?, skipped, timedOut, results[] }`, each row with its `resultId` and `runId`) you can read from any step — `blocked` counts blocked tests separately when present; tests that never dispatched (deferred / conflicted / not found / skipped) count under `skipped`. **`--gh-output`** additionally emits a job-summary table and annotations (`::error::` for failures/timeouts, `::warning::` for never-dispatched tests); it auto-enables under `GITHUB_ACTIONS=true`, so you rarely pass it by hand.
+- If the wait ends while tests are still running, the summary includes a separate `running` count. The JUnit report marks those cases as skipped with an explanation, and GitHub Actions emits error annotations only for observed failures or timeouts.
 
 Archive any requested reports with a step that also runs after failure (`if: always()` in GitHub Actions).
 
-### Full frontend coverage: use a test list
+### Gate a curated test list
 
-> ⚠️ On a V2 project, `test run --all --project <id>` uses the backend-only batch engine, so frontend tests are skipped and reported under `skippedFrontend`; a batch `--target-url` request is unsupported (exit 7). On a V3 project, `--all` includes frontend and backend tests and `--target-url` applies to frontend tests. For a gate spanning several projects, group the tests into a **test list** and run that:
-
-`ci run` folds a V2 project's frontend skips into its one `skipped` count and warns about them; it never counts them as failures. For an explicitly curated set, including tests spanning several projects, use a **test list**:
+Use `ci run` for one project's tests. A saved test list lets you gate a selected set of cases across several projects and pin each project's environment.
 
 ```bash
-testsprite testlist run tl_xxxxxxxx --wait \
+testsprite run --testlist "$LIST_ID" --wait \
   --report junit --report-file testsprite-junit.xml
 ```
 
@@ -1614,10 +1326,10 @@ For `ci run`, the exit code **is** the gate:
 
 | Exit              | CI meaning                                                                                                                                                                                                                                 |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `0`               | accepted runs passed; skipped tests are allowed unless `--fail-on-skipped` is set (or an empty run was explicitly allowed)                                                                                                                 |
+| `0`               | accepted tests passed; skipped tests are allowed unless `--fail-on-skipped` is set (or an empty run was explicitly allowed)                                                                                                                |
 | `1`               | at least one test failed or was blocked, or `--fail-on-skipped` rejected skipped tests                                                                                                                                                     |
 | `4`               | a requested test id was not found                                                                                                                                                                                                          |
-| `7`               | a run timed out — raise `--timeout`                                                                                                                                                                                                        |
+| `7`               | The run or preview wait timed out, or the server could not confirm the requested settings. See [CI gate](#ci-gate-ci-run).                                                                                                                 |
 | `5`               | the invocation dispatched **zero** tests (empty project, or a `--filter` that matched nothing). This is deliberate — a gate that greens on zero tests is worse than no gate. Pass `--allow-empty` when an empty run is genuinely expected. |
 | `3` / `12` / `13` | auth / out-of-credits / paid-feature-gated — a config problem, not a test failure                                                                                                                                                          |
 
@@ -1642,23 +1354,6 @@ The full list is the [exit-code table](#exit-codes). On every path the same info
 | `14`                  | Client too old — the backend requires a newer CLI (HTTP 426 `CLIENT_TOO_OLD`); upgrade to proceed |
 | `129` / `130` / `143` | Interrupted by a signal (SIGHUP / SIGINT / SIGTERM) — `128 + signal number`                       |
 
-### Exit 7 on `test plan generate` — timeout or unsupported?
-
-Exit `7` is a shared bucket, and on this command it has three producers. The
-message text tells them apart:
-
-- **Wait budget elapsed** — `Timed out after <n>s waiting for plan generation on
-project <projectId>`, followed by the stage you paused in and how many are left.
-  Running the same command again picks up where it left off; raising `--timeout`
-  lets one run cover every stage. Under `--output json` the partial object on
-  stdout carries the `projectId` and `stagesRemaining` to resume with.
-- **Backend does not have these routes yet** — the message names an unsupported
-  operation rather than a timeout, and there is no partial object on stdout. Exit
-  7 here means _unsupported_, not _slow_.
-- **A single request exceeded `--request-timeout`** — the per-request wall clock
-  rather than the wait budget. Under a wait the CLI raises that window to cover
-  `--timeout`, so this should not fire first.
-
 ### Ambiguous org id (exit 6)
 
 For a membership-scoped API key, a testId can — pathologically — resolve to
@@ -1670,16 +1365,16 @@ information in `error.details.candidates`.
 
 ### Signals & pipes
 
-During an **ordinary or adopted-tunnel** `--wait`, SIGINT (Ctrl-C), SIGTERM, or SIGHUP gracefully detaches: the in-flight request aborts, stdout receives a partial run result, and stderr names the signal and offers `test wait <run-id>` / `test cancel <run-id>`. The run keeps executing and remains billable; an adopted tunnel stays with its owner. This is distinct from observing that owner disappear, which cancels the borrower's own run by default. Exit codes are `128 + signal` (130 / 143 / 129).
+During an **ordinary or adopted-tunnel** `--wait`, SIGINT (Ctrl-C), SIGTERM, or SIGHUP gracefully detaches: the in-flight request aborts, stdout receives a partial run result, and stderr names the signal and offers `run wait <run-id>` / `run cancel <run-id>`. The run keeps executing and remains billable; an adopted tunnel stays with its owner. This is distinct from observing that owner disappear, which cancels the borrower's own run by default. Exit codes are `128 + signal` (130 / 143 / 129).
 
-For an **owned `--local` run**, the first signal instead cancels the non-terminal run by default and closes the tunnel. The CLI reports the cancellation outcome; a run cancelled before it finished is refunded. `--no-cancel-on-interrupt` opts out of cancellation and detaches, but the owned tunnel still closes; the same flag also skips an adopted run's owner-gone cancellation. Use a new `test run <test-id> --env <name>` to verify again; `test wait` cannot reopen it. See [local ownership and timeout rules](#local-frontend-testing-and-tunnels).
+For an **owned `--local` run**, the first signal instead cancels the non-terminal run by default and closes the tunnel. The CLI reports the cancellation outcome. For a frontend test cancelled before a terminal verdict the server attempts a refund; read the reported `refund`. `--no-cancel-on-interrupt` opts out of cancellation and detaches, but the owned tunnel still closes; the same flag also skips an adopted run's owner-gone cancellation. Use a new `run <test-id> --env <name>` to verify again; `run wait` cannot reopen it. See [local ownership and timeout rules](#local-frontend-testing-and-tunnels).
 
-A second signal exits immediately unless a tunnel credential delete or run cancel is in flight; then the CLI waits up to 2 seconds for critical cleanup. A third signal always exits immediately. Outside a `--wait`, signals keep their immediate-exit behavior, except Ctrl-C on `tunnel start`, which is its normal exit 0. A closed stdout pipe (`EPIPE`, e.g. `testsprite test list | head`) exits 0 silently.
+A second signal exits immediately unless a tunnel credential delete or run cancel is in flight; then the CLI waits up to 2 seconds for critical cleanup. A third signal always exits immediately. Outside a `--wait`, signals keep their immediate-exit behavior, except Ctrl-C on `tunnel start`, which is its normal exit 0. Closing the stdout pipe early suppresses the broken-pipe message. Outside an active wait the CLI retains the command’s own exit code.
 
 ## Design principles
 
-1. **Resource-oriented.** Verbs (`list`, `get`) operate on resources (`project`, `test`, `run`).
+1. **Resource-oriented.** Verbs (`list`, `get`) operate on resources (`project`, `test`, `run`, `result`).
 2. **Scriptable.** Every command supports `--output json` for machine-readable output.
 3. **Stateless.** No local database; the TestSprite backend is the source of truth.
 4. **Composable.** Output is pipe-friendly and pairs well with `jq`.
-5. **Agent-safe.** Reads that span multiple entities share a `snapshotId` and refuse to stitch data from different runs or code versions.
+5. **Agent-safe.** A `resultId` names one test's part of one run, so a read never mixes in another run's result.

@@ -19,7 +19,7 @@ body:
     attributes:
       label: What happened?
       description: A clear and concise description of the bug, including what you expected to happen instead.
-      placeholder: When I run `testsprite test run ...`, I expected X but got Y.
+      placeholder: When I run `testsprite run ...`, I expected X but got Y.
     validations:
       required: true
   - type: textarea
@@ -29,7 +29,7 @@ body:
       description: The exact commands you ran, in order. Redact any API keys or private URLs.
       placeholder: |
         1. testsprite setup ...
-        2. testsprite test run <id> --wait
+        2. testsprite run <id> --wait
         3. ...
       render: shell
     validations:

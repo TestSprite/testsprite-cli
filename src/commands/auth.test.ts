@@ -412,10 +412,10 @@ describe('runConfigure', () => {
       code: 'VALIDATION_ERROR',
       exitCode: 5,
       message: expect.stringContaining(
-        'TESTSPRITE_API_KEY is not set in the environment. Set it and re-run with --from-env, or omit --from-env to enter the key interactively. Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+        'TESTSPRITE_API_KEY is not set in the environment. Set it and re-run with --from-env, or omit --from-env to enter the key interactively. Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey',
       ),
       nextAction:
-        'Set TESTSPRITE_API_KEY and re-run. Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+        'Set TESTSPRITE_API_KEY and re-run. Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey',
       details: { field: 'TESTSPRITE_API_KEY', reason: 'missing' },
     });
   });
@@ -537,7 +537,7 @@ describe('runConfigure', () => {
   it('prints the API-key settings URL to stderr before the secret prompt', async () => {
     const { capture, deps } = makeCapture();
     const hint =
-      'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey';
+      'Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey';
     const prompt = {
       secret: vi.fn(async () => {
         expect(capture.stderr).toContain(hint);
@@ -577,7 +577,7 @@ describe('runConfigure', () => {
     );
 
     expect(capture.stderr).toContain(
-      "Create or copy an API key on your TestSprite dashboard's API-keys page (/dashboard/settings/apikey).",
+      "Create or copy an API key on your TestSprite dashboard's API-keys page (/dashboard-v3/settings/apikey).",
     );
     expect(capture.stderr.join('\n')).not.toContain('www.testsprite.com');
   });
@@ -666,13 +666,13 @@ describe('runConfigure', () => {
     ).rejects.toMatchObject({
       exitCode: 5,
       message: expect.stringContaining(
-        'No API key provided. Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+        'No API key provided. Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey',
       ),
       nextAction:
-        'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+        'Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey',
     });
     expect(capture.stderr).toContain(
-      'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+      'Create or copy an API key at https://www.testsprite.com/dashboard-v3/settings/apikey',
     );
   });
 
@@ -1088,7 +1088,7 @@ describe('runConfigure', () => {
     expect(sentHeaders.some(h => h?.['x-cli-command'] === 'init')).toBe(true);
   });
 
-  it('omits X-CLI-Command when no commandTag (plain auth configure)', async () => {
+  it('omits X-CLI-Command when no commandTag', async () => {
     const { deps } = makeCapture();
     const sentHeaders: Array<Record<string, string> | undefined> = [];
     const capturingFetch = vi.fn(
@@ -1199,9 +1199,9 @@ describe('runWhoami', () => {
     expect(JSON.parse(capture.stdout.join('')).orgName).toBe('Acme');
   });
 
-  // Confirms `auth whoami` / `auth status` never sends X-CLI-Command — it must
+  // Confirms `auth status` never sends X-CLI-Command — it must
   // stay a plain, untagged /me call (only `runInit`'s configure-validate step
-  // and `test run --target-url`'s v3Enabled probe tag this header).
+  // tags this header).
   it('sends no X-CLI-Command header', async () => {
     writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { deps } = makeCapture();
@@ -1220,49 +1220,27 @@ describe('runWhoami', () => {
     expect(sentHeaders[0]?.['x-cli-command']).toBeUndefined();
   });
 
-  it('renders routing: v3 and the gap advisory when v3Enabled is true', async () => {
-    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-    await runWhoami(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
-    );
-    expect(capture.stdout.join('\n')).toContain('routing: v3');
-    expect(capture.stderr.join('\n')).toContain('[advisory]');
-    expect(capture.stderr.join('\n')).toContain('rerun');
-    expect(capture.stderr.join('\n')).not.toContain('--target-url');
-  });
+  // Every account is served by V3, so the CLI no longer reads `v3Enabled`:
+  // no `routing:` line, whatever the (still-sent) field says.
+  it.each([true, false, undefined])(
+    'renders no routing line (v3Enabled on the wire: %s)',
+    async v3Enabled => {
+      writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+      const { capture, deps } = makeCapture();
+      const me = new Response(JSON.stringify({ ...sampleMe, v3Enabled }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+      await runWhoami(
+        { profile: 'default', output: 'text', debug: false },
+        { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(me) },
+      );
+      expect(capture.stdout.join('\n')).not.toContain('routing:');
+      expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+    },
+  );
 
-  it('renders routing: v2 and NO advisory when v3Enabled is false', async () => {
-    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const meV2 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: false }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-    await runWhoami(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV2) },
-    );
-    expect(capture.stdout.join('\n')).toContain('routing: v2');
-    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
-  });
-
-  it('omits the routing line when the backend does not return v3Enabled', async () => {
-    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    await runWhoami(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meResponse()) },
-    );
-    expect(capture.stdout.join('\n')).not.toContain('routing:');
-  });
-
-  it('renders the org line when activeOrg is present on a V3-routed caller', async () => {
+  it('renders the org line when activeOrg is present', async () => {
     writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meOrg = new Response(
@@ -1355,14 +1333,10 @@ describe('runWhoami', () => {
     expect(capture.stdout.join('\n')).not.toContain('workspace:');
   });
 
-  it('omits the org line when activeOrg is present but the caller is not V3-routed', async () => {
-    // Wallet selection follows the authoritative routing bit, never field
-    // presence alone — a V2-routed caller's commands charge the legacy
-    // wallet, so no org context may be shown even if a backend regression
-    // ships activeOrg to them again.
+  it('renders the org line from activeOrg alone, whatever v3Enabled says', async () => {
     writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
-    const meOrgV2 = new Response(
+    const meOrg = new Response(
       JSON.stringify({
         ...sampleMe,
         v3Enabled: false,
@@ -1380,9 +1354,9 @@ describe('runWhoami', () => {
     );
     await runWhoami(
       { profile: 'default', output: 'text', debug: false },
-      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meOrgV2) },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meOrg) },
     );
-    expect(capture.stdout.join('\n')).not.toContain('org:    Acme QA');
+    expect(capture.stdout.join('\n')).toContain('org:    Acme QA (Standard, member)');
   });
 
   it('omits the org line when activeOrg is absent (older backends)', async () => {
@@ -1395,7 +1369,7 @@ describe('runWhoami', () => {
     expect(capture.stdout.join('\n')).not.toContain('org:');
   });
 
-  it('does not emit the advisory in JSON mode even when v3Enabled is true', async () => {
+  it('passes the /me body through in JSON mode with no advisory', async () => {
     writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
@@ -1407,7 +1381,8 @@ describe('runWhoami', () => {
       { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
     );
     expect(capture.stderr.join('\n')).not.toContain('[advisory]');
-    const parsed = JSON.parse(capture.stdout.join('')) as MeResponse;
+    // The wire field still rides through the JSON verbatim.
+    const parsed = JSON.parse(capture.stdout.join('')) as Record<string, unknown>;
     expect(parsed.v3Enabled).toBe(true);
   });
 
@@ -1804,16 +1779,9 @@ describe('createAuthCommand wiring', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes status/remove as primaries plus deprecated whoami/logout aliases', () => {
+  it('exposes status and remove', () => {
     const auth = createAuthCommand();
-    // `configure` is NOT here — it is a hidden, program-level alias for `setup`
-    // (attached in index.ts) so it can route through the setup flow.
-    expect(auth.commands.map(c => c.name()).sort()).toEqual([
-      'logout',
-      'remove',
-      'status',
-      'whoami',
-    ]);
+    expect(auth.commands.map(c => c.name()).sort()).toEqual(['remove', 'status']);
   });
 
   it('remove deletes the active profile and exits 0', async () => {
@@ -1824,39 +1792,6 @@ describe('createAuthCommand wiring', () => {
     auth.commands.forEach(c => c.exitOverride());
     await auth.parseAsync(['remove'], { from: 'user' });
     expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
-  });
-
-  it('deprecated `whoami` alias emits a deprecation notice pointing at `auth status`', async () => {
-    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const auth = createAuthCommand({
-      ...deps,
-      credentialsPath,
-      env: {},
-      fetchImpl: meOkFetch,
-    });
-    auth.exitOverride();
-    auth.commands.forEach(c => c.exitOverride());
-    await auth.parseAsync(['whoami'], { from: 'user' });
-    expect(capture.stderr.join('\n')).toContain('[deprecated]');
-    expect(capture.stderr.join('\n')).toContain('auth status');
-  });
-
-  it('whoami uses injected fetch and exits 0', async () => {
-    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
-    const { deps } = makeCapture();
-    const fetchImpl = vi.fn(
-      async () =>
-        new Response(JSON.stringify(sampleMe), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-    ) as unknown as typeof fetch;
-    const auth = createAuthCommand({ ...deps, credentialsPath, env: {}, fetchImpl });
-    auth.exitOverride();
-    auth.commands.forEach(c => c.exitOverride());
-    await auth.parseAsync(['whoami'], { from: 'user' });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it('L1802: `status` alias resolves to the whoami action', async () => {
@@ -1874,16 +1809,6 @@ describe('createAuthCommand wiring', () => {
     auth.commands.forEach(c => c.exitOverride());
     await auth.parseAsync(['status'], { from: 'user' });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
-  });
-
-  it('logout removes the profile', async () => {
-    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
-    const { deps } = makeCapture();
-    const auth = createAuthCommand({ ...deps, credentialsPath });
-    auth.exitOverride();
-    auth.commands.forEach(c => c.exitOverride());
-    await auth.parseAsync(['logout'], { from: 'user' });
-    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
   });
 });
 

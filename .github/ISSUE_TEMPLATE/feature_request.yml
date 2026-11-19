@@ -26,7 +26,7 @@ body:
     attributes:
       label: Proposed solution
       description: What command, flag, or behavior would solve it? Sketch the CLI surface if you can.
-      placeholder: e.g. `testsprite test run --watch` that re-runs on file changes.
+      placeholder: e.g. `testsprite run --watch` that re-runs on file changes.
     validations:
       required: true
   - type: textarea

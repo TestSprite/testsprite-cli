@@ -11,7 +11,7 @@ export function resolveCiRunFailure(
   /** The batch's `conflicts[]`, with their reasons, when the caller has them. */
   conflicts: readonly RunConflict[] = [],
 ): Error | null {
-  const missing = summary.runs.filter(row => row.status === 'not_found');
+  const missing = summary.results.filter(row => row.status === 'not_found');
   if (missing.length > 0) {
     return new CLIError(`Tests not found: ${missing.map(row => row.testId).join(', ')}`, 4);
   }

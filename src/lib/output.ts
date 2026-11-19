@@ -1,6 +1,6 @@
 import { localValidationError } from './errors.js';
-import type { DeprecationEntry } from './deprecate.js';
 import { redactDeep } from './redact.js';
+import { jsonForTerminal, terminalSafe, terminalSafeLine } from './terminal-text.js';
 
 export type OutputMode = 'json' | 'text';
 
@@ -63,48 +63,15 @@ export interface OutputStreams {
    */
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
-  /**
-   * Raw byte-oriented stdout writer. Each call writes its argument
-   * verbatim, no trailing newline. Use {@link Output.writeChunk} to
-   * stream content where preserving the exact byte stream matters —
-   * e.g. dumping presigned source code to stdout for `> file.ts`
-   * piping.
-   *
-   * Returning a `Promise` is the contract for honoring backpressure:
-   * the default implementation returns a promise that resolves when
-   * `process.stdout.write` returns `true` synchronously, or when the
-   * stream's `'drain'` event fires if the kernel buffer was full.
-   * Callers (e.g. the streaming loop in `streamPresignedBody`) MUST
-   * `await` `writeChunk` so the upstream reader pauses instead of
-   * silently piling chunks into V8's heap. Tests that ignore
-   * backpressure may pass a sync `(text) => void` impl — the
-   * `void | Promise<void>` return type is intentionally loose so
-   * trivial in-memory test sinks don't have to manufacture
-   * Promises.
-   */
-  rawStdout?: (text: string) => void | Promise<void>;
 }
 
 export class Output {
   private readonly mode: OutputMode;
   private readonly stdoutWrite: (line: string) => void;
   private readonly stderrWrite: (line: string) => void;
-  private readonly rawStdoutWrite: (text: string) => void | Promise<void>;
-  private readonly deprecations: readonly DeprecationEntry[] | undefined;
 
-  /**
-   * `options.deprecations` is appended as the LAST key of a JSON object
-   * payload from `print` (text mode, arrays and error envelopes are never
-   * touched), so a deprecated command's output stays the same document plus
-   * one trailing key.
-   */
-  constructor(
-    mode: OutputMode = 'text',
-    streams: OutputStreams = {},
-    options: { deprecations?: readonly DeprecationEntry[] } = {},
-  ) {
+  constructor(mode: OutputMode = 'text', streams: OutputStreams = {}) {
     this.mode = mode;
-    this.deprecations = options.deprecations?.length ? options.deprecations : undefined;
     this.stdoutWrite =
       streams.stdout ??
       (line => {
@@ -115,13 +82,11 @@ export class Output {
       (line => {
         console.error(line);
       });
-    this.rawStdoutWrite = streams.rawStdout ?? defaultRawStdout;
   }
 
   print(data: unknown, textRenderer?: (data: unknown) => string): void {
     // Success data is the caller's OWN content — generated test code, plans,
-    // backend-test fixtures — and must round-trip byte-identical (`test code
-    // get --output json` -> edit -> `test code put`), even when it
+    // backend-test fixtures — and JSON must round-trip it unchanged, even when it
     // legitimately contains a literal `Authorization: Bearer …` header or a
     // `password` fixture key. Never redacted here, in either mode. Secret
     // redaction (see `redact.ts`) applies only at error and request-trace
@@ -129,29 +94,12 @@ export class Output {
     // `index.ts`, and `--debug` tracing in `client-factory.ts` — never to a
     // success payload.
     if (this.mode === 'json' || !textRenderer) {
-      const withDeprecations =
-        this.mode === 'json' &&
-        this.deprecations &&
-        typeof data === 'object' &&
-        data !== null &&
-        !Array.isArray(data)
-          ? { ...data, deprecations: this.deprecations }
-          : data;
-      this.stdoutWrite(JSON.stringify(withDeprecations, null, 2));
+      this.stdoutWrite(jsonForTerminal(data, 2));
       return;
     }
-    this.stdoutWrite(textRenderer(data));
-  }
-
-  /**
-   * Write a chunk of bytes to stdout verbatim. Awaits any
-   * Promise the rawStdout writer returns so a slow downstream
-   * consumer pauses the upstream reader instead of buffering chunks
-   * in memory. See `OutputStreams.rawStdout` for the backpressure
-   * contract.
-   */
-  async writeChunk(text: string): Promise<void> {
-    await this.rawStdoutWrite(text);
+    // Every text renderer prints server values (titles, names, errors, URLs):
+    // on a terminal they carry no escape sequence or control character.
+    this.stdoutWrite(terminalSafe(textRenderer(data)));
   }
 
   /**
@@ -179,24 +127,11 @@ export class Output {
           details: redactDeep(input.details ?? {}),
         },
       };
-      this.stderrWrite(JSON.stringify(envelope, null, 2));
+      this.stderrWrite(jsonForTerminal(envelope, 2));
       return;
     }
-    this.stderrWrite(`Error: ${input.message}`);
+    // A message may embed a server value: on a terminal it prints on one line
+    // with no escape sequence. The JSON envelope above keeps it as it is.
+    this.stderrWrite(`Error: ${terminalSafeLine(input.message)}`);
   }
-}
-
-/**
- * Default rawStdout writer. Honors stdout backpressure: when
- * `process.stdout.write` returns `false` the OS buffer is full, so
- * resolve only when `'drain'` fires. Without this an upstream stream
- * reader keeps pulling chunks into memory — the documented streaming
- * guarantee for `test code get` would silently degrade into "buffered
- * download piped to a slow consumer."
- */
-function defaultRawStdout(text: string): void | Promise<void> {
-  if (process.stdout.write(text)) return;
-  return new Promise(resolve => {
-    process.stdout.once('drain', () => resolve());
-  });
 }

@@ -122,7 +122,7 @@ describe('classifyCliError', () => {
       error: {
         code: 'UNSUPPORTED',
         message: 'Timed out after 30s waiting for run run_abc.',
-        nextAction: 'Resume polling: testsprite test wait run_abc',
+        nextAction: 'Resume polling: testsprite run wait run_abc',
         requestId: 'local',
         details: { runId: 'run_abc', timeoutSeconds: 30 },
       },
@@ -235,7 +235,7 @@ describe('buildTelemetryEvent', () => {
   it('emits only allowlisted fields; never a url or message', () => {
     const event = buildTelemetryEvent(
       {
-        command: 'test run',
+        command: 'run',
         outcome: 'error',
         exitCode: 5,
         errorCode: 'VALIDATION_ERROR',
@@ -248,7 +248,7 @@ describe('buildTelemetryEvent', () => {
       false,
     );
     expect(event).toEqual({
-      command: 'test run',
+      command: 'run',
       outcome: 'error',
       exitCode: 5,
       errorCode: 'VALIDATION_ERROR',
@@ -283,7 +283,7 @@ describe('buildTelemetryEvent', () => {
   it('includes errorOrigin and timeoutSeconds when supplied', () => {
     const event = buildTelemetryEvent(
       {
-        command: 'test wait',
+        command: 'run wait',
         outcome: 'error',
         exitCode: 7,
         errorCode: 'UNSUPPORTED',
@@ -311,7 +311,7 @@ describe('buildTelemetryEvent', () => {
   it('a "server" errorOrigin is preserved verbatim (not coerced to client)', () => {
     const event = buildTelemetryEvent(
       {
-        command: 'test run',
+        command: 'run',
         outcome: 'error',
         exitCode: 7,
         errorCode: 'UNSUPPORTED',
@@ -326,7 +326,7 @@ describe('buildTelemetryEvent', () => {
 
   it('emits local: true for a --local invocation', () => {
     const event = buildTelemetryEvent(
-      { command: 'test run', outcome: 'success', exitCode: 0, durationMs: 1, local: true },
+      { command: 'run', outcome: 'success', exitCode: 0, durationMs: 1, local: true },
       {},
       false,
     );
@@ -335,7 +335,7 @@ describe('buildTelemetryEvent', () => {
 
   it('preserves an explicit local flag when the runtime sink reports no owned tunnel', () => {
     const event = buildTelemetryEvent(
-      { command: 'test run', outcome: 'error', exitCode: 5, durationMs: 1, local: true },
+      { command: 'run', outcome: 'error', exitCode: 5, durationMs: 1, local: true },
       {},
       false,
       { local: false },
@@ -346,7 +346,7 @@ describe('buildTelemetryEvent', () => {
   it('keeps timeout cancellation metadata when the runtime sink records an opened tunnel', () => {
     const event = buildTelemetryEvent(
       {
-        command: 'test run',
+        command: 'run',
         outcome: 'error',
         exitCode: 7,
         durationMs: 100,
@@ -380,7 +380,7 @@ describe('buildTelemetryEvent', () => {
 // ---------------------------------------------------------------------------
 
 describe('recordOutcome', () => {
-  const base = { command: 'test run', outcome: 'success' as const, exitCode: 0, durationMs: 42 };
+  const base = { command: 'run', outcome: 'success' as const, exitCode: 0, durationMs: 42 };
 
   it('POSTs the event to the beacon when authenticated', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(okResponse());
@@ -395,7 +395,7 @@ describe('recordOutcome', () => {
     const headers = init.headers as Record<string, string>;
     expect(headers['x-api-key']).toBe('sk-user-test');
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
-    expect(body.command).toBe('test run');
+    expect(body.command).toBe('run');
     expect(body.outcome).toBe('success');
     expect(body.ci).toBe(false);
     expect(body).not.toHaveProperty('endpointUrl');
@@ -428,7 +428,7 @@ describe('recordOutcome', () => {
     const fetchImpl = vi.fn().mockResolvedValue(okResponse());
     await recordOutcome(
       {
-        command: 'test run',
+        command: 'run',
         outcome: 'error',
         exitCode: 5,
         errorCode: 'VALIDATION_ERROR',
@@ -583,7 +583,7 @@ describe('tryResolveTelemetryAuth', () => {
 
 describe('wait timeout event fields', () => {
   const base = {
-    command: 'test run',
+    command: 'run',
     outcome: 'error' as const,
     exitCode: 7,
     durationMs: 1000,
@@ -650,7 +650,7 @@ describe('wait timeout event fields', () => {
 // ---------------------------------------------------------------------------
 
 describe('client tag on the event and the beacon UA', () => {
-  const base = { command: 'test run', outcome: 'success' as const, exitCode: 0, durationMs: 1 };
+  const base = { command: 'run', outcome: 'success' as const, exitCode: 0, durationMs: 1 };
 
   it('carries a valid TESTSPRITE_CLIENT as `client`; omits it when unset or invalid', () => {
     expect(buildTelemetryEvent(base, { TESTSPRITE_CLIENT: 'github-action/v1' }, false).client).toBe(
@@ -766,7 +766,7 @@ describe('hashRepository / buildCiContext', () => {
 
   it('lands on the event', () => {
     const event = buildTelemetryEvent(
-      { command: 'test run', outcome: 'success', exitCode: 0, durationMs: 1 },
+      { command: 'run', outcome: 'success', exitCode: 0, durationMs: 1 },
       { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'a/b' },
       false,
     );
@@ -865,8 +865,12 @@ describe('sanitizeTelemetryExtras', () => {
   it('ci run facts: the outcome enum, a UUID execution id and the report flag — nothing looser', () => {
     const executionId = '7ceab81a-a20a-4141-aa89-f6886bdbb11c';
     expect(
-      sanitizeTelemetryExtras({ ciRunOutcome: 'gated', executionId, reportReady: true }),
-    ).toEqual({ ciRunOutcome: 'gated', executionId, reportReady: true });
+      sanitizeTelemetryExtras({
+        ciRunOutcome: 'gated',
+        executionId: executionId,
+        reportReady: true,
+      }),
+    ).toEqual({ ciRunOutcome: 'gated', executionId: executionId, reportReady: true });
     for (const outcome of [
       'skipped_draft',
       'skipped_no_pr',
@@ -919,7 +923,7 @@ describe('recordTelemetryExtras / takeTelemetryExtras', () => {
     recordTelemetryExtras({ accepted: 1, passed: 1, conflictReason: 'in_flight' });
     const fetchImpl = vi.fn().mockResolvedValue(okResponse());
     await recordOutcome(
-      { command: 'test run', outcome: 'success', exitCode: 0, durationMs: 1 },
+      { command: 'run', outcome: 'success', exitCode: 0, durationMs: 1 },
       {
         env: {},
         resolvedAuth: { apiKey: 'sk-user-test', apiUrl: 'https://api.example.com' },
@@ -936,7 +940,7 @@ describe('recordTelemetryExtras / takeTelemetryExtras', () => {
     recordTelemetryExtras({ accepted: 1 });
     const fetchImpl = vi.fn();
     await recordOutcome(
-      { command: 'test run', outcome: 'success', exitCode: 0, durationMs: 1, dryRun: true },
+      { command: 'run', outcome: 'success', exitCode: 0, durationMs: 1, dryRun: true },
       { env: {}, fetchImpl },
     );
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -948,6 +952,7 @@ describe('batchOutcomeCounts / recordBatchOutcome', () => {
   it('splits verdicts into disjoint passed / failed / blocked / timedOut', () => {
     expect(
       batchOutcomeCounts([
+        { status: 'running' },
         { status: 'passed' },
         { status: 'passed' },
         { status: 'failed' },
@@ -966,7 +971,7 @@ describe('batchOutcomeCounts / recordBatchOutcome', () => {
       conflicts: [
         { testId: 'a', reason: 'insufficient_credits' },
         { testId: 'b', reason: 'insufficient_credits' },
-        { testId: 'c', currentRunId: 'r' },
+        { testId: 'c', currentResultId: 'r' },
       ],
       deferred: 1,
       skipped: 3,

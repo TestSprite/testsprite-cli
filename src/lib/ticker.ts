@@ -1,6 +1,6 @@
 /**
- * TTY-gated single-line stderr progress ticker for `test run --wait`
- * and `test wait`. On non-TTY (CI) the ticker is completely silent —
+ * TTY-gated single-line stderr progress ticker for `run --wait`
+ * and `run wait`. On non-TTY (CI) the ticker is completely silent —
  * logs stay clean for shell-script consumers.
  *
  * Behavior:
@@ -17,6 +17,8 @@
  * Timestamps: each tick prefixes an ISO 8601 timestamp so engineers
  * can correlate spinner output with --debug logs (dogfood item 2).
  */
+
+import { terminalSafe, terminalSafeLine } from './terminal-text.js';
 
 export interface Ticker {
   /** Update the in-place progress line. No-op on non-TTY. */
@@ -166,6 +168,24 @@ function fitToTerminal(line: string): string {
  *   Defaults to checking `NO_COLOR` env var per https://no-color.org/.
  */
 export function createTicker(
+  stderrWrite: (line: string) => void,
+  isTTY?: boolean,
+  stderrRaw?: (text: string) => void,
+  noColor?: boolean,
+): Ticker {
+  // A line names server values (a title, a status, an id). The ticker writes
+  // its own escape sequences around them, so they reach it already safe: the
+  // live line on one line, a note with its line breaks kept.
+  const ticker = createTickerWriter(stderrWrite, isTTY, stderrRaw, noColor);
+  return {
+    redrawsInPlace: ticker.redrawsInPlace,
+    update: line => ticker.update(terminalSafeLine(line)),
+    finalize: line => ticker.finalize(line === undefined ? undefined : terminalSafeLine(line)),
+    note: line => ticker.note(terminalSafe(line)),
+  };
+}
+
+function createTickerWriter(
   stderrWrite: (line: string) => void,
   isTTY?: boolean,
   stderrRaw?: (text: string) => void,

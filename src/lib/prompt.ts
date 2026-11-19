@@ -1,4 +1,5 @@
 import type { Readable, Writable } from 'node:stream';
+import { terminalSafe } from './terminal-text.js';
 
 export interface PromptStreams {
   input?: NodeJS.ReadableStream;
@@ -21,7 +22,9 @@ export async function promptText(question: string, streams: PromptStreams = {}):
   // setup / configure path (§8.1 stdout purity). stderr is still the user's
   // TTY, so the prompt remains visible.
   const output = streams.output ?? process.stderr;
-  output.write(question);
+  // A question can name a server value (an environment the agent proposed):
+  // the terminal is shown it with no escape sequence or control character.
+  output.write(terminalSafe(question));
   return readLine(input, output, false);
 }
 
@@ -29,7 +32,7 @@ export async function promptSecret(question: string, streams: PromptStreams = {}
   const input = streams.input ?? process.stdin;
   // See promptText: interactive prompt + masking go to stderr, not stdout.
   const output = streams.output ?? process.stderr;
-  output.write(question);
+  output.write(terminalSafe(question));
 
   const inputAsTTY = input as Readable & RawModeCapable;
   const useRawMode = inputAsTTY.isTTY === true && typeof inputAsTTY.setRawMode === 'function';

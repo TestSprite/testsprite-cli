@@ -1,6 +1,5 @@
 /**
- * Local e2e tests for `testsprite setup` (the consolidated onboarding command)
- * and its hidden, deprecated `init` alias.
+ * Local e2e tests for `testsprite setup` (the consolidated onboarding command).
  *
  * Uses the real built binary (`dist/index.js`) against a temp directory.
  * No network or real credentials required — tests use --dry-run or paths that
@@ -185,7 +184,7 @@ describe('setup — non-interactive, no key', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Top-level --help: `setup` is listed; deprecated `init` is hidden
+// 5. Top-level --help: `setup` is listed
 // ---------------------------------------------------------------------------
 
 describe('top-level --help', () => {
@@ -194,48 +193,10 @@ describe('top-level --help', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('setup');
   });
-
-  it('does NOT list the deprecated `init` alias (hidden)', () => {
-    const result = runCli(['--help']);
-    expect(result.status).toBe(0);
-    // `init` must not appear as a top-level command entry. Guard against a
-    // loose substring match (e.g. inside "initialize") by checking the command
-    // column convention: a line beginning with optional spaces then `init`.
-    const lists = result.stdout.split('\n').some(l => /^\s+init(\s|$)/.test(l));
-    expect(lists).toBe(false);
-  });
 });
 
 // ---------------------------------------------------------------------------
-// 6. Deprecated `init` alias still works (hidden) and warns
-// ---------------------------------------------------------------------------
-
-describe('deprecated `init` alias', () => {
-  it('still runs (exit 0 under --dry-run --no-agent) and prints a deprecation notice', () => {
-    const tmpDir = freshTmpDir();
-    const credsTmpDir = freshTmpDir();
-
-    const result = runCli(
-      ['--dry-run', 'init', '--api-key', 'sk-user-dep-init', '--no-agent', '--dir', tmpDir],
-      homeEnv(credsTmpDir),
-    );
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toContain('[deprecated]');
-    expect(result.stderr).toContain('testsprite setup');
-    // Still performs the (dry-run) setup preview.
-    expect(result.stderr).toContain('[dry-run]');
-  });
-
-  it('init --help still works (exit 0) for anyone on the old command', () => {
-    const result = runCli(['init', '--help']);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain('--api-key');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 7. Matrix-coverage guard — documents the TARGETS set
+// 6. Matrix-coverage guard — documents the TARGETS set
 // ---------------------------------------------------------------------------
 
 describe('matrix coverage guard', () => {
@@ -254,7 +215,7 @@ describe('matrix coverage guard', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. rawArgConflict wiring — conflict warn fires through parseAsync
+// 7. rawArgConflict wiring — conflict warn fires through parseAsync
 // ---------------------------------------------------------------------------
 
 describe('setup --agent <t> --no-agent conflict warn fires through real binary', () => {

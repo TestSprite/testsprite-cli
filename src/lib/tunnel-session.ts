@@ -44,6 +44,8 @@ import { ErrCode, TunnelClient } from '../vendor/tunnel-client/index.js';
 import { DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS } from '../vendor/tunnel-client/config.js';
 import type { LogLevel, TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import type { TunnelMintResponse } from './tunnel.types.js';
+import { runLabel, waitCommand, type RunRef } from './run-render.js';
+import { terminalSafeLine } from './terminal-text.js';
 
 /**
  * How long to wait for the control plane's first successful connection.
@@ -157,32 +159,42 @@ export interface TunnelSessionDeps {
  * the already-started server-side run before deciding whether to retry.
  */
 export class TunnelLostError extends ApiError {
-  constructor(reason: TunnelFatalReason, runId: string, fatalMessage?: string) {
+  /**
+   * `run` carries the wire ids of the run that lost its tunnel: `resultId` is the
+   * result id and `runId` its launch. Both are absent when the tunnel
+   * died before any run was accepted.
+   */
+  constructor(reason: TunnelFatalReason, run: RunRef, fatalMessage?: string) {
     // Two different things go wrong here and they do NOT share a remedy.
     // `--tunnel-client <id>` re-attaches to the same dead id and mints nothing,
     // so a borrower must inspect this run before deciding what to do next.
     // The wait path reports the observed cancellation outcome separately.
     const ownerGone = reason === 'owner-gone';
     const dataPlaneUnreachable = reason === 'data-plane-unreachable';
+    const subject = runLabel(run, 'lower');
+    // `run wait` takes the launch id; without one no command is offered.
+    const wait = waitCommand([run]);
     super({
       code: 'UNAVAILABLE',
       message: ownerGone
-        ? `The borrowed tunnel for run ${runId} is no longer registered. It was minted by ` +
+        ? `The borrowed tunnel for ${subject} is no longer registered. It was minted by ` +
           `another process (\`testsprite tunnel start\`), and that process has stopped or its ` +
           `credential expired. The run cannot reach your app through that tunnel.`
         : dataPlaneUnreachable
           ? formatDataPlaneUnreachableMessage(fatalMessage)
-          : `The tunnel carrying run ${runId} was disconnected by the server and cannot be ` +
+          : `The tunnel carrying ${subject} was disconnected by the server and cannot be ` +
             `restored for this run (${reason}).`,
       nextAction: ownerGone
-        ? `Check the run before re-running: testsprite test wait ${runId}.`
+        ? wait
+          ? `Check the run before re-running: ${wait}.`
+          : 'Check the run before re-running.'
         : dataPlaneUnreachable
-          ? `Check the cancelled run with testsprite test wait ${runId}. ` +
+          ? (wait ? `Check the cancelled run with ${wait}. ` : '') +
             formatDataPlaneUnreachableNextAction(fatalMessage, 'start a new run')
           : 'This usually means the tunnel service was redeployed mid-run. Start the run again: ' +
             'the retry mints a fresh tunnel.',
       requestId: 'local',
-      details: { reason, runId },
+      details: { reason, ...{ runId: run.runId, resultId: run.resultId ?? null } },
     });
     this.name = 'TunnelLostError';
   }
@@ -341,9 +353,9 @@ export async function openTunnelSession(
       await deps.destroy(minted.clientId);
     } catch (err) {
       sessionLog(
-        `[advisory] could not delete the tunnel credential (${
-          err instanceof Error ? err.message : String(err)
-        }); it expires on its own at ${minted.expiresAt}.`,
+        `[advisory] could not delete the tunnel credential (${terminalSafeLine(
+          err instanceof Error ? err.message : String(err),
+        )}); it expires on its own at ${terminalSafeLine(minted.expiresAt)}.`,
       );
     }
   };
@@ -362,7 +374,8 @@ export async function openTunnelSession(
       // a run that pivots into the rest of their network is the failure this
       // rail exists to stop. Loopback and public targets are unaffected.
       allowPrivateNetworkTarget: false,
-      logSink: (_level, line) => sessionLog(line),
+      // A client log line can carry a server value (a close reason): one line.
+      logSink: (_level, line) => sessionLog(terminalSafeLine(line)),
       onError: e => {
         const terminal = e.code === ErrCode.AuthFailed || e.code === ErrCode.DataPlaneUnreachable;
         if (terminal && fatal === undefined) {
@@ -382,7 +395,7 @@ export async function openTunnelSession(
           return;
         }
         if (terminal) return;
-        sessionLog(`[tunnel] ${e.message}`);
+        sessionLog(`[tunnel] ${terminalSafeLine(e.message)}`);
       },
     });
   } catch (err) {

@@ -1,3 +1,7 @@
+import { projectRun, runListing, resultCard } from '../../test/helpers/project-run.js';
+import { resultLine } from '../../test/helpers/result-list.js';
+import type { ProjectRunResponse } from '../lib/runs.types.js';
+import type { ResultList } from '../lib/result/types.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -7,10 +11,12 @@ import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCiCommand, runCiRun, type CiRunOptions } from './ci.js';
 import { InterruptError } from '../lib/errors.js';
+import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
 import { ShutdownController } from '../lib/interrupt.js';
-import type { BatchRunFreshResponse, RunResponse, RunStatus } from '../lib/runs.types.js';
+import type { RunStatus } from '../lib/runs.types.js';
 import type { CiSummary } from '../lib/gh-output.js';
+import { onFakeTimers } from '../../test/helpers/fake-timers.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -18,34 +24,14 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function batch(overrides: Partial<BatchRunFreshResponse> = {}): BatchRunFreshResponse {
-  return {
-    accepted: [],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-    ...overrides,
-  };
-}
-
-function accepted(testId: string, executionId?: string) {
-  return {
-    testId,
-    runId: `run-${testId}`,
-    enqueuedAt: '2026-09-18T00:00:00Z',
-    ...(executionId !== undefined ? { executionId } : {}),
-  };
-}
-
 /** A ready execution report in the server's shape, with the App's Markdown stand-in. */
-function executionReport(executionId: string) {
-  const resultUrl = `https://portal.example.com/dashboard-v3/o/org/projects/project-1/execution/${executionId}`;
+function executionReport(runId: string) {
+  const resultUrl = `https://portal.example.com/dashboard-v3/o/org/projects/project-1/execution/${runId}`;
   return {
     ready: true,
     report: {
       projectId: 'project-1',
-      executionId,
+      runId,
       projectName: 'Shop',
       orgId: 'org',
       stats: { passed: 1, failed: 0, blocked: 0, total: 1 },
@@ -71,41 +57,26 @@ function executionReport(executionId: string) {
   };
 }
 
-function runResult(runId: string, status: RunStatus): RunResponse {
-  return {
-    runId,
-    testId: runId.slice(4),
-    testTitle: 'Checkout',
-    projectId: 'project-1',
-    userId: 'user-1',
-    status,
-    source: 'cli',
-    createdFrom: 'cli',
-    createdAt: '2026-09-18T00:00:00Z',
-    startedAt: '2026-09-18T00:00:01Z',
-    finishedAt: '2026-09-18T00:00:03Z',
-    codeVersion: 'v1',
-    targetUrl: 'https://preview.example.com',
-    failedStepIndex: null,
-    failureKind: null,
-    error: status === 'failed' ? 'checkout failed' : null,
-    videoUrl: null,
-    stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-    dashboardUrl: 'https://portal.example.com/test',
-    executionUrl: 'https://portal.example.com/run',
-  };
-}
-
-function harness(
-  responses = [batch({ accepted: [accepted('a')] })],
-  status: RunStatus = 'passed',
+function nativeHarness(
   options: {
+    launch?: ProjectRunResponse;
+    listing?: ResultList;
+    listingRead?: (runId: string) => Response | undefined;
     /** Names the project's environment list answers with. */
     environments?: string[];
-    /** A backend that read the CI fields echoes them; `false` plays an older one. */
-    echo?: boolean;
+    /**
+     * A backend that read the CI fields echoes them; `false` plays an older
+     * one, and `'no-preview'` one that echoes all but the preview environment.
+     */
+    echo?: boolean | 'no-preview';
     /** What GitHub answers for `GET /repos/{o}/{r}/commits/{sha}/pulls`. */
     pulls?: unknown;
+    /**
+     * What GitHub answers for `--wait-for-status`'s two reads, per round
+     * (0-based; the last entry repeats): the commit's `statuses[]` and
+     * `check_runs[]`. Absent ⇒ both empty.
+     */
+    signals?: Array<{ statuses?: unknown[]; checks?: unknown[] }>;
     /**
      * Make the environment-list read fail: an HTTP status with an error
      * envelope, or a signal that interrupts the request mid-flight.
@@ -132,8 +103,8 @@ function harness(
   const calls: { path: string; method: string; body?: Record<string, unknown> }[] = [];
   let now = Date.now();
   vi.spyOn(Date, 'now').mockImplementation(() => now);
-  let post = 0;
   let reportCalls = 0;
+  let signalReads = 0;
   const fetchImpl = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
     const url = new URL(
       typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
@@ -142,7 +113,17 @@ function harness(
     const method = init.method ?? 'GET';
     if (url.hostname === 'api.github.com') {
       calls.push({ path: `github:${path}`, method });
-      return new Response(JSON.stringify(options.pulls ?? []), {
+      let answer: unknown = options.pulls ?? [];
+      if (/\/commits\/[^/]+\/(status|check-runs)$/.test(path)) {
+        // Both endpoints are read per round; the round advances after the pair.
+        const rounds = options.signals ?? [];
+        const round = rounds[Math.min(signalReads >> 1, Math.max(rounds.length - 1, 0))] ?? {};
+        signalReads++;
+        answer = path.endsWith('/check-runs')
+          ? { check_runs: round.checks ?? [] }
+          : { statuses: round.statuses ?? [] };
+      }
+      return new Response(JSON.stringify(answer), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
@@ -153,7 +134,7 @@ function harness(
         : undefined;
     calls.push({ path, method, body });
     let response: unknown;
-    if (method === 'POST' && path === '/tests/batch/run') {
+    if (method === 'POST' && /^\/projects\/[^/]+\/runs$/.test(path)) {
       if (options.batchRefusal) {
         return new Response(
           JSON.stringify({
@@ -166,29 +147,57 @@ function harness(
           { status: options.batchRefusal.status, headers: { 'content-type': 'application/json' } },
         );
       }
-      const base = responses[Math.min(post++, responses.length - 1)]!;
+      const base =
+        options.launch ??
+        projectRun({
+          runId: 'exec-1',
+          projectId: 'project-1',
+          environment: { id: 'env-0', name: 'default' },
+          targetUrl: 'https://app.example.com',
+        });
       response = echo
         ? {
             ...base,
             ...(body?.targetUrl !== undefined ? { targetUrl: body.targetUrl } : {}),
-            ...(body?.admission !== undefined ? { admission: body.admission } : {}),
-            ...(body?.previewName !== undefined ? { previewName: body.previewName } : {}),
+
+            ...(body?.previewName !== undefined && echo !== 'no-preview'
+              ? { environment: { id: 'env-preview', name: body.previewName } }
+              : body?.environment
+                ? { environment: { id: 'env-selected', name: body.environment } }
+                : {}),
           }
         : base;
-    } else if (path.startsWith('/runs/')) {
-      // The real long-poll consumes wall time even when it returns running.
+    } else if (path.startsWith('/runs/') && options.runRead) {
+      const result = options.runRead(path.slice('/runs/'.length));
+      if (result) return result;
+      throw new Error(`Unexpected result card ${path}`);
+    } else if (path === '/results') {
       now += 1000;
-      const overridden = options.runRead?.(path.slice('/runs/'.length).split('?')[0]!);
+      const overridden = options.listingRead?.(url.searchParams.get('run')!);
       if (overridden) return overridden;
-      response = runResult(path.slice('/runs/'.length), status);
+      response =
+        options.listing ??
+        runListing(
+          { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+          [
+            resultLine({
+              runId: 'exec-1',
+              resultId: 'run-a',
+              caseKey: 'a',
+              title: 'Checkout',
+              testStatus: 'PASSED',
+            }),
+          ],
+        );
     } else if (/^\/tests\/executions\/[^/]+\/report$/.test(path) && options.report) {
       const answer = options.report(reportCalls++);
       if (answer instanceof Response) return answer;
       response = answer;
-    } else if (path === '/tests')
-      response = { items: [{ id: 'a', name: 'Checkout' }], nextToken: null };
+    } else if (/^\/projects\/[^/]+$/.test(path)) response = { type: 'frontend' };
+    else if (path === '/tests')
+      response = { items: [{ id: 'a', title: 'Checkout' }], nextToken: null };
     else if (path.startsWith('/tests/'))
-      response = { id: path.slice('/tests/'.length), type: 'frontend', name: 'Checkout' };
+      response = { id: path.slice('/tests/'.length), type: 'frontend', title: 'Checkout' };
     // 0.14.0 reads the project's environments before a batch (automatic
     // tunnel discovery; also under --dry-run). A public default needs none.
     else if (/^\/projects\/[^/]+\/env$/.test(path) && method === 'GET') {
@@ -255,14 +264,15 @@ function harness(
     stderr,
     calls,
     /** The batch dispatches only — metadata reads are not the contract under test. */
-    dispatches: () => calls.filter(c => c.method === 'POST' && c.path === '/tests/batch/run'),
+    dispatches: () =>
+      calls.filter(c => c.method === 'POST' && /^\/projects\/[^/]+\/runs$/.test(c.path)),
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned summary path under this test's mkdtemp directory; no external path input.
     summary: () => JSON.parse(readFileSync(opts.summaryFile!, 'utf8')) as CiSummary,
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned output fixture under this test's mkdtemp directory, not the host GITHUB_OUTPUT.
     outputs: () => readFileSync(env.GITHUB_OUTPUT, 'utf8'),
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned job-summary fixture under this test's mkdtemp directory, not the host environment.
     job: () => readFileSync(env.GITHUB_STEP_SUMMARY, 'utf8'),
-    json: () => JSON.parse(stdout.join('\n')) as { summary: CiSummary; accepted: unknown[] },
+    json: () => JSON.parse(stdout.join('\n')) as { summary: CiSummary; results: unknown[] },
   };
 }
 
@@ -287,15 +297,19 @@ globalThis.fetch = async (input, init = {}) => {
   let response;
   if (method === 'GET' && path === '/projects/project-1/env') {
     response = { environments: [{ name: 'staging', url: 'http://localhost:3000', isDefault: true }] };
-  } else if (method === 'POST' && path === '/tests/batch/run') {
+  } else if (method === 'POST' && path === '/projects/project-1/runs') {
     response = {
-      accepted: [], conflicts: [], deferred: [], skippedFrontend: ['fe'], skippedIntegration: [],
-      admission: body.admission, targetUrl: body.targetUrl
+      runId: 'exec-1', projectId: 'project-1', total: 0, enqueuedAt: '2026-09-18T00:00:00Z', autoHeal: true,
+      blocked: [], held: [], environment: { id: 'env-1', name: body.environment || 'staging' }, targetUrl: body.targetUrl || null
     };
+  } else if (method === 'GET' && path === '/results') {
+    response = { run: { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false, created: '2026-09-18T00:00:00Z', modified: '2026-09-18T00:00:00Z', targetUrl: null, dashboardUrl: null }, results: [] };
+  } else if (method === 'GET' && path === '/projects/project-1') {
+    response = { id: 'project-1', type: 'frontend' };
   } else if (method === 'GET' && path === '/tests') {
-    response = { items: [{ id: 'fe', name: 'Checkout' }], nextToken: null };
+    response = { items: [{ id: 'fe', title: 'Checkout' }], nextToken: null };
   } else if (method === 'GET' && path === '/tests/fe') {
-    response = { id: 'fe', type: 'frontend', name: 'Checkout' };
+    response = { id: 'fe', type: 'frontend', title: 'Checkout' };
   } else {
     throw new Error('Unexpected request: ' + method + ' ' + path);
   }
@@ -363,12 +377,12 @@ globalThis.fetch = async (input, init = {}) => {
   ])('refuses %s before opening a tunnel or dispatching', (_label, args) => {
     const result = run(args);
     expect(result.status, result.stderr).toBe(5);
-    expect(result.stderr).toContain('test run --all --env <name> --wait');
+    expect(result.stderr).toContain('run --project <id> --env <name> --wait');
     expect(result.stderr).not.toMatch(
       /--max-concurrency|--local|opening a tunnel|Would open a tunnel/,
     );
     expect(result.outputs).toBe(
-      'previous=value\ntotal=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\n',
+      'previous=value\ntotal=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
     );
     expect(
       result.calls.filter(call => call.path !== '/telemetry').every(call => call.method === 'GET'),
@@ -377,6 +391,9 @@ globalThis.fetch = async (input, init = {}) => {
       expect(result.calls.find(call => call.path === '/telemetry')?.body).toMatchObject({
         ciRunOutcome: 'refused_loopback',
       });
+    } else {
+      // Refused before any sample is produced, so no dry-run banner.
+      expect(result.stderr).not.toContain('[dry-run] sample response');
     }
   });
 
@@ -385,39 +402,35 @@ globalThis.fetch = async (input, init = {}) => {
     expect(result.status, result.stderr).toBe(5);
     expect(result.stderr).toContain('no path');
     expect(result.outputs).toBe(
-      'previous=value\ntotal=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\n',
+      'previous=value\ntotal=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
     );
   });
 
-  it.each([false, true])(
-    'a public override of a loopback environment keeps the CI gate, strict=%s',
-    strict => {
-      const result = run([
-        '--env',
-        'staging',
-        '--target-url',
-        PREVIEW,
-        '--skip-preflight',
-        '--allow-empty',
-        ...(strict ? ['--fail-on-skipped'] : []),
-      ]);
-      expect(result.status, result.stderr).toBe(strict ? 1 : 0);
-      expect(result.outputs).toContain('total=1\npassed=0\nfailed=0\nskipped=1\ntimedOut=0\n');
-      expect(
-        result.calls.filter(call => call.method === 'POST' && call.path !== '/telemetry'),
-      ).toMatchObject([
-        {
-          path: '/tests/batch/run',
-          body: { admission: 'all', targetUrl: PREVIEW },
-        },
-      ]);
-    },
-  );
+  it('a public override of a loopback environment is dispatched, not refused', () => {
+    const result = run([
+      '--env',
+      'staging',
+      '--target-url',
+      PREVIEW,
+      '--skip-preflight',
+      '--allow-empty',
+    ]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain('publicly reachable target URL');
+    expect(
+      result.calls.filter(call => call.method === 'POST' && call.path !== '/telemetry'),
+    ).toMatchObject([
+      {
+        path: '/projects/project-1/runs',
+        body: { admission: 'all', targetUrl: PREVIEW },
+      },
+    ]);
+  });
 });
 /* eslint-enable security/detect-non-literal-fs-filename */
 
 function githubEnv(
-  h: ReturnType<typeof harness>,
+  h: ReturnType<typeof nativeHarness>,
   event: string,
   payload: unknown,
   extra: Record<string, string> = {},
@@ -438,177 +451,295 @@ function githubEnv(
 }
 
 describe('ci run', () => {
+  it('names the run on stderr right after the dispatch, before the wait', async () => {
+    const h = nativeHarness({
+      launch: projectRun({
+        runId: 'exec_1',
+        projectId: 'project-1',
+        total: 2,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec_1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec_1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+          resultLine({
+            runId: 'exec_1',
+            resultId: 'run-b',
+            caseKey: 'b',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
+    });
+    await runCiRun({ ...h.opts, output: 'text' }, h.deps);
+    const dispatched = h.stderr.findIndex(line => line === 'Run exec_1');
+    expect(dispatched).toBeGreaterThanOrEqual(0);
+    expect(h.calls.findIndex(call => call.path === '/results')).toBeGreaterThan(
+      h.calls.findIndex(call => call.method === 'POST'),
+    );
+    expect(h.stderr.filter(line => line === 'Run exec_1')).toHaveLength(1);
+  });
+
+  it('waits out a network outage after the dispatch and publishes the verdict', async () => {
+    // The harness keeps its own clock for the poll's sleeps; the HTTP
+    // client's retry waits run on these fake timers.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      // The dispatch answers; the first eight reads of the result (two of the
+      // HTTP client's bursts of four) hit a dead network.
+      let reads = 0;
+      const h = nativeHarness({
+        listingRead: () => {
+          reads += 1;
+          if (reads <= 8) throw new TypeError('fetch failed');
+          return undefined;
+        },
+      });
+      const pending = runCiRun(h.opts, h.deps).catch((caught: unknown) => caught);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(await pending).not.toBeInstanceOf(Error);
+      expect(reads).toBe(9);
+      expect(h.summary()).toMatchObject({ total: 1, passed: 1, failed: 0, timedOut: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('dispatches all tests, waits, and publishes one consistent summary', async () => {
-    const h = harness();
+    const h = nativeHarness();
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- Seeds only the harness output file in its fresh mkdtemp directory.
     writeFileSync(h.deps.env.GITHUB_OUTPUT, 'previous=value\n');
     await runCiRun(h.opts, h.deps);
     expect(h.dispatches()[0]).toEqual({
-      path: '/tests/batch/run',
+      path: '/projects/project-1/runs',
       method: 'POST',
-      body: { projectId: 'project-1', source: 'cli', admission: 'all' },
+      body: { maxConcurrency: 50, admission: 'all' },
     });
-    expect(h.calls.some(c => c.path === '/runs/run-a')).toBe(true);
+    expect(h.calls.some(c => c.path === '/results')).toBe(true);
     expect(h.summary()).toMatchObject({ total: 1, passed: 1, failed: 0, skipped: 0, timedOut: 0 });
     expect(h.json().summary).toEqual(h.summary());
     expect(h.outputs()).toBe(
-      'previous=value\ntotal=1\npassed=1\nfailed=0\nskipped=0\ntimedOut=0\n',
+      'previous=value\ntotal=1\npassed=1\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
     );
-    expect(h.job()).toContain('[Checkout](https://portal.example.com/test)');
-    expect(h.calls.every(c => c.method === 'GET' || c.path === '/tests/batch/run')).toBe(true);
+    expect(h.job()).toContain('| Checkout | passed | run-a |');
+    expect(h.calls.every(c => c.method === 'GET' || /^\/projects\/[^/]+\/runs$/.test(c.path))).toBe(
+      true,
+    );
   });
 
-  it.each([false, true])('unifies all skipped buckets; strict=%s', async strict => {
-    const h = harness([
-      batch({
-        accepted: [accepted('a')],
-        deferred: [{ testId: 'later' }],
-        conflicts: [{ testId: 'busy', currentRunId: 'other-deployment' }],
-        skippedFrontend: ['fe'],
-        skippedIntegration: [{ testId: 'integration' }],
-      }),
-      batch({ deferred: [{ testId: 'later' }] }),
-    ]);
-    const promise = runCiRun({ ...h.opts, failOnSkipped: strict }, h.deps);
-    if (strict) await expect(promise).rejects.toMatchObject({ exitCode: 1 });
-    else await promise;
-    expect(h.summary()).toMatchObject({ total: 5, passed: 1, failed: 0, skipped: 4 });
-    expect(h.json().summary).toEqual(h.summary());
-    expect(h.outputs()).toContain('skipped=4\n');
-    expect(h.job()).toContain('4 skipped');
-    expect(h.stderr.filter(s => s.startsWith('::warning'))).toHaveLength(4);
-    expect(h.stderr.filter(s => s.startsWith('::error'))).toHaveLength(0);
-    expect(h.calls.some(c => c.path.includes('other-deployment'))).toBe(false);
-  });
+  const held = { testId: 'busy', runId: 'other-exec', resultId: 'other-result' };
+  const incompatibleHeld = (total = 1) =>
+    nativeHarness({
+      launch: projectRun({ runId: 'exec-1', projectId: 'project-1', total, held: [held] }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        total
+          ? [
+              resultLine({
+                runId: 'exec-1',
+                resultId: 'run-a',
+                caseKey: 'a',
+                title: 'Checkout',
+                testStatus: 'PASSED',
+              }),
+            ]
+          : [],
+      ),
+      runRead: () =>
+        new Response(JSON.stringify(resultCard({ ...held, projectId: 'other-project' }))),
+    });
 
-  it.each([
-    ['empty project', batch()],
-    ['all frontend', batch({ skippedFrontend: ['fe'] })],
-    ['all integration', batch({ skippedIntegration: [{ testId: 'int' }] })],
-    ['all conflicts', batch({ conflicts: [{ testId: 'busy', currentRunId: 'old-run' }] })],
-    ['all deferred', batch({ deferred: [{ testId: 'later' }] })],
-  ] as const)(
+  it.each([false, true])(
+    'retains incompatible held references as skipped; strict=%s',
+    async strict => {
+      const h = incompatibleHeld();
+      const promise = runCiRun({ ...h.opts, failOnSkipped: strict }, h.deps);
+      if (strict) await expect(promise).rejects.toMatchObject({ exitCode: 1 });
+      else await promise;
+      expect(h.summary()).toMatchObject({ total: 2, passed: 1, failed: 0, skipped: 1 });
+      expect(h.json()).toMatchObject({ runs: [{ held: [held] }], skipped: [held] });
+      expect(h.outputs()).toContain('skipped=1\n');
+      expect(h.job()).toContain('1 skipped');
+      expect(h.calls.filter(c => c.method === 'POST')).toHaveLength(1);
+    },
+  );
+
+  it.each(['empty project', 'all incompatible held'] as const)(
     '%s fails with 5 after publishing outputs, unless explicitly allowed',
-    async (label, response) => {
-      const h = harness([response]);
+    async label => {
+      const h =
+        label === 'empty project'
+          ? nativeHarness({
+              launch: projectRun({ runId: 'exec-1', projectId: 'project-1', total: 0 }),
+              listing: runListing({ runId: 'exec-1', status: 'finished', cancelled: false }, []),
+            })
+          : incompatibleHeld(0);
       await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 5 });
       expect(h.outputs()).toContain('passed=0\n');
       expect(h.summary().total).toBe(label === 'empty project' ? 0 : 1);
       await runCiRun({ ...h.opts, allowEmpty: true }, h.deps);
-      expect(h.calls.some(c => c.path.startsWith('/runs/'))).toBe(false);
     },
   );
 
   it('--allow-empty does not override --fail-on-skipped', async () => {
-    const h = harness([batch({ skippedFrontend: ['fe'] })]);
+    const h = incompatibleHeld(0);
     await expect(
       runCiRun({ ...h.opts, allowEmpty: true, failOnSkipped: true }, h.deps),
     ).rejects.toMatchObject({ exitCode: 1 });
   });
 
   it.each([false, true])('missing ids always fail with 4 (allow-empty=%s)', async allowEmpty => {
-    const h = harness([batch({ conflicts: [{ testId: 'gone', reason: 'not_found' }] })]);
+    const h = nativeHarness({ batchRefusal: { status: 404, code: 'NOT_FOUND' } });
     await expect(runCiRun({ ...h.opts, allowEmpty }, h.deps)).rejects.toMatchObject({
       exitCode: 4,
+      code: 'NOT_FOUND',
+      message: 'batch refused (NOT_FOUND)',
     });
-    expect(h.summary()).toMatchObject({ failed: 0, skipped: 1 });
-    expect(h.summary().runs[0]).toMatchObject({
-      testId: 'gone',
-      status: 'not_found',
-      error: expect.stringContaining('not found'),
-    });
-    expect(h.outputs()).toContain('skipped=1');
+    expect(h.summary()).toMatchObject({ passed: 0 });
   });
 
-  it('missing ids also fail a partially passing batch', async () => {
-    const h = harness([
-      batch({ accepted: [accepted('a')], conflicts: [{ testId: 'gone', reason: 'not_found' }] }),
-    ]);
-    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 4 });
-    expect(h.summary()).toMatchObject({ total: 2, passed: 1, skipped: 1 });
+  it('a project request containing a missing ID is refused before any partial dispatch', async () => {
+    const h = nativeHarness({
+      batchRefusal: { status: 404, code: 'NOT_FOUND', details: { testId: 'gone' } },
+    });
+    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({
+      exitCode: 4,
+      details: { testId: 'gone' },
+    });
+    expect(h.calls.some(c => c.path === '/results')).toBe(false);
   });
 
   it.each(['failed', 'blocked', 'cancelled'] as RunStatus[])(
     '%s results fail after writing every output',
     async status => {
-      const h = harness(undefined, status);
+      const h = nativeHarness({
+        listing: runListing(
+          { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+          [
+            resultLine({
+              runId: 'exec-1',
+              resultId: 'run-a',
+              caseKey: 'a',
+              title: 'Checkout',
+              testStatus: status.toUpperCase() as 'FAILED',
+              error: status === 'failed' ? 'checkout failed' : null,
+            }),
+          ],
+        ),
+      });
       await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
-      expect(h.summary()).toMatchObject({ total: 1, failed: 1, skipped: 0 });
-      if (status === 'failed') expect(h.summary().runs[0]!.error).toBe('checkout failed');
+      expect(h.summary()).toMatchObject({
+        total: 1,
+        failed: status === 'failed' ? 1 : 0,
+        ...(status === 'cancelled' ? { cancelled: 1 } : {}),
+        skipped: 0,
+        ...(status === 'blocked' ? { blocked: 1 } : {}),
+      });
+      expect(h.outputs()).toContain(`failedOnly=${status === 'failed' ? 1 : 0}\n`);
+      if (status === 'blocked') {
+        expect(h.outputs()).toContain('blocked=1\n');
+        expect(h.job()).toContain('0 failed, 1 blocked');
+      }
+      if (status === 'failed') expect(h.summary().results[0]!.error).toBe('checkout failed');
       expect(h.json().summary).toEqual(h.summary());
       expect(h.outputs()).toContain('failed=1\n');
       expect(h.stderr.some(s => s.startsWith('::error'))).toBe(true);
     },
   );
 
-  it('preserves batch environment rejections as skipped conflicts and gates zero dispatch', async () => {
-    const message =
-      "Field `environment` is invalid: unknown environment 'missing'; use one of: default.";
-    // The list says the name exists and the server still refuses it: the
-    // server-side refusal path (the client-side name check is tested below).
-    const h = harness(
-      [batch({ conflicts: [{ testId: 'a', reason: 'local_address', message }] })],
-      'passed',
-      { environments: ['default', 'missing'] },
-    );
+  it('preserves project environment refusal details without classifying them as held', async () => {
+    const h = nativeHarness({
+      environments: ['default', 'missing'],
+      batchRefusal: {
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        details: { field: 'environment', supplied: 'missing' },
+      },
+    });
     await expect(runCiRun({ ...h.opts, environment: 'missing' }, h.deps)).rejects.toMatchObject({
       exitCode: 5,
+      message: 'batch refused (VALIDATION_ERROR)',
+      details: { field: 'environment', supplied: 'missing' },
     });
-    expect(h.summary()).toMatchObject({ total: 1, passed: 0, failed: 0, skipped: 1 });
-    expect(h.summary().runs[0]).toMatchObject({
-      testId: 'a',
-      status: 'conflict',
-      error: `${message} (not dispatched)`,
-    });
-    expect(h.outputs()).toContain('skipped=1\n');
-    expect(h.calls.filter(c => c.path.startsWith('/runs/'))).toEqual([]);
-    expect(h.stderr.some(s => s.startsWith('::warning') && s.includes(message))).toBe(true);
+    expect(h.calls.some(c => c.path === '/results')).toBe(false);
   });
 
-  it('passes the chosen environment on the dispatch and never resends a deferred id', async () => {
-    const h = harness([batch({ accepted: [accepted('a')], deferred: [{ testId: 'b' }] })]);
-    await expect(runCiRun({ ...h.opts, environment: 'pr-42' }, h.deps)).resolves.toBeUndefined();
+  it('passes the chosen environment and never resends held tests', async () => {
+    const h = incompatibleHeld();
+    await runCiRun({ ...h.opts, environment: 'pr-42' }, h.deps);
     const posts = h.calls.filter(c => c.method === 'POST');
     expect(posts).toHaveLength(1);
     expect(posts[0]!.body?.environment).toBe('pr-42');
     expect(h.summary()).toMatchObject({ total: 2, passed: 1, skipped: 1 });
   });
 
-  it('reports timed-out accepted runs with exit 7, separately from deferred skips', async () => {
-    const h = harness(
-      [batch({ accepted: [accepted('a')], deferred: [{ testId: 'b' }] })],
-      'running',
-    );
+  it('reports timed-out execution results with exit 7, separately from held skips', async () => {
+    const h = nativeHarness({
+      launch: projectRun({ runId: 'exec-1', projectId: 'project-1', held: [held] }),
+      runRead: () =>
+        new Response(JSON.stringify(resultCard({ ...held, projectId: 'other-project' }))),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'running', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'RUNNING',
+          }),
+        ],
+      ),
+    });
     await expect(runCiRun({ ...h.opts, timeoutSeconds: 1 }, h.deps)).rejects.toMatchObject({
       exitCode: 7,
     });
-    expect(h.summary()).toMatchObject({ total: 2, passed: 0, failed: 0, skipped: 1, timedOut: 1 });
+    expect(h.summary()).toMatchObject({ total: 2, passed: 0, skipped: 1, timedOut: 1 });
     expect(h.outputs()).toContain('timedOut=1');
-    expect(h.stderr.filter(s => s.startsWith('::error'))).toHaveLength(1);
-    expect(h.stderr.filter(s => s.startsWith('::warning'))).toHaveLength(1);
   });
 
   it('honors the case-insensitive substring filter without counting excluded tests as skipped', async () => {
-    const h = harness();
+    const h = nativeHarness();
     await runCiRun({ ...h.opts, nameFilter: 'CHECK' }, h.deps);
     expect(h.calls.find(c => c.method === 'POST')?.body?.testIds).toEqual(['a']);
     expect(h.summary()).toMatchObject({ total: 1, passed: 1, skipped: 0 });
   });
 
-  it('keeps skipped buckets returned during retries visible', async () => {
-    const h = harness([
-      batch({ accepted: [accepted('a')], deferred: [{ testId: 'b' }, { testId: 'c' }] }),
-      batch({ skippedFrontend: ['b'], skippedIntegration: [{ testId: 'c' }] }),
-    ]);
-    await runCiRun(h.opts, h.deps);
-    expect(h.summary()).toMatchObject({ total: 3, passed: 1, skipped: 2 });
+  it('does not turn held verification authentication failure into a skipped test', async () => {
+    const h = nativeHarness({
+      launch: projectRun({ runId: 'exec-1', projectId: 'project-1', held: [held] }),
+      runRead: () =>
+        new Response(
+          JSON.stringify({
+            code: 'AUTH_INVALID',
+            message: 'expired',
+            nextAction: 'login',
+            requestId: 'auth-held',
+          }),
+          { status: 401 },
+        ),
+    });
+    await expect(runCiRun({ ...h.opts, allowEmpty: true }, h.deps)).rejects.toMatchObject({
+      exitCode: 3,
+      message: 'expired',
+    });
+    expect(h.summary().skipped).toBe(0);
   });
 
   it('retains operational poll errors and publishes their diagnostics', async () => {
-    const h = harness();
+    const h = nativeHarness();
     const original = h.deps.fetchImpl.getMockImplementation()!;
     h.deps.fetchImpl.mockImplementation(async (input, init) => {
-      if (String(input).includes('/runs/')) {
+      if (String(input).includes('/results')) {
         return new Response(
           JSON.stringify({
             error: {
@@ -625,12 +756,18 @@ describe('ci run', () => {
       return original(input, init);
     });
     await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 3 });
-    expect(h.summary().failed).toBe(1);
+    expect(h.summary()).toMatchObject({
+      total: 0,
+      failed: 0,
+      runFailures: [{ runId: 'exec-1', status: 'error' }],
+    });
     expect(h.outputs()).toContain('failed=1');
+    expect(h.job()).toContain('expired');
+    expect(h.stderr.join('\n')).toContain('::error title=TestSprite run exec-1::expired');
   });
 
   it('an unmatched filter emits an empty summary without dispatching', async () => {
-    const h = harness();
+    const h = nativeHarness();
     await expect(
       runCiRun({ ...h.opts, nameFilter: 'does-not-exist' }, h.deps),
     ).rejects.toMatchObject({ exitCode: 5 });
@@ -641,12 +778,22 @@ describe('ci run', () => {
       failed: 0,
       skipped: 0,
       timedOut: 0,
-      runs: [],
+      results: [],
     });
   });
 
   it('continues after artifact write failures without hiding a test failure', async () => {
-    const h = harness(undefined, 'failed');
+    const h = nativeHarness({
+      listing: runListing({ runId: 'exec-1', status: 'finished', cancelled: false }, [
+        resultLine({
+          runId: 'exec-1',
+          resultId: 'run-a',
+          caseKey: 'a',
+          testStatus: 'FAILED',
+          error: 'checkout failed',
+        }),
+      ]),
+    });
     h.deps.env.GITHUB_OUTPUT = h.dir;
     h.deps.env.GITHUB_STEP_SUMMARY = h.dir;
     await expect(runCiRun({ ...h.opts, summaryFile: h.dir }, h.deps)).rejects.toMatchObject({
@@ -657,7 +804,7 @@ describe('ci run', () => {
   });
 
   it('writes step outputs even outside Actions without other artifacts enabled', async () => {
-    const h = harness();
+    const h = nativeHarness();
     h.deps.env.GITHUB_ACTIONS = 'false';
     await runCiRun({ ...h.opts, summaryFile: undefined }, h.deps);
     expect(h.outputs()).toContain('passed=1');
@@ -666,7 +813,17 @@ describe('ci run', () => {
   });
 
   it('writes opt-in JUnit before a failing gate', async () => {
-    const h = harness(undefined, 'failed');
+    const h = nativeHarness({
+      listing: runListing({ runId: 'exec-1', status: 'finished', cancelled: false }, [
+        resultLine({
+          runId: 'exec-1',
+          resultId: 'run-a',
+          caseKey: 'a',
+          testStatus: 'FAILED',
+          error: 'checkout failed',
+        }),
+      ]),
+    });
     const reportFile = join(h.dir, 'junit.xml');
     await expect(
       runCiRun({ ...h.opts, report: 'junit', reportFile }, h.deps),
@@ -677,7 +834,17 @@ describe('ci run', () => {
   });
 
   it('an unwritable JUnit file cannot mask a failed gate or suppress summaries', async () => {
-    const h = harness(undefined, 'failed');
+    const h = nativeHarness({
+      listing: runListing({ runId: 'exec-1', status: 'finished', cancelled: false }, [
+        resultLine({
+          runId: 'exec-1',
+          resultId: 'run-a',
+          caseKey: 'a',
+          testStatus: 'FAILED',
+          error: 'checkout failed',
+        }),
+      ]),
+    });
     await expect(
       runCiRun({ ...h.opts, report: 'junit', reportFile: h.dir }, h.deps),
     ).rejects.toMatchObject({ exitCode: 1 });
@@ -686,16 +853,24 @@ describe('ci run', () => {
   });
 
   it('dry-run neither dispatches nor writes artifacts, even with JUnit requested', async () => {
-    const h = harness();
+    resetDryRunBannerForTesting();
+    const h = nativeHarness();
     const reportFile = join(h.dir, 'junit.xml');
     await runCiRun({ ...h.opts, dryRun: true, report: 'junit', reportFile }, h.deps);
     // A credentialed dry run may read environment metadata; it never dispatches.
     expect(h.dispatches()).toEqual([]);
+    // Those reads are live, so the preview itself announces the sample, once.
+    expect(h.stderr.filter(line => line === DRY_RUN_BANNER)).toHaveLength(1);
     expect(h.calls.every(c => c.method === 'GET')).toBe(true);
     expect(JSON.parse(h.stdout.join('\n'))).toMatchObject({
       dryRun: true,
-      body: { projectId: 'project-1' },
-      thenPoll: '/api/cli/v1/runs/<run-id>?waitSeconds=25',
+      requests: [
+        {
+          path: '/api/cli/v1/projects/project-1/runs',
+          body: { maxConcurrency: 50, admission: 'all' },
+        },
+      ],
+      thenPoll: '/api/cli/v1/results?run=<run-id>&status=passed,failed,running,blocked,cancelled',
     });
     for (const path of [
       reportFile,
@@ -708,7 +883,7 @@ describe('ci run', () => {
   });
 
   it('requires a project before making any requests', async () => {
-    const h = harness();
+    const h = nativeHarness();
     await expect(runCiRun({ ...h.opts, projectId: undefined }, h.deps)).rejects.toMatchObject({
       exitCode: 5,
     });
@@ -716,9 +891,9 @@ describe('ci run', () => {
   });
 
   it('an explicit project wins over TESTSPRITE_PROJECT_ID', async () => {
-    const h = harness();
+    const h = nativeHarness();
     await runCiRun(h.opts, { ...h.deps, env: { ...h.deps.env, TESTSPRITE_PROJECT_ID: 'other' } });
-    expect(h.dispatches()[0]!.body?.projectId).toBe('project-1');
+    expect(h.dispatches()[0]!.path).toBe('/projects/project-1/runs');
   });
 
   it.each([
@@ -731,7 +906,7 @@ describe('ci run', () => {
     { environment: '   ' },
     { reportFile: 'results.xml' },
   ])('rejects invalid options before dispatch: %j', async invalid => {
-    const h = harness();
+    const h = nativeHarness();
     await expect(runCiRun({ ...h.opts, ...invalid }, h.deps)).rejects.toMatchObject({
       exitCode: 5,
     });
@@ -741,7 +916,7 @@ describe('ci run', () => {
   it.each([['unexpected'], [' --env', 'pr-415']])(
     'rejects extra positional arguments before dispatch: %j',
     async (...extra) => {
-      const h = harness();
+      const h = nativeHarness();
       const ci = createCiCommand(h.deps);
       ci.commands
         .find(command => command.name() === 'run')!
@@ -756,7 +931,7 @@ describe('ci run', () => {
   );
 
   it('wires Commander options, globals, project env default, and implicit wait', async () => {
-    const h = harness();
+    const h = nativeHarness();
     const program = new Command().option('--output <mode>').addCommand(
       createCiCommand({
         ...h.deps,
@@ -777,8 +952,7 @@ describe('ci run', () => {
       h.opts.summaryFile!,
     ]);
     expect(h.dispatches()[0]!.body).toEqual({
-      projectId: 'env-project',
-      source: 'cli',
+      maxConcurrency: 50,
       environment: 'pr-42',
       admission: 'all',
     });
@@ -787,9 +961,9 @@ describe('ci run', () => {
   });
 });
 
-describe('ci run — pull request context and single-execution admission', () => {
+describe('ci run — pull request context and single-run admission', () => {
   it('in a pull_request job, --env + --target-url runs in github-pr-<N>, stamped with the PR', async () => {
-    const h = harness();
+    const h = nativeHarness();
     const deps = githubEnv(h, 'pull_request', {
       pull_request: { number: 42, draft: false, head: { sha: SHA, ref: 'feat/x' } },
     });
@@ -798,8 +972,7 @@ describe('ci run — pull request context and single-execution admission', () =>
       deps,
     );
     expect(h.dispatches()[0]!.body).toEqual({
-      projectId: 'project-1',
-      source: 'cli',
+      maxConcurrency: 50,
       environment: 'staging',
       targetUrl: PREVIEW,
       admission: 'all',
@@ -815,8 +988,25 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(h.summary()).toMatchObject({ total: 1, passed: 1 });
   });
 
+  it('a backend that does not echo the preview environment is refused: the accepted tests may have run outside it', async () => {
+    const h = nativeHarness({ echo: 'no-preview' });
+    const deps = githubEnv(h, 'pull_request', {
+      pull_request: { number: 42, draft: false, head: { sha: SHA, ref: 'feat/x' } },
+    });
+    await expect(
+      runCiRun(
+        { ...h.opts, environment: 'staging', targetUrl: PREVIEW, skipPreflight: true },
+        deps,
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 7,
+      message: 'Run exec-1 did not confirm the requested previewName.',
+      details: { field: 'previewName' },
+    });
+  });
+
   it('without --env the run is still stamped with the PR but asks for no preview environment', async () => {
-    const h = harness();
+    const h = nativeHarness();
     const deps = githubEnv(h, 'pull_request', { pull_request: { number: 42, head: { sha: SHA } } });
     await runCiRun({ ...h.opts, targetUrl: PREVIEW, skipPreflight: true }, deps);
     const body = h.dispatches()[0]!.body!;
@@ -826,7 +1016,7 @@ describe('ci run — pull request context and single-execution admission', () =>
   });
 
   it('skips a draft pull request with a notice and dispatches nothing', async () => {
-    const h = harness();
+    const h = nativeHarness();
     const deps = githubEnv(h, 'pull_request', {
       pull_request: { number: 7, draft: true, head: { sha: SHA } },
     });
@@ -834,7 +1024,9 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(h.dispatches()).toEqual([]);
     expect(h.stderr.some(s => s.startsWith('::notice') && s.includes('draft'))).toBe(true);
     // A later step reading `steps.<id>.outputs.passed` sees a number, not ''.
-    expect(h.outputs()).toBe('total=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\n');
+    expect(h.outputs()).toBe(
+      'total=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
+    );
     // Nothing ran, so nothing else describes a run.
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned summary path under this test's mkdtemp directory; no external path input.
     expect(existsSync(h.opts.summaryFile!)).toBe(false);
@@ -843,7 +1035,7 @@ describe('ci run — pull request context and single-execution admission', () =>
   });
 
   it('deployment_status: finds the PR by commit with GITHUB_TOKEN; none → notice, nothing to gate', async () => {
-    const found = harness(undefined, 'passed', {
+    const found = nativeHarness({
       pulls: [{ number: 7, state: 'open', draft: false, head: { sha: SHA, ref: 'feat/y' } }],
     });
     await runCiRun(
@@ -865,7 +1057,7 @@ describe('ci run — pull request context and single-execution admission', () =>
       githubTrigger: { prNumber: 7, commitSha: SHA, branchName: 'feat/y' },
     });
 
-    const none = harness(undefined, 'passed', { pulls: [] });
+    const none = nativeHarness({ pulls: [] });
     await runCiRun(
       { ...none.opts, environment: 'staging', targetUrl: PREVIEW },
       githubEnv(none, 'deployment_status', { deployment: { sha: SHA } }, { GITHUB_TOKEN: 'ghs_x' }),
@@ -874,21 +1066,20 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(none.stderr.some(s => s.startsWith('::notice') && s.includes('nothing to gate'))).toBe(
       true,
     );
-    expect(none.outputs()).toBe('total=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\n');
+    expect(none.outputs()).toBe(
+      'total=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
+    );
   });
 
-  it('a backend that does not echo the admission mode is refused with exit 7, after publishing', async () => {
-    const h = harness(undefined, 'passed', { echo: false });
-    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({
-      exitCode: 7,
-      details: { field: 'admission', reason: 'admission-not-honored' },
-    });
-    expect(h.summary().runs[0]).toMatchObject({ status: 'error' });
-    expect(h.outputs()).toContain('failed=1\n');
+  it('the strict project route establishes admission support without an invented echo field', async () => {
+    const h = nativeHarness({ echo: false });
+    await runCiRun(h.opts, h.deps);
+    expect(h.dispatches()[0]!.body).toMatchObject({ admission: 'all' });
+    expect(h.summary()).toMatchObject({ total: 1, passed: 1 });
   });
 
   it('an unknown --env is refused before anything dispatches, even with --allow-empty', async () => {
-    const h = harness();
+    const h = nativeHarness();
     await expect(
       runCiRun({ ...h.opts, environment: 'stagng', allowEmpty: true }, h.deps),
     ).rejects.toMatchObject({
@@ -903,7 +1094,7 @@ describe('ci run — pull request context and single-execution admission', () =>
 
   it('an environment list that cannot be read fails closed with that error, before any dispatch', async () => {
     // A bad key is the key's error, not a run that goes on to charge.
-    const unauth = harness(undefined, 'passed', {
+    const unauth = nativeHarness({
       envList: { status: 401, code: 'AUTH_INVALID' },
     });
     await expect(
@@ -912,37 +1103,34 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(unauth.dispatches()).toEqual([]);
 
     // A backend that is down is exit 10, after the client's own bounded retries.
-    const down = harness(undefined, 'passed', {
+    const down = nativeHarness({
       envList: { status: 503, code: 'UNAVAILABLE' },
     });
     await expect(
-      runCiRun({ ...down.opts, environment: 'staging' }, down.deps),
+      onFakeTimers(() => runCiRun({ ...down.opts, environment: 'staging' }, down.deps)),
     ).rejects.toMatchObject({ exitCode: 10, code: 'UNAVAILABLE' });
     expect(down.dispatches()).toEqual([]);
   });
 
-  it('a backend with no environment surface for the project leaves --env to the batch', async () => {
-    // A V2 project: the facade answers UNSUPPORTED — there is no list to
-    // check against, so the batch's own validation is the only authority.
-    const v2 = harness(undefined, 'passed', {
-      envList: {
-        status: 501,
-        code: 'UNSUPPORTED',
-        details: { field: 'projectId', reason: 'environments-unsupported-on-v2' },
-      },
+  it('an older backend without the environment route leaves --env to the batch', async () => {
+    // Every project has an environment list now, so an UNSUPPORTED answer is
+    // an ordinary error (exit 7) that dispatches nothing.
+    const unsupported = nativeHarness({
+      envList: { status: 501, code: 'UNSUPPORTED' },
     });
-    await runCiRun({ ...v2.opts, environment: 'staging' }, v2.deps);
-    expect(v2.dispatches()[0]!.body).toMatchObject({ environment: 'staging' });
-    expect(v2.summary()).toMatchObject({ total: 1, passed: 1 });
+    await expect(
+      runCiRun({ ...unsupported.opts, environment: 'staging' }, unsupported.deps),
+    ).rejects.toMatchObject({ exitCode: 7, code: 'UNSUPPORTED' });
+    expect(unsupported.dispatches()).toEqual([]);
 
     // An older backend without the route at all answers 404 for it.
-    const old = harness(undefined, 'passed', { envList: { status: 404, code: 'NOT_FOUND' } });
+    const old = nativeHarness({ envList: { status: 404, code: 'NOT_FOUND' } });
     await runCiRun({ ...old.opts, environment: 'staging' }, old.deps);
     expect(old.dispatches()[0]!.body).toMatchObject({ environment: 'staging' });
   });
 
   it('an interrupt during the environment read propagates as the signal, dispatching nothing', async () => {
-    const h = harness(undefined, 'passed', { envList: 'interrupt' });
+    const h = nativeHarness({ envList: 'interrupt' });
     await expect(runCiRun({ ...h.opts, environment: 'staging' }, h.deps)).rejects.toMatchObject({
       exitCode: 143,
       code: 'INTERRUPTED',
@@ -950,24 +1138,25 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(h.dispatches()).toEqual([]);
   });
 
-  it('a batch the backend refused is not "empty": --allow-empty still exits 5', async () => {
-    const message = 'Field `environment` is invalid: unknown environment.';
-    const h = harness(
-      [batch({ conflicts: [{ testId: 'a', reason: 'error', message }] })],
-      'passed',
-      {
-        environments: ['default', 'nope'],
+  it('a project request refusal cannot be made green by --allow-empty', async () => {
+    const h = nativeHarness({
+      environments: ['default', 'nope'],
+      batchRefusal: {
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        details: { field: 'environment', reason: 'unknown environment' },
       },
-    );
+    });
     await expect(
       runCiRun({ ...h.opts, environment: 'nope', allowEmpty: true }, h.deps),
     ).rejects.toMatchObject({ exitCode: 5 });
-    expect(h.summary()).toMatchObject({ total: 1, skipped: 1 });
-    expect(h.outputs()).toContain('skipped=1\n');
+    expect(h.dispatches()).toHaveLength(1);
+    expect(JSON.parse(h.stdout.join(''))).toMatchObject({ runs: [], results: [] });
+    expect(JSON.parse(h.stdout.join(''))).not.toHaveProperty('partial');
   });
 
   it('refuses an empty --target-url before any request', async () => {
-    const h = harness();
+    const h = nativeHarness();
     await expect(runCiRun({ ...h.opts, targetUrl: '   ' }, h.deps)).rejects.toMatchObject({
       exitCode: 5,
     });
@@ -975,7 +1164,7 @@ describe('ci run — pull request context and single-execution admission', () =>
   });
 
   it('refuses a preview behind Vercel Deployment Protection before dispatching', async () => {
-    const h = harness();
+    const h = nativeHarness();
     // A literal IP skips the probe's DNS step. The redirect is what a
     // protected preview answers a visitor with no Vercel session.
     const protectedPreview = 'http://203.0.113.10';
@@ -996,7 +1185,7 @@ describe('ci run — pull request context and single-execution admission', () =>
   });
 
   it('wires --target-url and --skip-preflight through Commander', async () => {
-    const h = harness();
+    const h = nativeHarness();
     const program = new Command().addCommand(createCiCommand(h.deps));
     await program.parseAsync([
       'node',
@@ -1023,34 +1212,78 @@ describe('ci run — pull request context and single-execution admission', () =>
 
 describe('ci run — execution report (the GitHub App comment content)', () => {
   it('fills the job summary with the server markdown and hands the report to later steps', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => executionReport('exec-1'),
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport('exec-1'),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     h.deps.env = { ...h.deps.env, RUNNER_TEMP: h.dir };
     await runCiRun(h.opts, h.deps);
     // The job summary IS the App's markdown, not the local table.
     expect(h.job()).toBe(executionReport('exec-1').markdown);
     expect(h.job()).not.toContain('TestSprite results');
-    // The structured report rides the summary into --summary-file and --output json alike.
-    expect(h.summary().executionReport).toMatchObject({ executionId: 'exec-1', allPassed: true });
+    // The structured report rides the summary into --summary-file and --output json alike,
+    // naming the launch it describes `runId`.
+    expect(h.summary().executionReport).toMatchObject({ runId: 'exec-1', allPassed: true });
     expect(h.json().summary).toEqual(h.summary());
-    // Step outputs: the five counters first, then the two report files.
+    // Step outputs: counters first, then the two report files.
     const outputs = h.outputs();
-    expect(outputs).toContain('total=1\npassed=1\nfailed=0\nskipped=0\ntimedOut=0\n');
+    expect(outputs).toContain(
+      'total=1\npassed=1\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
+    );
     const jsonPath = /^execution-report-file=(.+)$/m.exec(outputs)?.[1];
     const mdPath = /^execution-report-markdown-file=(.+)$/m.exec(outputs)?.[1];
     expect(jsonPath).toBe(join(h.dir, 'testsprite-execution-report-exec-1.json'));
     expect(mdPath).toBe(join(h.dir, 'testsprite-execution-report-exec-1.md'));
+    const { runId, ...report } = executionReport('exec-1').report;
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned files under this test's mkdtemp RUNNER_TEMP.
-    expect(JSON.parse(readFileSync(jsonPath!, 'utf8'))).toEqual(executionReport('exec-1').report);
+    expect(JSON.parse(readFileSync(jsonPath!, 'utf8'))).toEqual({ ...report, runId });
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned files under this test's mkdtemp RUNNER_TEMP.
     expect(readFileSync(mdPath!, 'utf8')).toBe(executionReport('exec-1').markdown);
     expect(h.calls.filter(c => c.path === '/tests/executions/exec-1/report')).toHaveLength(1);
   });
 
   it('polls while the report is being built, honoring retryAfterSeconds', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: n => (n < 2 ? { ready: false, retryAfterSeconds: 2 } : executionReport('exec-1')),
+    const h = nativeHarness({
+      ...{
+        report: n => (n < 2 ? { ready: false, retryAfterSeconds: 2 } : executionReport('exec-1')),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     await runCiRun(h.opts, h.deps);
     expect(h.calls.filter(c => c.path === '/tests/executions/exec-1/report')).toHaveLength(3);
@@ -1058,25 +1291,65 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
   });
 
   it('falls back to the local table when the report is not ready within --execution-report-timeout', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => ({ ready: false, retryAfterSeconds: 5 }),
+    const h = nativeHarness({
+      ...{
+        report: () => ({ ready: false, retryAfterSeconds: 5 }),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     await runCiRun({ ...h.opts, executionReportTimeoutSeconds: 12 }, h.deps);
     // 12s budget, 5s between polls: polls at 0, 5, 10 — then the budget is gone.
     expect(h.calls.filter(c => c.path === '/tests/executions/exec-1/report')).toHaveLength(3);
-    expect(h.job()).toContain('[Checkout](https://portal.example.com/test)');
+    expect(h.job()).toContain('| Checkout | passed | run-a |');
     expect(h.summary().executionReport).toBeUndefined();
     expect(h.outputs()).not.toContain('execution-report-file=');
     expect(h.stderr.some(s => s.includes('execution report not ready within 12s'))).toBe(true);
   });
 
   it('an older backend (404 on the report) keeps the local table and the exit code', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () =>
-        new Response(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'Cannot GET' } }), {
-          status: 404,
-          headers: { 'content-type': 'application/json' },
-        }),
+    const h = nativeHarness({
+      ...{
+        report: () =>
+          new Response(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'Cannot GET' } }), {
+            status: 404,
+            headers: { 'content-type': 'application/json' },
+          }),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     await runCiRun(h.opts, h.deps);
     expect(h.job()).toContain('TestSprite results');
@@ -1085,34 +1358,69 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
   });
 
   it('a report failure never hides a failing gate', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'failed', {
-      report: () => {
-        throw new Error('boom');
+    const h = nativeHarness({
+      ...{
+        report: () => {
+          throw new Error('boom');
+        },
       },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'FAILED',
+          }),
+        ],
+      ),
     });
     await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
     expect(h.json().summary.failed).toBe(1);
   });
 
-  it('reads no report when the batch names no execution (older backend) or several', async () => {
-    const none = harness([batch({ accepted: [accepted('a')] })]);
-    await runCiRun(none.opts, none.deps);
-    expect(none.calls.some(c => c.path.includes('/report'))).toBe(false);
-
-    const several = harness([
-      batch({ accepted: [accepted('a', 'exec-1'), accepted('b', 'exec-2')] }),
-    ]);
-    await runCiRun(several.opts, several.deps);
-    expect(several.calls.some(c => c.path.includes('/report'))).toBe(false);
-    expect(several.job()).toContain('TestSprite results');
+  it('rejects a missing execution identity before attempting any report', async () => {
+    const h = nativeHarness({
+      launch: { ...projectRun(), runId: undefined } as unknown as ProjectRunResponse,
+    });
+    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(h.calls.some(c => c.path.includes('/report'))).toBe(false);
   });
 
   it('a verdict the report does not carry is stated above it and its rows appended', async () => {
     // The run failed in the CLI's own poll, but the server's report (built
     // from the execution) says all passed — a red check must not get a green
     // summary.
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'failed', {
-      report: () => executionReport('exec-1'),
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport('exec-1'),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'FAILED',
+          }),
+        ],
+      ),
     });
     await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
     const job = h.job();
@@ -1126,53 +1434,95 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
     expect(job).not.toContain('### Not reflected in the execution report');
   });
 
-  it('rows the report cannot contain (a run the CLI could not read) are appended under the report', async () => {
-    const h = harness(
-      [batch({ accepted: [accepted('a', 'exec-1'), accepted('b', 'exec-1')] })],
-      'passed',
-      {
-        report: () => ({
-          ...executionReport('exec-1'),
-          report: {
-            ...executionReport('exec-1').report,
-            stats: { passed: 2, failed: 0, blocked: 0, total: 2 },
-          },
-        }),
-        runRead: (runId: string) =>
-          runId === 'run-b'
-            ? new Response(JSON.stringify({ error: { code: 'INTERNAL', message: 'db down' } }), {
-                status: 500,
-                headers: { 'content-type': 'application/json' },
-              })
-            : undefined,
-      },
-    );
-    await expect(runCiRun({ ...h.opts, timeoutSeconds: 30 }, h.deps)).rejects.toMatchObject({
-      exitCode: expect.any(Number),
+  it('a late integration failure missing from the report is appended under it', async () => {
+    const h = nativeHarness({
+      report: () => executionReport('exec-1'),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-b',
+            caseKey: 'b',
+            title: 'b',
+            testStatus: 'FAILED',
+            error: 'integration failed',
+          }),
+        ],
+      ),
     });
-    const job = h.job();
-    expect(job.startsWith('> [!WARNING]')).toBe(true);
-    expect(job).toContain('### Not reflected in the execution report');
-    expect(job).toMatch(/\| b \| error \| db down \| run-b \|/);
+    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
+    expect(h.job()).toContain('### Not reflected in the execution report');
+    expect(h.job()).toContain('integration failed');
+    expect(h.summary()).toMatchObject({ total: 2, failed: 1 });
   });
 
-  it('a run that timed out means the execution is not finished: no report is read', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'running', {
-      report: () => executionReport('exec-1'),
+  it('a test that timed out means the run is not finished: no report is read', async () => {
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport('exec-1'),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'running', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'RUNNING',
+          }),
+        ],
+      ),
     });
     await expect(runCiRun({ ...h.opts, timeoutSeconds: 2 }, h.deps)).rejects.toMatchObject({
       exitCode: 7,
     });
     expect(h.calls.some(c => c.path.includes('/report'))).toBe(false);
-    expect(h.stderr.some(s => s.includes('a run timed out'))).toBe(true);
+    expect(h.stderr).toContain(
+      '[ci run] a test timed out, so the run is not finished; the job summary uses the local results table',
+    );
     expect(h.outputs()).toContain('timedOut=1\n');
   });
 
   it('an interrupt during the report request falls back — the finished batch still gets its summary and outputs, then the signal exits', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => {
-        throw new InterruptError('SIGINT');
+    const h = nativeHarness({
+      ...{
+        report: () => {
+          throw new InterruptError('SIGINT');
+        },
       },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     // The signal's exit code wins over the gate's 0, but only after the
     // summary and outputs are written.
@@ -1180,6 +1530,8 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
     expect(
       h.stderr.some(s => s.includes('interrupted while waiting for the execution report')),
     ).toBe(true);
+    expect(h.json()).not.toHaveProperty('partial');
+    expect(h.stderr.join('\n')).not.toContain('still executing on the server');
     expect(h.job()).toContain('TestSprite results');
     expect(h.outputs()).toContain('passed=1\n');
   });
@@ -1189,8 +1541,28 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
     // an armed scope the signal handler's disarmed path would exit at once.
     const shutdown = new ShutdownController();
     const armedDuringSleep: boolean[] = [];
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => ({ ready: false, retryAfterSeconds: 2 }),
+    const h = nativeHarness({
+      ...{
+        report: () => ({ ready: false, retryAfterSeconds: 2 }),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     const deps = {
       ...h.deps,
@@ -1218,39 +1590,128 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
     red.report.allPassed = false;
     red.report.tests[0]!.status = 'FAILED';
     red.markdown = '> [!CAUTION]\n> ### 1 of 1 failed\n';
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'failed', {
-      report: () => red,
+    const h = nativeHarness({
+      ...{
+        report: () => red,
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'FAILED',
+          }),
+        ],
+      ),
     });
     await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
     expect(h.job()).toBe(red.markdown);
   });
 
-  it('a batch whose rows do not all name the same execution reads no report (a partial report would read as the whole batch)', async () => {
-    const mixed = harness(
-      [batch({ accepted: [accepted('a', 'exec-1'), accepted('b')] })],
-      'passed',
-      {
-        report: () => executionReport('exec-1'),
-      },
-    );
-    await runCiRun(mixed.opts, mixed.deps);
-    expect(mixed.calls.some(c => c.path.includes('/report'))).toBe(false);
-    expect(mixed.job()).toContain('TestSprite results');
-  });
-
-  it("a report for another execution is not this batch's", async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => executionReport('exec-2'),
+  it('does not present one execution report as the report for joined work in another execution', async () => {
+    const h = nativeHarness({
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        held: [{ testId: 'b', runId: 'exec-2', resultId: 'run-b' }],
+      }),
+      runRead: () =>
+        new Response(
+          JSON.stringify(
+            resultCard({
+              resultId: 'run-b',
+              runId: 'exec-2',
+              projectId: 'project-1',
+              environment: { id: 'env-0', name: 'default' },
+            }),
+          ),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      listingRead: runId =>
+        new Response(
+          JSON.stringify(
+            runListing({ runId, projectId: 'project-1', status: 'finished', cancelled: false }, [
+              resultLine({
+                runId,
+                resultId: runId === 'exec-1' ? 'run-a' : 'run-b',
+                caseKey: runId === 'exec-1' ? 'a' : 'b',
+                testStatus: 'PASSED',
+              }),
+            ]),
+          ),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      report: () => executionReport('exec-1'),
     });
     await runCiRun(h.opts, h.deps);
-    expect(h.stderr.some(s => s.includes('names execution exec-2, not exec-1'))).toBe(true);
+    expect(h.calls.some(c => c.path.includes('/report'))).toBe(false);
+    expect(h.summary()).toMatchObject({ total: 2, passed: 2 });
+  });
+
+  it("a report for another run is not this batch's", async () => {
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport('exec-2'),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
+    });
+    await runCiRun(h.opts, h.deps);
+    expect(h.stderr).toContain(
+      '[ci run] execution report names run exec-2, not exec-1; the job summary uses the local results table',
+    );
     expect(h.job()).toContain('TestSprite results');
     expect(h.summary().executionReport).toBeUndefined();
   });
 
   it('--no-execution-report: nothing is read, the job summary is the local table', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => executionReport('exec-1'),
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport('exec-1'),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     await runCiRun({ ...h.opts, executionReport: false }, h.deps);
     expect(h.calls.some(c => c.path.includes('/report'))).toBe(false);
@@ -1259,8 +1720,28 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
   });
 
   it('the report files are written owner-only (0600)', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => executionReport('exec-1'),
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport('exec-1'),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     h.deps.env = { ...h.deps.env, RUNNER_TEMP: h.dir };
     await runCiRun(h.opts, h.deps);
@@ -1272,8 +1753,28 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
   });
 
   it('commander: --no-execution-report reaches the run as executionReport: false', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed', {
-      report: () => executionReport('exec-1'),
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport('exec-1'),
+      },
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     const program = new Command().addCommand(createCiCommand(h.deps));
     await program.parseAsync([
@@ -1291,7 +1792,7 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
   });
 
   it('commander: --execution-report-timeout is validated like --timeout', async () => {
-    const h = harness();
+    const h = nativeHarness();
     const program = new Command().addCommand(createCiCommand(h.deps));
     await expect(
       program.parseAsync([
@@ -1311,6 +1812,139 @@ describe('ci run — execution report (the GitHub App comment content)', () => {
 
 // ── telemetry facts ──────────────────────────────────────────────────────────
 
+// Wire names in the fixtures: `runId` is one test's result (`run-<test>`) and
+// `executionId` the launch. Everything `ci run` prints or writes calls them
+// `resultId` and `runId`.
+describe('ci run — the launch is runId and each test has a resultId', () => {
+  const twoTests = () => ({
+    launch: projectRun({ runId: 'exec-1', projectId: 'project-1', total: 2 }),
+    listing: runListing(
+      { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+      [
+        resultLine({ runId: 'exec-1', resultId: 'run-a', caseKey: 'a', testStatus: 'PASSED' }),
+        resultLine({ runId: 'exec-1', resultId: 'run-b', caseKey: 'b', testStatus: 'PASSED' }),
+      ],
+    ),
+  });
+  it('prints native launch receipts and native result rows without an accepted envelope', async () => {
+    const h = nativeHarness({ ...twoTests(), report: () => executionReport('exec-1') });
+    await runCiRun(h.opts, h.deps);
+    const printed = h.json();
+    expect(printed).toMatchObject({
+      runs: [{ runId: 'exec-1', total: 2, status: 'finished', cancelled: false }],
+      results: [
+        { resultId: 'run-a', runId: 'exec-1' },
+        { resultId: 'run-b', runId: 'exec-1' },
+      ],
+    });
+    expect(printed).not.toHaveProperty('accepted');
+    expect(printed.summary.executionReport?.runId).toBe('exec-1');
+    expect(h.stdout.join('')).not.toContain('executionId');
+  });
+  it('lists one summary row per test and keeps execution receipts separate', async () => {
+    const h = nativeHarness(twoTests());
+    await runCiRun(h.opts, h.deps);
+    expect(h.summary().results.map(row => [row.testId, row.resultId, row.runId])).toEqual([
+      ['a', 'run-a', 'exec-1'],
+      ['b', 'run-b', 'exec-1'],
+    ]);
+    expect(h.summary()).not.toHaveProperty('runs');
+  });
+  it('writes exactly the stdout summary to --summary-file', async () => {
+    const h = nativeHarness({ ...twoTests(), report: () => executionReport('exec-1') });
+    await runCiRun(h.opts, h.deps);
+    expect(h.summary()).toEqual(h.json().summary);
+  });
+  it('retains native held references and keeps borrowed rows scoped', async () => {
+    const held = { testId: 'busy', runId: 'exec-other', resultId: 'run-other' };
+    const h = nativeHarness({
+      launch: projectRun({ runId: 'exec-1', projectId: 'project-1', held: [held] }),
+      runRead: () =>
+        new Response(
+          JSON.stringify(
+            resultCard({
+              runId: held.runId,
+              resultId: held.resultId,
+              testId: held.testId,
+              projectId: 'project-1',
+              environment: { id: 'env-0', name: 'default' },
+            }),
+          ),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      listingRead: runId =>
+        new Response(
+          JSON.stringify(
+            runListing({ runId, projectId: 'project-1', status: 'finished', cancelled: false }, [
+              resultLine({
+                runId,
+                resultId: runId === 'exec-1' ? 'run-a' : held.resultId,
+                caseKey: runId === 'exec-1' ? 'a' : held.testId,
+                testStatus: 'PASSED',
+              }),
+            ]),
+          ),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+    });
+    await runCiRun(h.opts, h.deps);
+    expect(h.json()).toMatchObject({
+      runs: [{ held: [held] }, { runId: 'exec-other', joined: true }],
+      joinedRuns: [{ runId: 'exec-other', resultIds: ['run-other'] }],
+    });
+    expect(h.summary().results).toContainEqual(
+      expect.objectContaining({ testId: 'busy', resultId: 'run-other', runId: 'exec-other' }),
+    );
+  });
+  it('names the execution and result IDs in the local job summary', async () => {
+    const h = nativeHarness(twoTests());
+    await runCiRun(h.opts, h.deps);
+    expect(h.job()).toContain('\nRun `exec-1`\n');
+    expect(h.job()).toContain('| Test | Status | Result |');
+    expect(h.job()).toContain('run-a');
+  });
+  it('reconciles an unreported late failure with the report using native result IDs', async () => {
+    const data = twoTests();
+    data.listing.results[1] = resultLine({
+      runId: 'exec-1',
+      resultId: 'run-b',
+      caseKey: 'b',
+      title: 'b',
+      testStatus: 'FAILED',
+      error: 'integration failed',
+    });
+    const h = nativeHarness({ ...data, report: () => executionReport('exec-1') });
+    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
+    expect(h.job()).toContain("The report below is the server's view of run `exec-1`");
+    expect(h.job()).toContain('| Test | Status | Detail | Result |');
+    expect(h.job()).toContain('run-b');
+  });
+  it('refuses an older launch envelope without manufacturing native IDs', async () => {
+    const h = nativeHarness({
+      launch: { resultId: 'old-result', accepted: [] } as unknown as ProjectRunResponse,
+    });
+    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(h.calls.some(row => row.path === '/results')).toBe(false);
+    expect(h.json()).toMatchObject({ runs: [], results: [] });
+    expect(h.json()).not.toHaveProperty('partial');
+  });
+  it('retains an empty execution receipt while --allow-empty controls the zero-result gate', async () => {
+    const h = nativeHarness({
+      launch: projectRun({ runId: 'exec-1', projectId: 'project-1', total: 0 }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [],
+      ),
+    });
+    await runCiRun({ ...h.opts, allowEmpty: true }, h.deps);
+    expect(h.json()).toMatchObject({
+      runs: [{ runId: 'exec-1', total: 0 }],
+      results: [],
+      summary: { total: 0 },
+    });
+  });
+});
+
 describe('ci run telemetry facts', () => {
   const EXECUTION = '7ceab81a-a20a-4141-aa89-f6886bdbb11c';
   beforeEach(() => {
@@ -1321,8 +1955,28 @@ describe('ci run telemetry facts', () => {
   });
 
   it('a gated run names its outcome, the execution (a UUID) and that the report arrived', async () => {
-    const h = harness([batch({ accepted: [accepted('a', EXECUTION)] })], 'passed', {
-      report: () => executionReport(EXECUTION),
+    const h = nativeHarness({
+      ...{
+        report: () => executionReport(EXECUTION),
+      },
+      launch: projectRun({
+        runId: EXECUTION,
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: EXECUTION, projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: EXECUTION,
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     await runCiRun(h.opts, h.deps);
     expect(takeTelemetryExtras()).toMatchObject({
@@ -1335,7 +1989,26 @@ describe('ci run telemetry facts', () => {
   });
 
   it('a gated run on a backend without the report route: reportReady:false, and a non-UUID id is dropped', async () => {
-    const h = harness([batch({ accepted: [accepted('a', 'exec-1')] })], 'passed');
+    const h = nativeHarness({
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: 'exec-1',
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
+    });
     await runCiRun(h.opts, h.deps);
     const facts = takeTelemetryExtras();
     expect(facts).toMatchObject({ ciRunOutcome: 'gated', reportReady: false });
@@ -1343,13 +2016,32 @@ describe('ci run telemetry facts', () => {
   });
 
   it('a red gate is still `gated` — the exit code is the verdict, the outcome says the gate ran', async () => {
-    const h = harness([batch({ accepted: [accepted('a', EXECUTION)] })], 'failed');
+    const h = nativeHarness({
+      launch: projectRun({
+        runId: EXECUTION,
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: EXECUTION, projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: EXECUTION,
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'FAILED',
+          }),
+        ],
+      ),
+    });
     await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 1 });
     expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'gated', executionId: EXECUTION });
   });
 
   it('a draft pull request is skipped_draft; a deployment with no pull request is skipped_no_pr', async () => {
-    const draft = harness();
+    const draft = nativeHarness();
     await runCiRun(
       { ...draft.opts, environment: 'staging', targetUrl: PREVIEW },
       githubEnv(draft, 'pull_request', {
@@ -1358,7 +2050,7 @@ describe('ci run telemetry facts', () => {
     );
     expect(takeTelemetryExtras()).toEqual({ ciRunOutcome: 'skipped_draft' });
 
-    const none = harness(undefined, 'passed', { pulls: [] });
+    const none = nativeHarness({ pulls: [] });
     await runCiRun(
       { ...none.opts, environment: 'staging', targetUrl: PREVIEW },
       githubEnv(none, 'deployment_status', { deployment: { sha: SHA } }, { GITHUB_TOKEN: 'ghs_x' }),
@@ -1367,14 +2059,16 @@ describe('ci run telemetry facts', () => {
   });
 
   it('an unknown --env is refused_env; a backend without the CI contract is refused_admission', async () => {
-    const env = harness();
+    const env = nativeHarness();
     await expect(runCiRun({ ...env.opts, environment: 'stagng' }, env.deps)).rejects.toMatchObject({
       exitCode: 5,
     });
     expect(takeTelemetryExtras()).toEqual({ ciRunOutcome: 'refused_env' });
 
-    const old = harness(undefined, 'passed', { echo: false });
-    await expect(runCiRun(old.opts, old.deps)).rejects.toMatchObject({ exitCode: 7 });
+    const old = nativeHarness({ echo: false });
+    await expect(
+      runCiRun({ ...old.opts, targetUrl: PREVIEW, skipPreflight: true }, old.deps),
+    ).rejects.toMatchObject({ exitCode: 7 });
     expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'refused_admission' });
   });
 
@@ -1387,14 +2081,16 @@ describe('ci run telemetry facts', () => {
     [429, 'RATE_LIMITED', {}, 'refused_other'],
     [401, 'AUTH_ERROR', {}, 'refused_other'],
   ] as const)('a whole-batch refusal %i %s %j is %s', async (status, code, details, outcome) => {
-    const h = harness(undefined, 'passed', { batchRefusal: { status, code, details } });
+    const h = nativeHarness({ batchRefusal: { status, code, details } });
     // (a 401's code is normalised by the client; the outcome is what matters here)
-    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ httpStatus: status });
-    expect(takeTelemetryExtras()).toEqual({ ciRunOutcome: outcome });
+    await expect(onFakeTimers(() => runCiRun(h.opts, h.deps))).rejects.toMatchObject({
+      httpStatus: status,
+    });
+    expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: outcome });
   });
 
   it('a refusal at the environment pre-check gets the same mapping (402 → refused_billing)', async () => {
-    const h = harness(undefined, 'passed', {
+    const h = nativeHarness({
       envList: { status: 402, code: 'INSUFFICIENT_CREDITS' },
     });
     await expect(runCiRun({ ...h.opts, environment: 'staging' }, h.deps)).rejects.toMatchObject({
@@ -1408,16 +2104,44 @@ describe('ci run telemetry facts', () => {
     // manual cancel or the runner timeout still reports which execution keeps
     // running. No reportReady: the wait never finished.
     const shutdown = new ShutdownController();
-    const h = harness([batch({ accepted: [accepted('a', EXECUTION)] })], 'passed', {
-      // The signal lands while the first poll is in flight (the long-poll has
-      // no sleep to hook), so the wait is interrupted, not timed out.
-      runRead: runId => {
-        shutdown.interrupt('SIGTERM');
-        return new Response(JSON.stringify(runResult(runId, 'running')), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
+    const h = nativeHarness({
+      ...{
+        // The signal lands while the first poll is in flight (the long-poll has
+        // no sleep to hook), so the wait is interrupted, not timed out.
+        listingRead: runId => {
+          shutdown.interrupt('SIGTERM');
+          return new Response(
+            JSON.stringify(
+              runListing(
+                { runId, projectId: 'project-1', status: 'running', cancelled: false },
+                [],
+              ),
+            ),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
+        },
       },
+      launch: projectRun({
+        runId: EXECUTION,
+        projectId: 'project-1',
+        total: 1,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: EXECUTION, projectId: 'project-1', status: 'finished', cancelled: false },
+        [
+          resultLine({
+            runId: EXECUTION,
+            resultId: 'run-a',
+            caseKey: 'a',
+            title: 'Checkout',
+            testStatus: 'PASSED',
+          }),
+        ],
+      ),
     });
     const deps = { ...h.deps, shutdown };
     await expect(runCiRun(h.opts, deps)).rejects.toBeInstanceOf(InterruptError);
@@ -1427,12 +2151,372 @@ describe('ci run telemetry facts', () => {
   });
 
   it('a batch that selected nothing is `empty`, green or not', async () => {
-    const red = harness([batch()]);
+    const red = nativeHarness({
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 0,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [],
+      ),
+    });
     await expect(runCiRun(red.opts, red.deps)).rejects.toMatchObject({ exitCode: 5 });
     expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'empty' });
 
-    const green = harness([batch()]);
+    const green = nativeHarness({
+      launch: projectRun({
+        runId: 'exec-1',
+        projectId: 'project-1',
+        total: 0,
+        environment: { id: 'env-0', name: 'default' },
+      }),
+      listing: runListing(
+        { runId: 'exec-1', projectId: 'project-1', status: 'finished', cancelled: false },
+        [],
+      ),
+    });
     await runCiRun({ ...green.opts, allowEmpty: true }, green.deps);
     expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'empty' });
+  });
+});
+
+describe('ci run — shape C: --wait-for-status and --target-url-template', () => {
+  const TEMPLATE = 'https://storefront-git-{branch-slug}-acme.vercel.app';
+  const RENDERED = 'https://storefront-git-feat-login-form-acme.vercel.app';
+  const pr = () =>
+    ({
+      pull_request: { number: 42, draft: false, head: { sha: SHA, ref: 'feat/Login_Form' } },
+    }) as const;
+  const vercel = (state: string, description = 'Deployment has completed') => ({
+    context: 'Vercel',
+    state,
+    description,
+    updated_at: '2026-10-23T21:00:00Z',
+  });
+  beforeEach(() => {
+    takeTelemetryExtras();
+  });
+
+  it('renders the template from the pull request and dispatches to it, in github-pr-<N>', async () => {
+    const h = nativeHarness();
+    const deps = githubEnv(h, 'pull_request', pr());
+    await runCiRun(
+      { ...h.opts, environment: 'staging', targetUrlTemplate: TEMPLATE, skipPreflight: true },
+      deps,
+    );
+    expect(h.dispatches()[0]!.body).toMatchObject({
+      targetUrl: RENDERED,
+      previewName: 'github-pr-42',
+      githubTrigger: { prNumber: 42, branchName: 'feat/Login_Form' },
+    });
+    expect(h.stderr.some(s => s.includes(`rendered to ${RENDERED}`))).toBe(true);
+    expect(h.summary()).toMatchObject({ total: 1, passed: 1 });
+    expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'gated' });
+  });
+
+  it('a {branch} in the host part whose value would change the host is refused before any dispatch', async () => {
+    const h = nativeHarness();
+    const deps = githubEnv(h, 'pull_request', {
+      pull_request: { number: 42, draft: false, head: { sha: SHA, ref: 'attacker.example/x' } },
+    });
+    await expect(
+      runCiRun(
+        {
+          ...h.opts,
+          targetUrlTemplate: 'https://{branch}.preview.example.com',
+          skipPreflight: true,
+        },
+        deps,
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      details: {
+        field: 'target-url-template',
+        reason: 'url_unsafe_host',
+        unsafe: '{branch} = "attacker.example/x"',
+      },
+    });
+    expect(h.dispatches()).toEqual([]);
+    expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'refused_url_template' });
+    // The slug form of the same branch is what the host part is for.
+    const ok = nativeHarness();
+    await runCiRun(
+      {
+        ...ok.opts,
+        environment: 'staging',
+        targetUrlTemplate: 'https://{branch-slug}.preview.example.com',
+        skipPreflight: true,
+      },
+      githubEnv(ok, 'pull_request', {
+        pull_request: { number: 42, draft: false, head: { sha: SHA, ref: 'attacker.example/x' } },
+      }),
+    );
+    expect(ok.dispatches()[0]!.body).toMatchObject({
+      targetUrl: 'https://attacker-example-x.preview.example.com',
+    });
+  });
+
+  it('a pattern this run cannot fill is refused before any dispatch, naming the placeholder', async () => {
+    const h = nativeHarness();
+    // A schedule names no pull request, so {pr} has no value.
+    const deps = githubEnv(h, 'schedule', {}, { GITHUB_SHA: SHA, GITHUB_REF_NAME: 'main' });
+    await expect(
+      runCiRun(
+        { ...h.opts, targetUrlTemplate: 'https://pr-{pr}.example.com', skipPreflight: true },
+        deps,
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      details: { field: 'target-url-template', reason: 'url_unresolved', missing: '{pr}' },
+    });
+    expect(h.dispatches()).toEqual([]);
+    expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'refused_url_template' });
+    // {branch-slug} and {sha} do render on a schedule from what the runner exposes.
+    const ok = nativeHarness();
+    await runCiRun(
+      {
+        ...ok.opts,
+        targetUrlTemplate: 'https://{branch-slug}-{short-sha}.example.com',
+        skipPreflight: true,
+      },
+      githubEnv(ok, 'schedule', {}, { GITHUB_SHA: SHA, GITHUB_REF_NAME: 'Release/2026' }),
+    );
+    expect(ok.dispatches()[0]!.body).toMatchObject({
+      targetUrl: `https://release-2026-${SHA.slice(0, 7)}.example.com`,
+    });
+  });
+
+  it('refuses a malformed pattern, a template next to --target-url, and a dangling --status-timeout, before any request', async () => {
+    const h = nativeHarness();
+    await expect(
+      runCiRun({ ...h.opts, targetUrlTemplate: 'storefront-{pr}.example.com' }, h.deps),
+    ).rejects.toMatchObject({ exitCode: 5, details: { field: 'target-url-template' } });
+    await expect(
+      runCiRun({ ...h.opts, targetUrlTemplate: TEMPLATE, targetUrl: PREVIEW }, h.deps),
+    ).rejects.toMatchObject({ exitCode: 5, details: { field: 'target-url-template' } });
+    await expect(runCiRun({ ...h.opts, statusTimeoutSeconds: 60 }, h.deps)).rejects.toMatchObject({
+      exitCode: 5,
+      details: { field: 'status-timeout' },
+    });
+    await expect(runCiRun({ ...h.opts, waitForStatus: '  ' }, h.deps)).rejects.toMatchObject({
+      exitCode: 5,
+      details: { field: 'wait-for-status' },
+    });
+    expect(h.calls).toEqual([]);
+  });
+
+  it('waits for the named status on the head commit, reading both APIs each round, then runs', async () => {
+    const h = nativeHarness({
+      signals: [
+        {},
+        { statuses: [vercel('pending', 'Deployment has started')] },
+        { statuses: [vercel('success')] },
+      ],
+    });
+    const deps = githubEnv(h, 'pull_request', pr(), { GITHUB_TOKEN: 'ghs_x' });
+    await runCiRun(
+      {
+        ...h.opts,
+        environment: 'staging',
+        waitForStatus: 'Vercel',
+        targetUrlTemplate: TEMPLATE,
+        skipPreflight: true,
+      },
+      deps,
+    );
+    const github = h.calls.filter(c => c.path.startsWith('github:')).map(c => c.path);
+    expect(github).toEqual([
+      `github:/repos/acme/storefront/commits/${SHA}/status`,
+      `github:/repos/acme/storefront/commits/${SHA}/check-runs`,
+      `github:/repos/acme/storefront/commits/${SHA}/status`,
+      `github:/repos/acme/storefront/commits/${SHA}/check-runs`,
+      `github:/repos/acme/storefront/commits/${SHA}/status`,
+      `github:/repos/acme/storefront/commits/${SHA}/check-runs`,
+    ]);
+    // The reads all happen before the dispatch; nothing is charged while waiting.
+    const firstDispatch = h.calls.findIndex(c => /^\/projects\/[^/]+\/runs$/.test(c.path));
+    expect(h.calls.slice(0, firstDispatch).filter(c => c.method === 'POST')).toEqual([]);
+    expect(h.dispatches()[0]!.body).toMatchObject({
+      targetUrl: RENDERED,
+      previewName: 'github-pr-42',
+    });
+    expect(h.stderr.some(s => s.includes('waiting up to 900s for "Vercel"'))).toBe(true);
+    expect(h.stderr.some(s => s.includes('"Vercel" succeeded (commit status)'))).toBe(true);
+  });
+
+  it('a check run of that name counts the same way (Cloudflare Pages)', async () => {
+    const h = nativeHarness({
+      signals: [
+        { checks: [{ name: 'Cloudflare Pages', status: 'in_progress', conclusion: null }] },
+        {
+          checks: [
+            {
+              name: 'Cloudflare Pages',
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: '2026-10-23T21:00:00Z',
+            },
+          ],
+        },
+      ],
+    });
+    await runCiRun(
+      { ...h.opts, waitForStatus: 'Cloudflare Pages', targetUrl: PREVIEW, skipPreflight: true },
+      githubEnv(h, 'pull_request', pr(), { GITHUB_TOKEN: 'ghs_x' }),
+    );
+    expect(h.dispatches()).toHaveLength(1);
+    expect(h.stderr.some(s => s.includes('"Cloudflare Pages" succeeded (check run)'))).toBe(true);
+  });
+
+  it('a failed or ignored build is a skip: notice, one-line job summary, zero outputs, exit 0, nothing dispatched', async () => {
+    for (const signal of [
+      vercel('failure', 'Deployment has failed'),
+      vercel('success', 'Canceled: ignored build step'),
+    ]) {
+      const h = nativeHarness({ signals: [{ statuses: [signal] }] });
+      await runCiRun(
+        { ...h.opts, environment: 'staging', waitForStatus: 'Vercel', targetUrlTemplate: TEMPLATE },
+        githubEnv(h, 'pull_request', pr(), { GITHUB_TOKEN: 'ghs_x' }),
+      );
+      expect(h.dispatches()).toEqual([]);
+      expect(h.stderr.some(s => s.startsWith('::notice') && s.includes('tests not run'))).toBe(
+        true,
+      );
+      expect(h.outputs()).toBe(
+        'total=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
+      );
+      expect(h.job()).toContain('no preview for this commit — tests not run');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned summary path under this test's mkdtemp directory; no external path input.
+      expect(existsSync(h.opts.summaryFile!)).toBe(false);
+      expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'skipped_no_preview' });
+    }
+  });
+
+  it('the skip notice encodes the status description, so it stays one workflow command', async () => {
+    const h = nativeHarness({
+      signals: [{ statuses: [vercel('failure', 'Build 100% failed\r\n::error::forged')] }],
+    });
+    await runCiRun(
+      { ...h.opts, environment: 'staging', waitForStatus: 'Vercel', targetUrlTemplate: TEMPLATE },
+      githubEnv(h, 'pull_request', pr(), { GITHUB_TOKEN: 'ghs_x' }),
+    );
+    const notices = h.stderr
+      .join('\n')
+      .split('\n')
+      .filter(line => line.startsWith('::'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatch(/^::notice title=TestSprite::/);
+    expect(notices[0]).toContain('Build 100%25 failed%0D%0A::error::forged');
+  });
+
+  it('nothing terminal within --status-timeout is exit 7, naming every check seen on the commit', async () => {
+    const h = nativeHarness({
+      signals: [
+        {
+          statuses: [vercel('pending')],
+          checks: [{ name: 'TestSprite V3', status: 'completed', conclusion: 'success' }],
+        },
+      ],
+    });
+    await expect(
+      runCiRun(
+        { ...h.opts, waitForStatus: 'Vercle', statusTimeoutSeconds: 12, targetUrl: PREVIEW },
+        githubEnv(h, 'pull_request', pr(), { GITHUB_TOKEN: 'ghs_x' }),
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 7,
+      details: {
+        field: 'wait-for-status',
+        reason: 'preview-status-timeout',
+        seen: ['TestSprite V3', 'Vercel'],
+      },
+    });
+    expect(h.dispatches()).toEqual([]);
+    expect(h.outputs()).toBe(
+      'total=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
+    );
+    expect(takeTelemetryExtras()).toMatchObject({ ciRunOutcome: 'timeout_preview' });
+  });
+
+  it('needs the job token and a commit to watch', async () => {
+    const h = nativeHarness();
+    await expect(
+      runCiRun({ ...h.opts, waitForStatus: 'Vercel' }, githubEnv(h, 'pull_request', pr())),
+    ).rejects.toMatchObject({ exitCode: 5, details: { field: 'GITHUB_TOKEN' } });
+    const outside = nativeHarness();
+    outside.deps.env.GITHUB_ACTIONS = 'false';
+    await expect(
+      runCiRun(
+        { ...outside.opts, waitForStatus: 'Vercel' },
+        { ...outside.deps, env: { ...outside.deps.env, GITHUB_TOKEN: 'ghs_x' } },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, details: { field: 'wait-for-status' } });
+    expect(h.dispatches()).toEqual([]);
+    expect(outside.dispatches()).toEqual([]);
+  });
+
+  it('a dry run renders the template but polls nothing', async () => {
+    const h = nativeHarness();
+    await runCiRun(
+      { ...h.opts, dryRun: true, waitForStatus: 'Vercel', targetUrlTemplate: TEMPLATE },
+      githubEnv(h, 'pull_request', pr(), { GITHUB_TOKEN: 'ghs_x' }),
+    );
+    expect(h.calls.filter(c => c.path.startsWith('github:'))).toEqual([]);
+    expect(h.dispatches()).toEqual([]);
+    expect(JSON.parse(h.stdout.join('\n'))).toMatchObject({
+      dryRun: true,
+      requests: [{ body: { targetUrl: RENDERED } }],
+    });
+  });
+
+  it('wires the three flags through Commander', async () => {
+    const h = nativeHarness({ signals: [{ statuses: [vercel('success')] }] });
+    const deps = githubEnv(h, 'pull_request', pr(), { GITHUB_TOKEN: 'ghs_x' });
+    const program = new Command().addCommand(createCiCommand(deps));
+    await program.parseAsync([
+      'node',
+      'testsprite',
+      'ci',
+      'run',
+      '--project',
+      'project-1',
+      '--env',
+      'staging',
+      '--wait-for-status',
+      'Vercel',
+      '--status-timeout',
+      '120',
+      '--target-url-template',
+      TEMPLATE,
+      '--skip-preflight',
+      '--summary-file',
+      h.opts.summaryFile!,
+    ]);
+    expect(h.dispatches()[0]!.body).toMatchObject({
+      environment: 'staging',
+      targetUrl: RENDERED,
+      previewName: 'github-pr-42',
+      admission: 'all',
+    });
+    expect(h.stderr.some(s => s.includes('waiting up to 120s'))).toBe(true);
+    await expect(
+      new Command()
+        .addCommand(createCiCommand(deps))
+        .parseAsync([
+          'node',
+          'testsprite',
+          'ci',
+          'run',
+          '--project',
+          'project-1',
+          '--wait-for-status',
+          'Vercel',
+          '--status-timeout',
+          '0',
+        ]),
+    ).rejects.toMatchObject({ exitCode: 5, details: { field: 'status-timeout' } });
   });
 });

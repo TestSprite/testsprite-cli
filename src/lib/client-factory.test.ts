@@ -256,31 +256,9 @@ describe('makeHttpClient — dry-run path', () => {
   });
 });
 
-// M3.3 piece-4 — getRunFailure dry-run path
-describe('makeHttpClient — getRunFailure dry-run path (M3.3 piece-4)', () => {
+describe('makeHttpClient — GET /runs/{runId} dry-run path', () => {
   afterEach(() => {
     resetDryRunBannerForTesting();
-  });
-
-  it('GET /runs/{runId}/failure returns a FailureContext-shaped body in dry-run', async () => {
-    const client = makeHttpClient(
-      { profile: 'default', output: 'json', debug: false, dryRun: true },
-      {
-        env: {} as NodeJS.ProcessEnv,
-        credentialsPath: NO_CREDS_PATH,
-        stderr: () => {},
-      },
-    );
-    const result = await client.get<{
-      snapshotId: string;
-      testId: string;
-      result: { snapshotId: string; runIdIfAvailable: string };
-    }>('/runs/run_abc/failure');
-    expect(result.snapshotId).toBeTruthy();
-    expect(result.testId).toBeTruthy();
-    expect(result.result.snapshotId).toBe(result.snapshotId);
-    // Run-scoped bundle must have runIdIfAvailable set
-    expect(result.result.runIdIfAvailable).toBe('run_abc');
   });
 
   it('GET /runs/{runId} returns a run-status-shaped body in dry-run', async () => {
@@ -296,7 +274,7 @@ describe('makeHttpClient — getRunFailure dry-run path (M3.3 piece-4)', () => {
       runId: string;
       testId: string;
       status: string;
-    }>('/runs/run_abc');
+    }>('/runs/res_dryrun0001');
     expect(result.runId).toBeTruthy();
     expect(result.testId).toBeTruthy();
     expect(result.status).toBeTruthy();

@@ -11,8 +11,7 @@
  *
  * Deliberately NOT applied to `Output.print`'s success data: generated test
  * code, plans and backend-test fixtures are the user's OWN content and must
- * round-trip byte-identical (`test code get --output json` -> edit ->
- * `test code put`), even when they legitimately contain a literal
+ * round-trip byte-identical, even when they legitimately contain a literal
  * `Authorization: Bearer …` header or a `password` fixture key — that is
  * not a secret the CLI is leaking, it is the value the user is asking to see
  * back. Applied instead at `Output.error`'s `details`, the hand-built
@@ -61,7 +60,7 @@ const SECRET_KEY_SUFFIXES = [
  * suffix rule like the list above. This CLI's own pagination continuation
  * handles are also literally named "...Token" (`nextToken`, `startingToken`)
  * and are opaque cursors, not secrets; a suffix match on "token" would blank
- * them (`test result --history`'s `nextToken`, `project list`'s
+ * them (`test list`'s and `project list`'s
  * `startingToken`/`nextToken`). Add a new compound auth-token name here, not
  * to the suffix list above.
  */
@@ -81,7 +80,7 @@ function normalizeKey(key: string): string {
   return key.replace(/[^a-z0-9]/gi, '').toLowerCase();
 }
 
-function isSecretKey(key: string): boolean {
+export function isSecretKey(key: string): boolean {
   const normalized = normalizeKey(key);
   if (SECRET_TOKEN_KEYS.has(normalized)) return true;
   return SECRET_KEY_SUFFIXES.some(suffix => normalized.endsWith(suffix));

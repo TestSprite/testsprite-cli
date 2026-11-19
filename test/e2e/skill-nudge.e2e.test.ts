@@ -129,7 +129,7 @@ describe('skill nudge — suppression gates', () => {
   it('is silent under --dry-run (offline, exit 0)', () => {
     const proj = freshDir('ts-nudge-proj-');
     const home = homeWithCreds();
-    const result = runCli(['--dry-run', 'auth', 'whoami'], { cwd: proj, home });
+    const result = runCli(['--dry-run', 'auth', 'status'], { cwd: proj, home });
     expect(result.status).toBe(0);
     expect(result.stderr).not.toContain(WARN_SUBSTR);
   });
@@ -152,20 +152,6 @@ describe('skill nudge — suppression gates', () => {
     },
     NETWORK_TIMEOUT_MS,
   );
-
-  // `test create --plan-template` is pure-local and informational
-  // (same family as `setup` / `agent install`) — it must not trip the
-  // "test create" entry in SKILL_NUDGE_COMMANDS even with a configured
-  // profile and no skill installed. Regression guard for the flag-aware
-  // skip added to src/index.ts's preAction hook.
-  it('is silent for `test create --plan-template` even with a configured profile and no skill installed', () => {
-    const proj = freshDir('ts-nudge-proj-');
-    const home = homeWithCreds();
-    const result = runCli(['test', 'create', '--plan-template'], { cwd: proj, home });
-    expect(result.status).toBe(0);
-    expect(result.stderr).not.toContain(WARN_SUBSTR);
-    expect(result.stdout).toContain('"planSteps"');
-  });
 });
 
 describe('skill nudge — the calling agent decides what counts as installed', () => {
@@ -177,14 +163,14 @@ describe('skill nudge — the calling agent decides what counts as installed', (
   }
 
   it(
-    'warns on `test run` when only a different agent has the skill',
+    'warns on `run` when only a different agent has the skill',
     () => {
       const proj = freshDir('ts-nudge-proj-');
       const home = homeWithCreds();
       installSkill(proj, 'claude');
 
       const result = runCli(
-        ['test', 'run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
+        ['run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
         { cwd: proj, home, env: { CURSOR_AGENT: '1' } },
       );
 
@@ -195,14 +181,14 @@ describe('skill nudge — the calling agent decides what counts as installed', (
   );
 
   it(
-    'stays silent on `test run` when the calling agent has the skill',
+    'stays silent on `run` when the calling agent has the skill',
     () => {
       const proj = freshDir('ts-nudge-proj-');
       const home = homeWithCreds();
       installSkill(proj, 'cursor');
 
       const result = runCli(
-        ['test', 'run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
+        ['run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
         { cwd: proj, home, env: { CURSOR_AGENT: '1' } },
       );
 
@@ -220,7 +206,7 @@ describe('skill nudge — the calling agent decides what counts as installed', (
       installSkill(proj, 'claude');
 
       const result = runCli(
-        ['test', 'run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
+        ['run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
         { cwd: proj, home },
       );
 

@@ -3,8 +3,8 @@
  * process against an in-memory HTTP server. Catches packaging / ESM /
  * shebang issues that unit tests cannot see.
  *
- * Per design.md §12.4 hard gate: "Subprocess test that builds the binary
- * and runs `auth whoami` against the mock."
+ * Per design.md §12.4 hard gate: a subprocess test that builds the binary
+ * and runs `auth status` against the mock.
  */
 
 import { spawn } from 'node:child_process';
@@ -31,6 +31,36 @@ const ME_BODY = {
 let server: Server;
 let baseUrl: string;
 let tmpHome: string;
+let requestCount = 0;
+const businessRequests: Array<{ method: string; url: string }> = [];
+const launchBodies: Array<{ url: string; body: Record<string, unknown> }> = [];
+const executionReads = new Map<string, number>();
+
+function readFixtureBody(
+  req: IncomingMessage,
+  onBody: (body: Record<string, unknown>) => void,
+): void {
+  let body = '';
+  req.on('data', chunk => {
+    body += chunk.toString();
+  });
+  req.on('end', () => onBody(JSON.parse(body) as Record<string, unknown>));
+}
+
+function fixtureResult(runId: string, testId: string) {
+  return {
+    resultId: `result_${testId}`,
+    runId,
+    caseKey: testId,
+    title: testId,
+    testStatus: 'PASSED',
+    processStatus: 'FINISHED',
+    error: null,
+    blockedReason: null,
+    environmentName: 'staging',
+    created: '2026-11-16T00:00:00.000Z',
+  };
+}
 
 beforeAll(async () => {
   // The build now happens exactly once in `test/global-setup.ts`, before any
@@ -40,7 +70,172 @@ beforeAll(async () => {
   // spawning a binary that isn't the code under test.
   assertFreshBuild(REPO_ROOT, BIN_PATH);
   server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    requestCount++;
     const url = req.url ?? '/';
+    businessRequests.push({ method: req.method ?? 'GET', url });
+    if (req.method === 'POST' && url === '/api/cli/v1/projects/project_subproc/runs') {
+      readFixtureBody(req, body => {
+        launchBodies.push({ url, body });
+        executionReads.set('run_project_launch_subproc', 0);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            runId: 'run_project_launch_subproc',
+            projectId: 'project_subproc',
+            total: 2,
+            enqueuedAt: '2026-11-16T00:00:00.000Z',
+            autoHeal: true,
+            environment: { id: 'env_subproc', name: 'staging' },
+            targetUrl: 'https://example.com',
+            blocked: [],
+            held: [],
+          }),
+        );
+      });
+      return;
+    }
+    if (url === '/api/cli/v1/testlist/list_launch_subproc') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: 'list_launch_subproc',
+          name: 'Subprocess list',
+          orgId: 'org_subproc',
+          caseCount: 2,
+          lastRunId: null,
+          lastRunCreated: null,
+          createdAt: '2026-11-16T00:00:00.000Z',
+          updatedAt: '2026-11-16T00:00:00.000Z',
+          projectEnvironments: [
+            { projectId: 'project_list_a', environmentName: 'staging' },
+            { projectId: 'project_list_b', environmentName: 'review' },
+          ],
+          cases: ['a', 'b'].map(id => ({
+            testId: `list_case_${id}`,
+            type: 'frontend',
+            projectId: `project_list_${id}`,
+            projectName: `List project ${id}`,
+            title: `List case ${id}`,
+            category: null,
+            priority: null,
+            modified: null,
+            status: null,
+          })),
+          stats: { total: 2, passed: 0, failed: 0, blocked: 0, running: 0 },
+        }),
+      );
+      return;
+    }
+    const listProject = /^\/api\/cli\/v1\/projects\/project_list_([ab])\/env$/.exec(url);
+    if (listProject) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          environments: [
+            { name: 'default', url: 'http://127.0.0.1:9', isDefault: true },
+            {
+              name: listProject[1] === 'a' ? 'staging' : 'review',
+              url: 'https://example.com',
+              isDefault: false,
+            },
+          ],
+        }),
+      );
+      return;
+    }
+    if (req.method === 'POST' && url === '/api/cli/v1/testlist/list_launch_subproc/run') {
+      readFixtureBody(req, body => {
+        launchBodies.push({ url, body });
+        const selected = Array.isArray(body.testIds)
+          ? (body.testIds as string[])
+          : ['list_case_a', 'list_case_b'];
+        const accepted = selected
+          .filter(id => id === 'list_case_a' || id === 'list_case_b')
+          .map(testId => ({
+            testId,
+            resultId: `result_${testId}`,
+            runId: `run_${testId}`,
+            enqueuedAt: '2026-11-16T00:00:00.000Z',
+          }));
+        const notFound = selected.filter(id => id !== 'list_case_a' && id !== 'list_case_b');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            accepted,
+            conflicts: [],
+            deferred: [],
+            ...(notFound.length ? { notFound } : {}),
+          }),
+        );
+      });
+      return;
+    }
+    if (url.startsWith('/api/cli/v1/results?')) {
+      const runId = new URLSearchParams(url.split('?')[1]).get('run');
+      if (
+        runId === 'run_project_launch_subproc' ||
+        runId === 'run_list_case_a' ||
+        runId === 'run_list_case_b'
+      ) {
+        const reads = (executionReads.get(runId) ?? 0) + 1;
+        executionReads.set(runId, reads);
+        const project = runId === 'run_project_launch_subproc';
+        const testIds = project
+          ? reads === 1
+            ? ['project_unit_a', 'project_unit_b']
+            : ['project_unit_a', 'project_unit_b', 'project_integration']
+          : [runId.replace('run_', '')];
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            run: {
+              runId,
+              status: project && reads === 1 ? 'running' : 'finished',
+              cancelled: false,
+            },
+            results: testIds.map(testId => fixtureResult(runId, testId)),
+          }),
+        );
+        return;
+      }
+      if (
+        runId === 'run_subproc' ||
+        runId === 'run_other_subproc' ||
+        runId === 'run_timeout_subproc'
+      ) {
+        const running = runId === 'run_timeout_subproc';
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            run: { runId, status: running ? 'running' : 'finished', cancelled: false },
+            results: [
+              {
+                resultId: `result_${runId}`,
+                runId,
+                caseKey: `test_${runId}`,
+                title: 'Subprocess lifecycle fixture',
+                testStatus: running ? 'RUNNING' : 'PASSED',
+                created: '2026-11-16T00:00:00.000Z',
+              },
+            ],
+          }),
+        );
+        return;
+      }
+    }
+    const cancel = /^\/api\/cli\/v1\/runs\/(run_subproc|run_other_subproc)\/cancel$/.exec(url);
+    if (req.method === 'POST' && cancel) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          runId: cancel[1],
+          alreadyCancelled: false,
+          alreadyFinished: false,
+          results: [],
+        }),
+      );
+      return;
+    }
     if (url.startsWith('/api/cli/v1/projects/')) {
       const id = url.replace('/api/cli/v1/projects/', '').split('?')[0]!;
       const apiKey = req.headers['x-api-key'];
@@ -114,67 +309,14 @@ beforeAll(async () => {
           JSON.stringify({
             id: 'test_subproc',
             projectId: 'project_subproc',
-            name: 'Subproc test fixture',
+            slug: 'SUBPROC-001',
+            title: 'Subproc test fixture',
             type: 'frontend',
-            createdFrom: 'portal',
-            status: 'failed',
+            version: { hash: 'a3f9c2e1', label: 'v1.0' },
+            stepCount: 0,
+            steps: [],
             createdAt: '2026-04-20T11:00:00.000Z',
             updatedAt: '2026-05-05T12:34:56.000Z',
-          }),
-        );
-        return;
-      }
-      if (testId === 'test_subproc' && subPath === 'code') {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            testId: 'test_subproc',
-            language: 'typescript',
-            framework: 'playwright',
-            code: [
-              "import { test } from '@playwright/test';",
-              "test('subproc happy path', async () => {});",
-              '',
-            ].join('\n'),
-            codeVersion: 'v3',
-            etag: 'sha256:subproc',
-          }),
-        );
-        return;
-      }
-      if (testId === 'test_subproc' && subPath === 'steps') {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            items: [
-              {
-                testId: 'test_subproc',
-                stepIndex: 1,
-                action: 'click',
-                description: 'Click the cart icon',
-                status: 'passed',
-                screenshotUrl: 'https://example.com/01.png',
-                htmlSnapshotUrl: 'https://example.com/01.html',
-                runIdIfAvailable: 'run_subproc',
-                codeVersion: 'v3',
-                capturedAt: '2026-05-05T12:34:55.000Z',
-                updatedAt: '2026-05-05T12:34:55.000Z',
-              },
-              {
-                testId: 'test_subproc',
-                stepIndex: 2,
-                action: 'click',
-                description: 'Click the submit button',
-                status: 'failed',
-                screenshotUrl: 'https://example.com/02.png',
-                htmlSnapshotUrl: 'https://example.com/02.html',
-                runIdIfAvailable: 'run_subproc',
-                codeVersion: 'v3',
-                capturedAt: '2026-05-05T12:34:56.000Z',
-                updatedAt: '2026-05-05T12:34:56.000Z',
-              },
-            ],
-            nextToken: null,
           }),
         );
         return;
@@ -204,29 +346,6 @@ beforeAll(async () => {
         );
         return;
       }
-      if (testId === 'test_subproc' && subPath === 'result') {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            testId: 'test_subproc',
-            status: 'failed',
-            startedAt: '2026-05-05T12:34:00.000Z',
-            finishedAt: '2026-05-05T12:34:58.000Z',
-            videoUrl: 'https://example.com/run_subproc.mp4',
-            failureAnalysisUrl: 'https://example.com/analysis.json',
-            snapshotId: 'snap_subproc',
-            runIdIfAvailable: 'run_subproc',
-            codeVersion: 'v3',
-            targetUrl: 'https://staging.example.com/checkout',
-            failedStepIndex: 2,
-            failureKind: 'assertion',
-            verdict: 'failed',
-            executionStatus: 'completed',
-            summary: 'Failed (assertion) on step 2: assertion error.',
-          }),
-        );
-        return;
-      }
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
@@ -250,7 +369,7 @@ beforeAll(async () => {
             error: {
               code: 'AUTH_REQUIRED',
               message: 'Authentication is required.',
-              nextAction: 'Run `testsprite auth configure`.',
+              nextAction: 'Run `testsprite setup`.',
               requestId: 'req_subproc',
               details: {},
             },
@@ -279,10 +398,11 @@ beforeAll(async () => {
         {
           id: 'test_subproc',
           projectId: 'project_subproc',
-          name: 'Subproc test fixture',
+          slug: 'SUBPROC-001',
+          title: 'Subproc test fixture',
           type: 'frontend' as const,
-          createdFrom: 'portal' as const,
-          status: 'failed' as const,
+          version: { hash: 'a3f9c2e1', label: 'v1.0' },
+          stepCount: 0,
           createdAt: '2026-04-20T11:00:00.000Z',
           updatedAt: '2026-05-05T12:34:56.000Z',
         },
@@ -302,7 +422,7 @@ beforeAll(async () => {
             error: {
               code: 'AUTH_REQUIRED',
               message: 'Authentication is required.',
-              nextAction: 'Run `testsprite auth configure`.',
+              nextAction: 'Run `testsprite setup`.',
               requestId: 'req_subproc',
               details: {},
             },
@@ -338,7 +458,7 @@ beforeAll(async () => {
             error: {
               code: 'AUTH_REQUIRED',
               message: 'Authentication is required.',
-              nextAction: 'Run `testsprite auth configure`.',
+              nextAction: 'Run `testsprite setup`.',
               requestId: 'req_subproc',
               details: {},
             },
@@ -377,7 +497,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await new Promise<void>(resolveClose => server.close(() => resolveClose()));
   // tmpHome accumulates a real (if fake-valued) credentials file across this
-  // suite's `auth configure` / `setup` runs — remove it so the suite doesn't
+  // suite's `setup` runs — remove it so the suite doesn't
   // leave one directory behind per test run. Guarded: if `beforeAll` threw
   // before assigning it, there is nothing to remove.
   if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
@@ -389,10 +509,17 @@ interface SpawnResult {
   stderr: string;
 }
 
-function runCli(args: string[], envOverrides: Record<string, string> = {}): Promise<SpawnResult> {
+function runCli(
+  args: string[],
+  envOverrides: Record<string, string> = {},
+  timeoutMs = 20_000,
+): Promise<SpawnResult> {
   return new Promise((resolveResult, rejectResult) => {
     const child = spawn('node', [BIN_PATH, ...args], {
       cwd: REPO_ROOT,
+      // A failed parser regression must not leave a 600-second polling child alive.
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
       env: {
         ...process.env,
         // os.homedir() reads HOME on POSIX but USERPROFILE on Windows —
@@ -413,7 +540,503 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
   });
 }
 
-describe('auth status subprocess (+ deprecated whoami alias)', () => {
+describe('single root run subprocess contract', () => {
+  const isolatedEnv = () => ({
+    TESTSPRITE_API_KEY: 'sk-user-subproc',
+    TESTSPRITE_API_URL: baseUrl,
+    TESTSPRITE_NO_TELEMETRY: '1',
+    TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
+    TESTSPRITE_NO_SKILL_WARNING: '1',
+    TESTSPRITE_PROJECT_ID: '',
+  });
+
+  it.each([
+    ['run', '--', '--project', 'project_subproc', '--no-wait'],
+    ['run', '--', '--testlist', 'list_subproc', '--no-wait'],
+    ['run', '--output', 'json', '--', '--project', 'project_subproc', '--no-wait'],
+  ])('preserves literal arguments after the option terminator: %j', async (...args) => {
+    const before = businessRequests.length;
+    const result = await runCli(['--output', 'json', ...args], isolatedEnv());
+    expect(result.exitCode, result.stderr).toBe(4);
+    const requests = businessRequests.slice(before);
+    expect(requests.some(request => request.method === 'POST')).toBe(false);
+    expect(requests.some(request => /\/tests\/(--project|--testlist)/.test(request.url))).toBe(
+      true,
+    );
+  });
+
+  it('keeps an option terminator used as a required global value distinct from a literal boundary', async () => {
+    const before = launchBodies.length;
+    const result = await runCli(
+      ['--profile', '--', '--output', 'json', 'run', '--project', 'project_subproc', '--no-wait'],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(launchBodies.slice(before)).toEqual([
+      { url: '/api/cli/v1/projects/project_subproc/runs', body: { maxConcurrency: 50 } },
+    ]);
+  });
+
+  it('previews an unfiltered project from the root without business requests', async () => {
+    const before = requestCount;
+    const result = await runCli(
+      [
+        '--dry-run',
+        '--output',
+        'json',
+        'run',
+        '--project',
+        'project_subproc',
+        '--target-url',
+        'https://example.com',
+        '--skip-preflight',
+      ],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      dryRun: true,
+      requests: [{ method: 'POST', path: '/api/cli/v1/projects/project_subproc/runs' }],
+    });
+    const preview = JSON.parse(result.stdout);
+    expect(preview.requests).toHaveLength(1);
+    expect(preview.requests[0].body).not.toHaveProperty('testIds');
+    expect(requestCount).toBe(before);
+  }, 30_000);
+
+  it('previews a saved list from the root without business requests', async () => {
+    const before = requestCount;
+    const result = await runCli(
+      ['--dry-run', '--output', 'json', 'run', '--testlist', 'list_subproc'],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      dryRun: true,
+      runs: [],
+      results: [],
+      requests: [{ method: 'POST', path: '/api/cli/v1/testlist/list_subproc/run' }],
+    });
+    expect(requestCount).toBe(before);
+  }, 30_000);
+
+  it('launches one whole-project execution and waits for its late integration result', async () => {
+    const before = businessRequests.length;
+    const bodiesBefore = launchBodies.length;
+    const result = await runCli(
+      [
+        '--output',
+        'json',
+        'run',
+        '--project',
+        'project_subproc',
+        '--target-url',
+        'https://example.com',
+        '--skip-preflight',
+        '--wait',
+        '--timeout',
+        '10',
+      ],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.runs).toEqual([
+      expect.objectContaining({
+        runId: 'run_project_launch_subproc',
+        projectId: 'project_subproc',
+        total: 2,
+      }),
+    ]);
+    expect(parsed.results.map((row: { resultId: string }) => row.resultId).sort()).toEqual([
+      'result_project_integration',
+      'result_project_unit_a',
+      'result_project_unit_b',
+    ]);
+    expect(parsed.summary).toMatchObject({ total: 3, passed: 3, failed: 0, timedOut: 0 });
+    expect(executionReads.get('run_project_launch_subproc')).toBe(2);
+    expect(launchBodies.slice(bodiesBefore)).toEqual([
+      {
+        url: '/api/cli/v1/projects/project_subproc/runs',
+        body: expect.objectContaining({ maxConcurrency: 50, targetUrl: 'https://example.com' }),
+      },
+    ]);
+    expect(launchBodies[bodiesBefore]!.body).not.toHaveProperty('testIds');
+    const requests = businessRequests.slice(before);
+    expect(requests.filter(row => row.method === 'POST')).toEqual([
+      { method: 'POST', url: '/api/cli/v1/projects/project_subproc/runs' },
+    ]);
+    expect(requests.some(row => new URL(row.url, baseUrl).pathname === '/api/cli/v1/tests')).toBe(
+      false,
+    );
+    expect(requests.some(row => row.url.startsWith('/api/cli/v1/tests/'))).toBe(false);
+  }, 30_000);
+
+  it('launches a whole saved list with pinned project environments and its native receipt', async () => {
+    const before = businessRequests.length;
+    const bodiesBefore = launchBodies.length;
+    const result = await runCli(
+      ['--output', 'json', 'run', '--testlist', 'list_launch_subproc', '--wait', '--timeout', '10'],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.results).toEqual([
+      expect.objectContaining({
+        testId: 'list_case_a',
+        resultId: 'result_list_case_a',
+        runId: 'run_list_case_a',
+        status: 'passed',
+      }),
+      expect.objectContaining({
+        testId: 'list_case_b',
+        resultId: 'result_list_case_b',
+        runId: 'run_list_case_b',
+        status: 'passed',
+      }),
+    ]);
+    expect(parsed.conflicts).toEqual([]);
+    expect(parsed.deferred).toEqual([]);
+    expect(parsed.summary).toMatchObject({ total: 2, passed: 2, failed: 0 });
+    expect(launchBodies.slice(bodiesBefore)).toEqual([
+      {
+        url: '/api/cli/v1/testlist/list_launch_subproc/run',
+        body: { maxConcurrency: 10 },
+      },
+    ]);
+    const requests = businessRequests.slice(before);
+    expect(requests.filter(row => row.url.endsWith('/env')).map(row => row.url)).toEqual([
+      '/api/cli/v1/projects/project_list_a/env',
+      '/api/cli/v1/projects/project_list_b/env',
+    ]);
+    expect(requests.filter(row => row.method === 'POST')).toEqual([
+      { method: 'POST', url: '/api/cli/v1/testlist/list_launch_subproc/run' },
+    ]);
+    expect(requests.some(row => row.url.includes('/tests'))).toBe(false);
+  }, 30_000);
+
+  it('passes a positional list subset unchanged and waits before reporting non-members', async () => {
+    const before = businessRequests.length;
+    const bodiesBefore = launchBodies.length;
+    const result = await runCli(
+      [
+        '--output',
+        'json',
+        'run',
+        'list_case_b',
+        'missing_case',
+        '--testlist',
+        'list_launch_subproc',
+        '--wait',
+        '--timeout',
+        '10',
+      ],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(4);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.results).toEqual([
+      expect.objectContaining({
+        testId: 'list_case_b',
+        resultId: 'result_list_case_b',
+        runId: 'run_list_case_b',
+        status: 'passed',
+      }),
+    ]);
+    expect(parsed.notFound).toEqual(['missing_case']);
+    expect(parsed.conflicts).toEqual([]);
+    expect(parsed.deferred).toEqual([]);
+    expect(parsed.summary.passed).toBe(1);
+    expect(launchBodies.slice(bodiesBefore)).toEqual([
+      {
+        url: '/api/cli/v1/testlist/list_launch_subproc/run',
+        body: { testIds: ['list_case_b', 'missing_case'], maxConcurrency: 10 },
+      },
+    ]);
+    const requests = businessRequests.slice(before);
+    expect(requests.filter(row => row.url.endsWith('/env')).map(row => row.url)).toEqual([
+      '/api/cli/v1/projects/project_list_b/env',
+    ]);
+    expect(
+      requests.filter(row => new URL(row.url, baseUrl).pathname === '/api/cli/v1/results'),
+    ).toEqual([{ method: 'GET', url: expect.stringContaining('run=run_list_case_b') }]);
+    expect(requests.filter(row => row.method === 'POST')).toHaveLength(1);
+    expect(result.stderr).toContain('missing_case');
+  }, 30_000);
+
+  it.each(['wait', 'cancel'])('root run %s help exits 0', async child => {
+    const result = await runCli(['run', child, '--help'], isolatedEnv());
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`Usage: testsprite run ${child} [options] <run-id...>`);
+  });
+
+  it.each([
+    ['test', 'run', ['test_subproc'], 'testsprite run'],
+    ['test', 'wait', ['run_subproc'], 'testsprite run wait'],
+    ['test', 'cancel', ['run_subproc'], 'testsprite run cancel'],
+    ['testlist', 'run', ['list_subproc'], 'testsprite run'],
+  ] as const)(
+    'refuses retired %s %s paths and help forms before business work',
+    async (group, name, ids, pointer) => {
+      const artifactDir = mkdtempSync(join(tmpHome, 'retired-run-'));
+      const report = join(artifactDir, 'report.xml');
+      const summary = join(artifactDir, 'summary.json');
+      const githubOutput = join(artifactDir, 'github-output');
+      const before = requestCount;
+      const invocations = [
+        [group, name, ...ids],
+        [
+          group,
+          name,
+          ...ids,
+          '--wait',
+          '--report',
+          'junit',
+          '--report-file',
+          report,
+          '--summary-file',
+          summary,
+        ],
+        [group, name, ...ids, '--dry-run', ...(name === 'wait' ? ['--timeout', '1'] : [])],
+        [group, name, '--help'],
+        [group, name, '-h'],
+        [group, '--help', name],
+        ['--help', group, name],
+        ['help', group, name],
+        [group, 'help', name],
+      ];
+      for (const output of ['text', 'json']) {
+        for (const args of invocations) {
+          const result = await runCli(['--output', output, ...args], {
+            ...isolatedEnv(),
+            GITHUB_OUTPUT: githubOutput,
+            GITHUB_STEP_SUMMARY: summary,
+          });
+          expect(result.exitCode, `${args.join(' ')}: ${result.stderr}`).toBe(5);
+          expect(result.stdout).toBe('');
+          if (output === 'json') {
+            const parsed = JSON.parse(result.stderr);
+            expect(parsed.error.code).toBe('VALIDATION_ERROR');
+            expect(parsed.error.message).toContain(`unknown command '${name}'`);
+            expect(parsed.error.nextAction).toContain(pointer);
+            if (group === 'testlist') expect(parsed.error.nextAction).toContain('--testlist');
+          } else {
+            expect(result.stderr).toContain(`unknown command '${name}'`);
+            expect(result.stderr).toContain(pointer);
+            if (group === 'testlist') expect(result.stderr).toContain('--testlist');
+          }
+          expect(requestCount).toBe(before);
+          expect(existsSync(report)).toBe(false);
+          expect(existsSync(summary)).toBe(false);
+          expect(existsSync(githubOutput)).toBe(false);
+        }
+      }
+    },
+    30_000,
+  );
+
+  it.each([
+    [['run', '--all', '--project', 'project_subproc'], '--all'],
+    [['run', '--testlist', 'list_subproc', '--case', 'test_subproc'], '--case'],
+  ])('rejects retired selector %j before business work', async (args, option) => {
+    const before = requestCount;
+    const result = await runCli(['--output', 'json', ...args], isolatedEnv());
+    expect(result.exitCode, result.stderr).toBe(5);
+    expect(result.stdout).toBe('');
+    const parsed = JSON.parse(result.stderr);
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.message).toContain(`unknown option '${option}'`);
+    expect(requestCount).toBe(before);
+  });
+
+  it.each([
+    ['run', 'test_subproc', '--project', 'project_subproc'],
+    ['run', '--project', 'project_subproc', '--testlist', 'list_subproc'],
+    ['run', '--project', ''],
+    ['run', '--project', '   '],
+    ['run', '--testlist', ''],
+    ['run', '--testlist', '   '],
+    ['run', '--testlist', 'list_subproc', '--env', 'staging'],
+    ['run', '--testlist', 'list_subproc', '--target-url', 'https://example.com'],
+    ['run', '--testlist', 'list_subproc', '--local', '3000'],
+    ['run', '--testlist', 'list_subproc', '--local-host', 'localhost'],
+    ['run', '--testlist', 'list_subproc', '--tunnel-client', 'tunnel_subproc'],
+    ['run', '--testlist', 'list_subproc', '--no-cancel-on-interrupt'],
+    ['run', '--testlist', 'list_subproc', '--skip-dependencies'],
+    ['run', '--testlist', 'list_subproc', '--filter', 'fixture'],
+    ['run', '--testlist', 'list_subproc', '--allow-empty'],
+  ])('refuses invalid root selectors/options %j without requests or artifacts', async (...args) => {
+    const artifactDir = mkdtempSync(join(tmpHome, 'invalid-run-'));
+    const report = join(artifactDir, 'report.xml');
+    const summary = join(artifactDir, 'summary.json');
+    const before = requestCount;
+    const result = await runCli(
+      [
+        '--output',
+        'json',
+        ...args,
+        '--wait',
+        '--report',
+        'junit',
+        '--report-file',
+        report,
+        '--summary-file',
+        summary,
+      ],
+      { ...isolatedEnv(), TESTSPRITE_PROJECT_ID: 'context_project' },
+    );
+    expect(result.exitCode, result.stderr).toBe(5);
+    expect(result.stdout).toBe('');
+    expect(JSON.parse(result.stderr).error.code).toBe('VALIDATION_ERROR');
+    expect(requestCount).toBe(before);
+    expect(existsSync(report)).toBe(false);
+    expect(existsSync(summary)).toBe(false);
+  });
+
+  it.each([['run'], ['run', 'list']])(
+    'rejects a missing selector or run-list guess %j locally',
+    async (...args) => {
+      const before = requestCount;
+      const result = await runCli(['--output', 'json', ...args], isolatedEnv());
+      expect(result.exitCode, result.stderr).toBe(5);
+      expect(result.stdout).toBe('');
+      const parsed = JSON.parse(result.stderr);
+      expect(parsed.error.code).toBe('VALIDATION_ERROR');
+      if (args[1] === 'list') {
+        expect(parsed.error.message + parsed.error.nextAction).toContain('testsprite result list');
+      }
+      expect(requestCount).toBe(before);
+    },
+  );
+
+  it('allows root-global options before wait and reads each distinct run without launching', async () => {
+    const before = businessRequests.length;
+    const result = await runCli(
+      [
+        'run',
+        '--output',
+        'json',
+        '--profile',
+        'run-contract',
+        '--endpoint-url',
+        baseUrl,
+        'wait',
+        'run_subproc',
+        'run_other_subproc',
+        'run_subproc',
+        '--timeout',
+        '17',
+      ],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.runs.map((run: { runId: string }) => run.runId)).toEqual([
+      'run_subproc',
+      'run_other_subproc',
+    ]);
+    expect(parsed.summary).toMatchObject({ total: 2, passed: 2, failed: 0, timedOut: 0 });
+    const requests = businessRequests.slice(before);
+    expect(requests).toHaveLength(2);
+    expect(requests.every(request => request.method === 'GET')).toBe(true);
+    expect(
+      requests.map(request => new URL(request.url, baseUrl).searchParams.get('run')).sort(),
+    ).toEqual(['run_other_subproc', 'run_subproc']);
+    for (const request of requests) {
+      const url = new URL(request.url, baseUrl);
+      expect(url.pathname).toBe('/api/cli/v1/results');
+      expect(url.searchParams.get('status')).toBe('passed,failed,running,blocked,cancelled');
+    }
+  }, 30_000);
+
+  it('assigns a trailing timeout to wait rather than the parent launch', async () => {
+    const before = businessRequests.length;
+    const result = await runCli(
+      ['--output', 'json', 'run', 'wait', 'run_timeout_subproc', '--timeout', '1'],
+      isolatedEnv(),
+      5_000,
+    );
+    expect(result.exitCode, result.stderr).toBe(7);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.runs).toEqual([expect.objectContaining({ runId: 'run_timeout_subproc' })]);
+    expect(parsed.summary.timedOut).toBe(1);
+    expect(businessRequests.slice(before).length).toBeGreaterThan(0);
+    expect(
+      businessRequests
+        .slice(before)
+        .every(
+          request =>
+            request.method === 'GET' &&
+            new URL(request.url, baseUrl).pathname === '/api/cli/v1/results',
+        ),
+    ).toBe(true);
+  }, 10_000);
+
+  it('cancels each distinct run once without enumerating members or launching', async () => {
+    const before = businessRequests.length;
+    const result = await runCli(
+      ['--output', 'json', 'run', 'cancel', 'run_subproc', 'run_other_subproc', 'run_subproc'],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.cancelled).toEqual(['run_subproc', 'run_other_subproc']);
+    expect(parsed.runs.map((run: { runId: string }) => run.runId)).toEqual([
+      'run_subproc',
+      'run_other_subproc',
+    ]);
+    expect(businessRequests.slice(before)).toEqual([
+      { method: 'POST', url: '/api/cli/v1/runs/run_subproc/cancel' },
+      { method: 'POST', url: '/api/cli/v1/runs/run_other_subproc/cancel' },
+    ]);
+  }, 30_000);
+
+  it('retains global dry-run and output options before a lifecycle child', async () => {
+    const before = requestCount;
+    const result = await runCli(
+      [
+        'run',
+        '--dry-run',
+        '--output',
+        'json',
+        '--profile',
+        'run-contract',
+        'cancel',
+        'run_subproc',
+      ],
+      isolatedEnv(),
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).runs).toHaveLength(1);
+    expect(result.stderr).toContain('[dry-run]');
+    expect(requestCount).toBe(before);
+  });
+
+  it.each([
+    ['--project', 'project_subproc'],
+    ['--testlist', 'list_subproc'],
+    ['--env', 'staging'],
+    ['--timeout', '17'],
+    ['--max-concurrency', '2'],
+    ['--no-wait'],
+  ])('rejects explicit parent launch flags %j before lifecycle dispatch', async (...options) => {
+    const before = requestCount;
+    for (const child of ['wait', 'cancel']) {
+      const result = await runCli(
+        ['--output', 'json', 'run', ...options, child, 'run_subproc'],
+        isolatedEnv(),
+      );
+      expect(result.exitCode, result.stderr).toBe(5);
+      expect(result.stdout).toBe('');
+      const parsed = JSON.parse(result.stderr);
+      expect(parsed.error.code).toBe('VALIDATION_ERROR');
+      expect(parsed.error.message + parsed.error.nextAction).toContain(options[0]);
+      expect(requestCount).toBe(before);
+    }
+  });
+});
+
+describe('auth status subprocess', () => {
   it('prints JSON me and exits 0 against the local server', async () => {
     const result = await runCli(['auth', 'status', '--output', 'json'], {
       TESTSPRITE_API_KEY: 'sk-user-subproc',
@@ -466,17 +1089,6 @@ describe('auth status subprocess (+ deprecated whoami alias)', () => {
     expect(result.stderr).toContain('"kind":"response"');
     expect(result.stderr).not.toContain('sk-user-subproc-secret');
     expect(result.stderr).not.toContain('x-api-key');
-  }, 30_000);
-
-  it('deprecated `auth whoami` alias still works and prints a deprecation notice', async () => {
-    const result = await runCli(['auth', 'whoami', '--output', 'json'], {
-      TESTSPRITE_API_KEY: 'sk-user-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
-    expect(result.exitCode).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual(ME_BODY);
-    expect(result.stderr).toContain('[deprecated]');
-    expect(result.stderr).toContain('auth status');
   }, 30_000);
 });
 
@@ -673,7 +1285,8 @@ describe('test list subprocess', () => {
     const parsed = JSON.parse(result.stdout);
     expect(parsed.items).toHaveLength(1);
     expect(parsed.items[0].id).toBe('test_subproc');
-    expect(parsed.items[0].status).toBe('failed');
+    expect(parsed.items[0].title).toBe('Subproc test fixture');
+    expect(parsed.items[0]).not.toHaveProperty('status');
     expect(parsed.nextToken).toBeNull();
   }, 30_000);
 
@@ -702,16 +1315,19 @@ describe('test list subprocess', () => {
     expect(JSON.parse(result.stdout).items).toEqual([]);
   }, 30_000);
 
-  it('text output renders header + status column', async () => {
+  it('text output renders header + the case columns', async () => {
     const result = await runCli(['test', 'list', '--project', 'project_subproc'], {
       TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('ID');
-    expect(result.stdout).toContain('STATUS');
+    expect(result.stdout).toContain('TITLE');
+    expect(result.stdout).toContain('VERSION');
+    expect(result.stdout).not.toContain('STATUS');
+    expect(result.stdout).toContain('SUBPROC-001');
     expect(result.stdout).toContain('Subproc test fixture');
-    expect(result.stdout).toContain('failed');
+    expect(result.stdout).toContain('v1.0');
   }, 30_000);
 
   it('--help prints filter and pagination flags', async () => {
@@ -719,7 +1335,7 @@ describe('test list subprocess', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('--project');
     expect(result.stdout).toContain('--type');
-    expect(result.stdout).toContain('--created-from');
+    expect(result.stdout).not.toContain('--status');
     expect(result.stdout).toContain('--page-size');
   }, 30_000);
 
@@ -760,7 +1376,9 @@ describe('test get subprocess', () => {
     const parsed = JSON.parse(result.stdout);
     expect(parsed.id).toBe('test_subproc');
     expect(parsed.type).toBe('frontend');
-    expect(parsed.status).toBe('failed');
+    expect(parsed.title).toBe('Subproc test fixture');
+    expect(parsed.version).toEqual({ hash: 'a3f9c2e1', label: 'v1.0' });
+    expect(parsed).not.toHaveProperty('status');
   }, 30_000);
 
   it('text output prints the labeled fields block', async () => {
@@ -770,8 +1388,10 @@ describe('test get subprocess', () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('id:          test_subproc');
-    expect(result.stdout).toContain('status:      failed');
-    expect(result.stdout).toContain('createdFrom: portal');
+    expect(result.stdout).toContain('slug:        SUBPROC-001');
+    expect(result.stdout).toContain('title:       Subproc test fixture');
+    expect(result.stdout).toContain('version:     v1.0');
+    expect(result.stdout).not.toContain('status:');
   }, 30_000);
 
   it('exits 4 (NOT_FOUND) for an unknown test id', async () => {
@@ -816,128 +1436,6 @@ describe('AMBIGUOUS_ORG conflict rendering (test get)', () => {
       { projectId: 'project_a', orgId: 'org_a' },
       { projectId: 'project_b', orgId: 'org_b' },
     ]);
-  }, 30_000);
-});
-
-describe('test code get subprocess', () => {
-  it('--output json returns the §6.3 TestCode shape', async () => {
-    const result = await runCli(['--output', 'json', 'test', 'code', 'get', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-user-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
-    expect(result.exitCode).toBe(0);
-    const parsed = JSON.parse(result.stdout) as {
-      testId: string;
-      language: string;
-      framework: string;
-      code: string;
-      codeVersion: string;
-    };
-    expect(parsed.testId).toBe('test_subproc');
-    expect(parsed.language).toBe('typescript');
-    expect(parsed.framework).toBe('playwright');
-    expect(parsed.codeVersion).toBe('v3');
-  }, 30_000);
-
-  it('text mode prints the inline source body without a JSON envelope', async () => {
-    const result = await runCli(['test', 'code', 'get', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-user-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
-    expect(result.exitCode).toBe(0);
-    // The source body itself must arrive on stdout, not the wire envelope.
-    // Agents pipe `> file.ts` and expect a runnable file.
-    expect(result.stdout).toContain("import { test } from '@playwright/test';");
-    expect(result.stdout).not.toContain('"testId"');
-    expect(result.stdout).not.toContain('"codeVersion"');
-  }, 30_000);
-
-  it('exits 4 (NOT_FOUND) for an unknown test id', async () => {
-    const result = await runCli(
-      ['--output', 'json', 'test', 'code', 'get', 'test_does_not_exist'],
-      { TESTSPRITE_API_KEY: 'sk-user-subproc', TESTSPRITE_API_URL: baseUrl },
-    );
-    expect(result.exitCode).toBe(4);
-    const parsed = JSON.parse(result.stderr) as { error: { code: string } };
-    expect(parsed.error.code).toBe('NOT_FOUND');
-  }, 30_000);
-});
-
-describe('test steps subprocess', () => {
-  it('--output json returns the §6.4 TestStepList shape', async () => {
-    const result = await runCli(['--output', 'json', 'test', 'steps', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-user-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
-    expect(result.exitCode).toBe(0);
-    const parsed = JSON.parse(result.stdout) as {
-      items: Array<{ stepIndex: number; status: string | null; runIdIfAvailable: string | null }>;
-      nextToken: string | null;
-    };
-    expect(parsed.items).toHaveLength(2);
-    expect(parsed.items[0]!.stepIndex).toBe(1);
-    expect(parsed.items[1]!.status).toBe('failed');
-    // §6.4 atomicity: every step in one response shares runIdIfAvailable.
-    const runIds = new Set(parsed.items.map(s => s.runIdIfAvailable));
-    expect(runIds.size).toBe(1);
-    expect(parsed.nextToken).toBeNull();
-  }, 30_000);
-
-  it('text mode renders the step table and shared run metadata', async () => {
-    const result = await runCli(['test', 'steps', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-user-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('INDEX');
-    expect(result.stdout).toContain('ACTION');
-    expect(result.stdout).toContain('Click the cart icon');
-    expect(result.stdout).toContain('Click the submit button');
-    expect(result.stdout).toContain('runId:       run_subproc');
-    expect(result.stdout).toContain('codeVersion: v3');
-  }, 30_000);
-});
-
-describe('test result subprocess', () => {
-  it('--output json returns the §6.5 LatestResult shape with correlation block', async () => {
-    const result = await runCli(['--output', 'json', 'test', 'result', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-user-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
-    expect(result.exitCode).toBe(0);
-    const parsed = JSON.parse(result.stdout) as {
-      status: string;
-      snapshotId: string;
-      runIdIfAvailable: string | null;
-      codeVersion: string | null;
-      failedStepIndex: number | null;
-      failureKind: string | null;
-    };
-    expect(parsed.status).toBe('failed');
-    // §6.5: every correlation field is present (not omitted) so agents
-    // can detect drift between code/result/steps.
-    expect(parsed.snapshotId).toBe('snap_subproc');
-    expect(parsed.runIdIfAvailable).toBe('run_subproc');
-    expect(parsed.codeVersion).toBe('v3');
-    expect(parsed.failedStepIndex).toBe(2);
-    expect(parsed.failureKind).toBe('assertion');
-  }, 30_000);
-
-  it('text mode highlights failureKind + failedStepIndex above timestamps', async () => {
-    const result = await runCli(['test', 'result', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-user-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
-    expect(result.exitCode).toBe(0);
-    const lines = result.stdout.split('\n');
-    const kindLine = lines.findIndex(l => l.startsWith('failureKind'));
-    const startedLine = lines.findIndex(l => l.startsWith('startedAt'));
-    expect(kindLine).toBeGreaterThanOrEqual(0);
-    expect(kindLine).toBeLessThan(startedLine);
-    expect(result.stdout).toContain('failureKind:        assertion');
-    expect(result.stdout).toContain('failedStepIndex:    2');
-    expect(result.stdout).toContain('verdict:            failed');
-    expect(result.stdout).toContain('summary:            Failed (assertion) on step 2');
   }, 30_000);
 });
 
@@ -1012,22 +1510,6 @@ describe('--dry-run subprocess smoke', () => {
     expect(parsed.id).toBeTruthy();
   }, 30_000);
 
-  it('project update --dry-run does not read a missing --password-file', async () => {
-    const result = await runCli([
-      'project',
-      'update',
-      'proj_anything',
-      '--password-file',
-      join(tmpHome, 'definitely-not-here-testsprite'),
-      '--dry-run',
-      '--output',
-      'json',
-    ]);
-    expect(result.exitCode).toBe(0);
-    const parsed = JSON.parse(result.stdout) as { updatedFields: string[] };
-    expect(parsed.updatedFields).toContain('password');
-  }, 30_000);
-
   it('test list --dry-run returns canned TestList', async () => {
     const result = await runCli([
       'test',
@@ -1043,72 +1525,7 @@ describe('--dry-run subprocess smoke', () => {
     expect(parsed.items.length).toBeGreaterThan(0);
   }, 30_000);
 
-  it('test failure get --dry-run --out <dir> does NOT create the directory', async () => {
-    const targetDir = join(tmpHome, 'dryrun-bundle-' + Date.now());
-    expect(existsSync(targetDir)).toBe(false);
-    const result = await runCli([
-      'test',
-      'failure',
-      'get',
-      'test_anything',
-      '--dry-run',
-      '--out',
-      targetDir,
-      '--output',
-      'json',
-    ]);
-    expect(result.exitCode).toBe(0);
-    expect(existsSync(targetDir)).toBe(false);
-    expect(result.stderr).toContain('[dry-run] would write bundle to');
-    expect(result.stderr).toContain(targetDir);
-    const parsed = JSON.parse(result.stdout) as { ok: boolean; dryRun: boolean };
-    expect(parsed.ok).toBe(true);
-    expect(parsed.dryRun).toBe(true);
-  }, 30_000);
-
-  it('test failure get --dry-run --out <dir> text mode does not claim the bundle was written', async () => {
-    // Stdout is the success contract — automation may parse it. The
-    // real-mode renderer says "Bundle written to ..."; in dry-run that
-    // would be a lie since the directory is never created. Codex flagged
-    // this as a P2 in the first review of P6 piece-2; this test guards
-    // against the regression.
-    const targetDir = join(tmpHome, 'dryrun-bundle-text-' + Date.now());
-    const result = await runCli([
-      'test',
-      'failure',
-      'get',
-      'test_anything',
-      '--dry-run',
-      '--out',
-      targetDir,
-    ]);
-    expect(result.exitCode).toBe(0);
-    expect(existsSync(targetDir)).toBe(false);
-    expect(result.stdout).toMatch(/^\(dry-run\) would write bundle to /);
-    expect(result.stdout).not.toContain('Bundle written to');
-  }, 30_000);
-
-  it('test code get --dry-run --out <file> does NOT create the file', async () => {
-    const targetFile = join(tmpHome, 'dryrun-code-' + Date.now() + '.ts');
-    expect(existsSync(targetFile)).toBe(false);
-    const result = await runCli([
-      'test',
-      'code',
-      'get',
-      'test_anything',
-      '--dry-run',
-      '--out',
-      targetFile,
-      '--output',
-      'json',
-    ]);
-    expect(result.exitCode).toBe(0);
-    expect(existsSync(targetFile)).toBe(false);
-    expect(result.stderr).toContain('[dry-run] would write code body');
-    expect(result.stderr).toContain(targetFile);
-  }, 30_000);
-
-  it('auth configure --dry-run does NOT prompt and does NOT write credentials', async () => {
+  it('setup --dry-run does NOT prompt and does NOT write credentials', async () => {
     // No TESTSPRITE_API_KEY in env; if dry-run actually called the prompt
     // path the subprocess would block waiting on stdin and the test would
     // time out. The fact that it exits 0 within the timeout proves it
@@ -1123,7 +1540,7 @@ describe('--dry-run subprocess smoke', () => {
     expect(result.stderr).toContain('would configure profile');
   }, 30_000);
 
-  it('auth whoami --dry-run returns canned MeResponse without auth', async () => {
+  it('auth status --dry-run returns canned MeResponse without auth', async () => {
     const result = await runCli(['auth', 'status', '--dry-run', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout) as { userId: string; scopes: string[] };
@@ -1131,7 +1548,7 @@ describe('--dry-run subprocess smoke', () => {
     expect(parsed.scopes.length).toBeGreaterThan(0);
   }, 30_000);
 
-  it('auth logout --dry-run does NOT delete credentials', async () => {
+  it('auth remove --dry-run does NOT delete credentials', async () => {
     // First configure a real profile so there's something to (not) delete.
     await runCli(['setup', '--from-env', '--no-agent'], {
       TESTSPRITE_API_KEY: 'sk-user-keep-me',
@@ -1149,109 +1566,118 @@ describe('--dry-run subprocess smoke', () => {
 });
 
 /**
- * Item-9 regression: `--dry-run` is a global flag for `test artifact get`.
- *
- * Three assertions per invocation:
- *   1. No credentials are read (no TESTSPRITE_API_KEY in env, no creds file
- *      on disk — exits 0, not 3).
- *   2. No HTTP call is made (the mock server is NOT pointed at; if the CLI
- *      made a real request it would either hang or fail, not exit 0 cleanly
- *      in time).
- *   3. No bundle directory is created under the cwd / --out path.
- *   4. Stdout is the canned success schema: { out, snapshotId, meta }.
- *
- * Two flag positions tested:
- *   a. `testsprite --dry-run test artifact get run_abc`  (global position)
- *   b. `testsprite test artifact get run_abc --dry-run`  (subcommand position)
- *      — before the fix, position (b) was silently coerced to `false` by
- *      the now-removed local `.option('--dry-run', ..., false)`.
+ * `result list` / `result get` replaced the six read commands outright: an old
+ * invocation gets Commander's own `unknown command` (exit 5) in both output
+ * modes, with no hidden alias, and one more line (in JSON, the envelope's
+ * `nextAction`) that says where the command went.
  */
-describe('test artifact get --dry-run subprocess (Item-9 regression)', () => {
-  it('global --dry-run: no auth, no network, no disk write; stdout is canned schema', async () => {
-    const targetDir = join(tmpHome, 'artifact-dryrun-global-' + Date.now());
-    expect(existsSync(targetDir)).toBe(false);
+describe('the removed read commands are unknown commands', () => {
+  const key = () => ({ TESTSPRITE_API_KEY: 'sk-user-subproc', TESTSPRITE_API_URL: baseUrl });
 
-    const result = await runCli([
-      '--dry-run',
-      '--output',
-      'json',
-      'test',
-      'artifact',
-      'get',
-      'run_abc',
-      '--out',
-      targetDir,
-    ]);
+  it.each([
+    ['result', ['test_x']],
+    ['result', ['test_x', '--history']],
+    ['steps', ['test_x']],
+    ['diff', ['run_a', 'run_b']],
+    ['failure', ['get', 'test_x']],
+    ['failure', ['summary', 'test_x']],
+    ['failure', ['test_x']],
+    ['artifact', ['get', 'run_x']],
+    ['artifact', ['run_x']],
+  ])(
+    'testsprite test %s %j exits 5 as an unknown command that says where it went',
+    async (name, rest) => {
+      const pointer = `\`test ${name}\` was removed in 0.17.0; ${
+        name === 'diff'
+          ? 'there is no replacement; compare two `result get` outputs'
+          : 'read results with: testsprite result list --test <test-id> | --run <run-id>, and testsprite result get <result-id>'
+      }`;
+      const text = await runCli(['test', name, ...rest], key());
+      expect(text.exitCode, text.stderr).toBe(5);
+      expect(text.stdout).toBe('');
+      expect(text.stderr).toBe(`error: unknown command '${name}'\n${pointer}\n`);
 
-    expect(result.exitCode).toBe(0);
-    // No directory created
-    expect(existsSync(targetDir)).toBe(false);
-    // Stdout is the canned success schema, not the old request envelope
-    const parsed = JSON.parse(result.stdout) as {
-      out: string;
-      snapshotId: string;
-      meta: Record<string, unknown>;
-    };
-    expect(parsed).toHaveProperty('out');
-    expect(parsed).toHaveProperty('snapshotId');
-    expect(parsed).toHaveProperty('meta');
-    expect(parsed.meta).toHaveProperty('testId');
-    expect(parsed.meta).toHaveProperty('projectId');
-    // Old request-envelope keys must NOT appear
-    expect(parsed).not.toHaveProperty('method');
-    expect(parsed).not.toHaveProperty('path');
-    expect(parsed).not.toHaveProperty('writeTo');
-  }, 30_000);
+      const json = await runCli(['--output', 'json', 'test', name, ...rest], key());
+      expect(json.exitCode, json.stderr).toBe(5);
+      expect(json.stdout).toBe('');
+      const envelope = JSON.parse(json.stderr) as {
+        error: { code: string; message: string; nextAction: string };
+      };
+      expect(envelope.error.code).toBe('VALIDATION_ERROR');
+      expect(envelope.error.message).toContain(`unknown command '${name}'`);
+      expect(envelope.error.nextAction).toBe(pointer);
+    },
+    30_000,
+  );
+});
 
-  it('subcommand-positioned --dry-run: same guarantees as global', async () => {
-    const targetDir = join(tmpHome, 'artifact-dryrun-subcmd-' + Date.now());
-    expect(existsSync(targetDir)).toBe(false);
+/**
+ * The other commands and options removed in 0.17.0 are refused the same way:
+ * exit 5, nothing on stdout, no request, and one line saying where each went.
+ */
+describe('the other removed commands and options say where they went', () => {
+  const key = () => ({ TESTSPRITE_API_KEY: 'sk-user-subproc', TESTSPRITE_API_URL: baseUrl });
 
-    const result = await runCli([
-      '--output',
-      'json',
-      'test',
-      'artifact',
-      'get',
-      'run_abc',
-      '--out',
-      targetDir,
-      '--dry-run',
-    ]);
+  it.each([
+    [
+      ['test', 'create', '--project', 'p_x', '--name', 'n'],
+      "unknown command 'create'",
+      /testsprite plan .*then testsprite apply$/,
+    ],
+    [
+      ['test', 'rerun', 'test_x', '--wait'],
+      "unknown command 'rerun'",
+      /testsprite run <test-id\.\.\.>/,
+    ],
+    [['project', 'sign-in', 'get', 'p_x'], "unknown command 'sign-in'", /project env create/],
+    [['ci', 'doctor'], "unknown command 'doctor'", /there is no replacement/],
+    [['init'], "unknown command 'init'", /testsprite setup$/],
+    [
+      ['run', '--all', '--project', 'p_x'],
+      "unknown option '--all'",
+      /testsprite run --project <project-id>$/,
+    ],
+    [
+      ['project', 'update', 'p_x', '--password=hunter2'],
+      "unknown option '--password=[REDACTED]'",
+      /testsprite project env update <project-id> <name>/,
+    ],
+    [
+      ['project', 'create', '--name', 'n', '--url=https://u:hunter2@host.example/x'],
+      "unknown option '--url=[REDACTED]'",
+      /testsprite project env create <project-id>/,
+    ],
+    [
+      ['run', '--project', 'p_x', '--status', 'failed'],
+      "unknown option '--status'",
+      /testsprite result list --run <run-id> --status failed,blocked lists$/,
+    ],
+  ])(
+    'testsprite %j exits 5 with a pointer',
+    async (args, message, pointer) => {
+      const before = requestCount;
+      const text = await runCli(args, key());
+      expect(text.exitCode, text.stderr).toBe(5);
+      expect(text.stdout).toBe('');
+      const lines = text.stderr.trimEnd().split('\n');
+      expect(lines[0]).toBe(`error: ${message}`);
+      expect(lines.at(-1)).toMatch(pointer);
+      expect(text.stderr).not.toContain('hunter2');
 
-    expect(result.exitCode).toBe(0);
-    // No directory created — proves the flag was honoured, not silently
-    // defaulted to false.
-    expect(existsSync(targetDir)).toBe(false);
-    const parsed = JSON.parse(result.stdout) as {
-      out: string;
-      snapshotId: string;
-      meta: Record<string, unknown>;
-    };
-    expect(parsed).toHaveProperty('out');
-    expect(parsed).toHaveProperty('snapshotId');
-    expect(parsed).toHaveProperty('meta');
-    expect(parsed).not.toHaveProperty('method');
-    expect(parsed).not.toHaveProperty('writeTo');
-  }, 30_000);
-
-  it('text mode --dry-run: prints [dry-run] header without claiming bundle written', async () => {
-    const targetDir = join(tmpHome, 'artifact-dryrun-text-' + Date.now());
-    const result = await runCli([
-      '--dry-run',
-      'test',
-      'artifact',
-      'get',
-      'run_abc',
-      '--out',
-      targetDir,
-    ]);
-    expect(result.exitCode).toBe(0);
-    expect(existsSync(targetDir)).toBe(false);
-    expect(result.stdout).toContain('[dry-run]');
-    expect(result.stdout).toContain('GET');
-    expect(result.stdout).not.toContain('Bundle written to');
-  }, 30_000);
+      const json = await runCli(['--output', 'json', ...args], key());
+      expect(json.exitCode, json.stderr).toBe(5);
+      expect(json.stdout).toBe('');
+      const envelope = JSON.parse(json.stderr) as {
+        error: { code: string; message: string; nextAction: string };
+      };
+      expect(envelope.error.code).toBe('VALIDATION_ERROR');
+      expect(envelope.error.message).toContain(message);
+      expect(envelope.error.nextAction).toBe(lines.at(-1));
+      expect(json.stderr).not.toContain('hunter2');
+      expect(requestCount).toBe(before);
+    },
+    30_000,
+  );
 });
 
 /**
@@ -1262,9 +1688,51 @@ describe('test artifact get --dry-run subprocess (Item-9 regression)', () => {
  *   - --help / -h                → exit 0  (user requested help — no error)
  *   - --version                  → exit 0  (user requested version — no error)
  */
+describe('removed code and schedule read commands', () => {
+  it.each([
+    ['test', ['code', 'get', 'test_subproc']],
+    ['schedule', ['run', 'list', 'schedule_subproc']],
+  ] as const)(
+    '%s %j is refused before any request or file write',
+    async (group, tail) => {
+      const destination = join(tmpHome, 'removed-code-output.ts');
+      const calls = [
+        [group, ...tail, ...(group === 'test' ? ['--out', destination] : [])],
+        [group, ...tail, '--dry-run'],
+        [group, ...tail, '--help'],
+        ['help', group, ...tail],
+        [group, '--help', ...tail],
+      ];
+      const before = requestCount;
+      for (const args of calls) {
+        for (const mode of ['text', 'json']) {
+          const result = await runCli(['--output', mode, ...args], {
+            TESTSPRITE_API_KEY: 'sk-user-subproc',
+            TESTSPRITE_API_URL: baseUrl,
+          });
+          expect(result.exitCode, result.stderr).toBe(5);
+          expect(result.stdout).toBe('');
+          if (mode === 'json') {
+            const envelope = JSON.parse(result.stderr);
+            expect(envelope.error.code).toBe('VALIDATION_ERROR');
+            expect(envelope.error.message).toContain('unknown command');
+            expect(envelope.error.nextAction).toMatch(/portal/i);
+          } else {
+            expect(result.stderr).toContain('unknown command');
+            expect(result.stderr).toMatch(/portal/i);
+          }
+        }
+      }
+      expect(requestCount).toBe(before);
+      expect(existsSync(destination)).toBe(false);
+    },
+    30_000,
+  );
+});
+
 describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', () => {
-  it('`test result` with no test-id argument exits 5', async () => {
-    const result = await runCli(['test', 'result'], {
+  it('`test get` with no test-id argument exits 5', async () => {
+    const result = await runCli(['test', 'get'], {
       TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
@@ -1280,8 +1748,8 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
     expect(result.stdout).toContain('testsprite');
   }, 30_000);
 
-  it('`testsprite test result --help` exits 0', async () => {
-    const result = await runCli(['test', 'result', '--help']);
+  it('`testsprite test get --help` exits 0', async () => {
+    const result = await runCli(['test', 'get', '--help']);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('test-id');
   }, 30_000);
@@ -1293,11 +1761,11 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
   }, 30_000);
 
   it('--output json: missing required arg emits JSON VALIDATION_ERROR envelope, not plain text', async () => {
-    // `test result` requires a positional <test-id>. With --output json, the
+    // `test get` requires a positional <test-id>. With --output json, the
     // CommanderError must be rendered as a machine-readable JSON envelope so
     // a coding agent parsing stderr does not receive an unexpected plain-text
     // error and crash its JSON.parse.
-    const result = await runCli(['--output', 'json', 'test', 'result'], {
+    const result = await runCli(['--output', 'json', 'test', 'get'], {
       TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
@@ -1342,7 +1810,7 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
   }, 30_000);
 
   it('text mode: Commander parse error still emits plain text (no regression)', async () => {
-    const result = await runCli(['test', 'result'], {
+    const result = await runCli(['test', 'get'], {
       TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });

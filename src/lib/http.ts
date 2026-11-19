@@ -12,11 +12,9 @@ import {
 import { buildUserAgent } from './client-tag.js';
 import { classifyFatalTransportFailure } from './transport-failure.js';
 import {
-  BATCH_RERUN_RESPONSE_SCHEMA,
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
+  PROJECT_RUN_RESPONSE_SCHEMA,
   CANCEL_RUN_RESPONSE_SCHEMA,
-  LIST_RUNS_RESPONSE_SCHEMA,
-  RERUN_RESPONSE_SCHEMA,
   RUN_RESPONSE_SCHEMA,
   TESTLIST_RUN_RESPONSE_SCHEMA,
   TRIGGER_RUN_RESPONSE_SCHEMA,
@@ -27,25 +25,16 @@ import {
 } from './response-schemas.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
 import type {
+  ProjectRunRequest,
+  ProjectRunResponse,
   TriggerRunBody,
   TriggerRunResponse,
   RunResponse,
-  RerunRequest,
-  RerunResponse,
-  BatchRerunRequest,
-  BatchRerunResponse,
   BatchRunFreshRequest,
   BatchRunFreshResponse,
-  ListRunsQuery,
-  ListRunsResponse,
   CancelRunResponse,
   ExecutionReportResponse,
 } from './runs.types.js';
-import type {
-  CliAcceptPlansResponse,
-  CliGeneratePlansResponse,
-  CliGetPlansResponse,
-} from './plans.types.js';
 import type {
   MintTunnelBody,
   TunnelListResponse,
@@ -53,6 +42,7 @@ import type {
   TunnelStatusResponse,
 } from './tunnel.types.js';
 import type { ShutdownHandle } from './interrupt.js';
+import { sleepUnlessInterrupted } from './poll-support.js';
 
 export type FetchImpl = typeof globalThis.fetch;
 
@@ -76,7 +66,7 @@ export interface DebugEvent {
  * by the polling layer), while still failing fast on a dead backend.
  *
  * The 15-minute test-execution ceiling is enforced separately by the `--timeout`
- * / polling path (`poll.ts`) which supplies its own `AbortSignal` per iteration.
+ * / whole-run waiting path (`run-wait.ts`) which supplies its own `AbortSignal` per iteration.
  * That path is unaffected — each 25s long-poll request still falls well within
  * this 120s per-request guard.
  *
@@ -189,9 +179,8 @@ export interface RequestOptions<T = unknown> {
    * field paths (never the body itself). When absent, behavior is unchanged:
    * the body is returned via the historical blind `as T` cast.
    *
-   * Wired by the typed run helpers only (`triggerRun`, `triggerRunWithMeta`,
-   * `triggerRerun`, `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`,
-   * `listTestRuns`, `cancelRun`); generic `get`/`post`/... callers stay opt-in.
+   * Wired by the typed HttpClient helpers (the run, test-list, tunnel and
+   * execution-report calls); generic `get`/`post`/... callers stay opt-in.
    * sourceRef: response-schemas.ts.
    */
   schema?: v.GenericSchema<unknown, T>;
@@ -210,23 +199,20 @@ export interface RequestOptions<T = unknown> {
   /**
    * Whether to retry on 409 CONFLICT.
    *
-   * The shared retry policy retries CONFLICT once by default (read paths
-   * where 409 = mid-mutation snapshot). Set to `false` for write paths
-   * where 409 is a persistent condition (e.g. POST /tests/{testId}/runs
-   * when another run is already in flight) — retrying there would enqueue
-   * a second run once the first finishes.
+   * The shared retry policy retries CONFLICT once by default, for a
+   * transient server-side conflict. Set to `false` where a 409 is persistent
+   * (a run trigger, when another run is already in flight): retrying there
+   * would enqueue a second run once the first finishes.
    *
-   * Defaults to `true` to preserve the original M2 read-path behavior.
+   * Defaults to `true`.
    */
   retryOnConflict?: boolean;
   /**
    * Whether the HTTP layer should retry internally on 429 RATE_LIMITED.
    *
-   * Set to `false` for the batch-run trigger path where the outer
-   * `runBatchRun` loop is the single owner of rate-limit handling —
-   * keeping the HTTP layer from adding up to 3 extra retries per outer
-   * attempt, which would multiply trigger POSTs per spec (e.g. 50×3 = 150/min)
-   * instead of staying within the client throttle's 50/min.
+   * Set to `false` where the caller owns rate-limit handling itself (or a
+   * best-effort lookup should give up on the first 429), keeping the HTTP
+   * layer from adding up to 3 extra retries per call.
    *
    * Defaults to `true` to preserve backward-compatible behavior for all
    * other callers.
@@ -251,13 +237,6 @@ export interface RequestOptions<T = unknown> {
    * existing request paths retain their retry behaviour.
    */
   retry?: boolean;
-  /**
-   * Called with the delay of each automatic retry wait (a transport backoff, a
-   * 429's `Retry-After`, a 5xx backoff) just before the wait starts. The run
-   * poll's stall guard uses it to restart its budget after the wait, so a
-   * retry inside one read is never mistaken for a silent connection.
-   */
-  onRetryWait?: (delayMs: number) => void;
 }
 
 const RETRY_BASE_MS = 250;
@@ -301,11 +280,10 @@ const INTERNAL_DELAY_MS = 500;
 
 // Upper bound on the size of a successful JSON response body the client will
 // buffer into memory. `response.json()` reads the ENTIRE body before parsing,
-// with no limit, so a large `test result --history` page or a run with a long
-// `steps[]` array (getRun `includeSteps`) would grow the heap in proportion to
-// the payload. 64 MiB sits far above any legitimate metadata/history/steps
-// response yet still bounds a pathological — or hostile — one. Override per
-// client via `HttpClientOptions.maxResponseBytes`.
+// with no limit, so a large list page or a result with a long `steps[]` array
+// would grow the heap in proportion to the payload. 64 MiB sits far above any
+// legitimate metadata/history/steps response yet still bounds a pathological —
+// or hostile — one. Override per client via `HttpClientOptions.maxResponseBytes`.
 const MAX_RESPONSE_BYTES_DEFAULT = 64 * 1024 * 1024;
 
 // Cap on how many valibot issues a shape-mismatch INTERNAL envelope carries in
@@ -402,24 +380,12 @@ export class HttpClient {
   }
 
   /**
-   * Like `get` / `post` / etc. but returns the full `RequestResult` including
+   * Like `post` / `delete` but returns the full `RequestResult` including
    * `requestId` and `status`, so callers can surface the requestId in
-   * happy-path output.
+   * happy-path output. The run triggers and the tunnel mint and delete use them.
    */
-  async getWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
-    return this.requestWithMeta<T>('GET', path, options);
-  }
-
   async postWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('POST', path, options);
-  }
-
-  async putWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
-    return this.requestWithMeta<T>('PUT', path, options);
-  }
-
-  async patchWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
-    return this.requestWithMeta<T>('PATCH', path, options);
   }
 
   async deleteWithMeta<T>(
@@ -427,6 +393,24 @@ export class HttpClient {
     options: RequestOptions<T> = {},
   ): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('DELETE', path, options);
+  }
+
+  /** Launch exactly one execution for this project, with server-owned pacing. */
+  async triggerProjectRun(
+    projectId: string,
+    body: ProjectRunRequest,
+    options: { idempotencyKey: string; signal?: AbortSignal },
+  ): Promise<RequestResult<ProjectRunResponse>> {
+    return this.postWithMeta<ProjectRunResponse>(
+      `/projects/${encodeURIComponent(projectId)}/runs`,
+      {
+        body,
+        headers: { 'idempotency-key': options.idempotencyKey },
+        signal: options.signal,
+        schema: PROJECT_RUN_RESPONSE_SCHEMA,
+        retryOnConflict: false,
+      },
+    );
   }
 
   /**
@@ -455,19 +439,11 @@ export class HttpClient {
   /**
    * Like `triggerRun` but returns the full `RequestResult` so the caller
    * can surface the `requestId` in happy-path CLI output.
-   *
-   * `retryOnRateLimit` defaults to `true` so single `test run` and
-   * `test create --run` retain the standard HTTP-layer 429 retry budget.
-   *
-   * Pass `retryOnRateLimit: false` ONLY at the batch fan-out call site
-   * (`runBatchRun` / `triggerOne`) where the outer loop is the single owner
-   * of rate-limit handling — preventing the HTTP layer from adding up to 3
-   * extra retries per outer attempt, which would multiply POSTs per spec (e.g. 50×3 = 150/min).
    */
   async triggerRunWithMeta(
     testId: string,
     body: TriggerRunBody,
-    options: { idempotencyKey: string; signal?: AbortSignal; retryOnRateLimit?: boolean },
+    options: { idempotencyKey: string; signal?: AbortSignal },
   ): Promise<RequestResult<TriggerRunResponse>> {
     return this.postWithMeta<TriggerRunResponse>(`/tests/${encodeURIComponent(testId)}/runs`, {
       body,
@@ -475,53 +451,7 @@ export class HttpClient {
       signal: options.signal,
       schema: TRIGGER_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
-      // Default true: single `test run` / `test create --run` retain 429 retry.
-      // Batch call site passes false to keep outer-loop as sole rate-limit owner.
-      retryOnRateLimit: options.retryOnRateLimit ?? true,
     });
-  }
-
-  /**
-   * POST /api/cli/v1/tests/{testId}/runs/rerun
-   * Trigger a rerun (replay) for a single test. FE: verbatim script replay, billed at
-   * 0.5 credits (same as a fresh run; legacy V2 accounts: free). BE: dependency-closure
-   * re-run, billed at 0.2 credits. Returns `runId` + optional `closure` (BE).
-   *
-   * `retryOnConflict: false` — 409 on rerun means the test is already in-flight,
-   * a persistent condition. Retrying would race against the running test.
-   */
-  async triggerRerun(
-    testId: string,
-    body: RerunRequest,
-    options: { idempotencyKey: string; signal?: AbortSignal },
-  ): Promise<RerunResponse> {
-    return this.postWithMeta<RerunResponse>(`/tests/${encodeURIComponent(testId)}/runs/rerun`, {
-      body,
-      headers: { 'idempotency-key': options.idempotencyKey },
-      signal: options.signal,
-      schema: RERUN_RESPONSE_SCHEMA,
-      retryOnConflict: false,
-    }).then(r => withoutDeprecationAdvisories(r.body));
-  }
-
-  /**
-   * POST /api/cli/v1/tests/batch/rerun
-   * Trigger a batch rerun across multiple tests (mixed FE/BE allowed).
-   * BE closure is deduped server-side per project.
-   *
-   * `retryOnConflict: false` — 409 on batch rerun is persistent ("in flight").
-   */
-  async triggerBatchRerun(
-    body: BatchRerunRequest,
-    options: { idempotencyKey: string; signal?: AbortSignal },
-  ): Promise<BatchRerunResponse> {
-    return this.postWithMeta<BatchRerunResponse>('/tests/batch/rerun', {
-      body,
-      headers: { 'idempotency-key': options.idempotencyKey },
-      signal: options.signal,
-      schema: BATCH_RERUN_RESPONSE_SCHEMA,
-      retryOnConflict: false,
-    }).then(r => withoutDeprecationAdvisories(r.body));
   }
 
   /**
@@ -556,7 +486,12 @@ export class HttpClient {
    */
   async triggerTestListRun(
     listId: string,
-    body: { testIds?: string[]; tunnelClientId?: string; targetUrl?: string },
+    body: {
+      testIds?: string[];
+      tunnelClientId?: string;
+      targetUrl?: string;
+      maxConcurrency?: number;
+    },
     options: { idempotencyKey: string; signal?: AbortSignal },
   ): Promise<CliTestListRunResponse> {
     return this.postWithMeta<CliTestListRunResponse>(
@@ -572,71 +507,28 @@ export class HttpClient {
   }
 
   /**
-   * GET /api/cli/v1/tests/{testId}/runs
-   * List a test's prior run history, newest-first.
-   *
-   * Limit-before-filter caveat: a `source`-filtered page may return fewer
-   * than `pageSize` rows while still yielding a non-null `nextCursor`.
-   * That means "none in THIS window", not end-of-history.
-   */
-  async listTestRuns(
-    testId: string,
-    query: ListRunsQuery,
-    options: { signal?: AbortSignal; retry?: boolean } = {},
-  ): Promise<ListRunsResponse> {
-    const q: Record<string, string | number | undefined> = {};
-    if (query.cursor !== undefined) q.cursor = query.cursor;
-    if (query.pageSize !== undefined) q.pageSize = query.pageSize;
-    if (query.source !== undefined) q.source = query.source;
-    if (query.since !== undefined) q.since = query.since;
-    if (query.environment !== undefined) q.environment = query.environment;
-    return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, {
-      query: q,
-      signal: options.signal,
-      retry: options.retry,
-      schema: LIST_RUNS_RESPONSE_SCHEMA,
-    });
-  }
-
-  /**
-   * GET /api/cli/v1/runs/{runId}
-   * Fetch the current state of a run. When `waitSeconds` is provided
-   * (1–25) the server performs a bounded long-poll and returns when the
-   * run is terminal or when `waitSeconds` elapses, whichever comes
-   * first. On `400 VALIDATION_ERROR` (server doesn't support
-   * `waitSeconds`) the caller should retry without the param and switch
-   * to client-side backoff — see `src/lib/poll.ts`.
-   *
-   * When `includeSteps` is `true`, the server appends the full ordered
-   * `steps[]` array (M3.4 piece-4). Default (absent/false) is byte-
-   * identical to the M3.3 summary shape — the polling path is unaffected.
+   * GET /api/cli/v1/runs/{resultId}
+   * Fetch an individual result card, including steps and artifacts. Optional
+   * waitSeconds is retained for callers of this existing result endpoint.
+   * Whole-execution waiting uses GET /results?run= through run-wait.ts.
    */
   async getRun(
-    runId: string,
-    options?: {
-      waitSeconds?: number;
-      includeSteps?: boolean;
-      signal?: AbortSignal;
-      onRetryWait?: (delayMs: number) => void;
-    },
+    resultId: string,
+    options?: { waitSeconds?: number; signal?: AbortSignal },
   ): Promise<RunResponse> {
-    const query: Record<string, number | boolean | undefined> = {};
+    const query: Record<string, number | undefined> = {};
     if (options?.waitSeconds !== undefined) {
       query.waitSeconds = options.waitSeconds;
     }
-    if (options?.includeSteps === true) {
-      query.includeSteps = true;
-    }
-    return this.get<RunResponse>(`/runs/${encodeURIComponent(runId)}`, {
+    return this.get<RunResponse>(`/runs/${encodeURIComponent(resultId)}`, {
       query: Object.keys(query).length > 0 ? query : undefined,
       signal: options?.signal,
       schema: RUN_RESPONSE_SCHEMA,
-      onRetryWait: options?.onRetryWait,
     });
   }
 
   /**
-   * POST /api/cli/v1/tunnel — mint a tunnel client for `test run --local`.
+   * POST /api/cli/v1/tunnel — mint a tunnel client for `run --local`.
    *
    * The ONLY response on this surface that carries a secret. Deliberately NOT
    * sent with an `Idempotency-Key`: the interceptor persists the response body
@@ -698,11 +590,11 @@ export class HttpClient {
    * building the report meanwhile.
    */
   async getExecutionReport(
-    executionId: string,
+    runId: string,
     options: { signal?: AbortSignal; retry?: boolean } = {},
   ): Promise<ExecutionReportResponse> {
     return this.get<ExecutionReportResponse>(
-      `/tests/executions/${encodeURIComponent(executionId)}/report`,
+      `/tests/executions/${encodeURIComponent(runId)}/report`,
       { signal: options.signal, retry: options.retry, schema: EXECUTION_REPORT_RESPONSE_SCHEMA },
     );
   }
@@ -725,14 +617,10 @@ export class HttpClient {
 
   /**
    * POST /api/cli/v1/runs/{runId}/cancel
-   * User-initiated cancel of a queued/running run. No
-   * body, no `Idempotency-Key` — the endpoint is naturally idempotent:
-   * re-cancel → 200 `alreadyCancelled: true`; already-terminal (passed/
-   * failed/blocked) → 409 CONFLICT; unknown/cross-tenant runId → 404.
-   *
-   * `retryOnConflict: false` — same rationale as `triggerRun`: a 409 here is
-   * a truthful terminal answer ("already finished"), not a transient
-   * snapshot conflict to paper over with a retry.
+   * Cancel the entire execution without enumerating its results. Repeated and
+   * terminal cancellation returns HTTP 200 with alreadyCancelled/alreadyFinished;
+   * unknown and cross-tenant execution IDs return 404. Per-result refund outcomes
+   * are returned by the server. No request body or idempotency key is required.
    */
   async cancelRun(runId: string, options?: { signal?: AbortSignal }): Promise<CancelRunResponse> {
     return this.post<CancelRunResponse>(`/runs/${encodeURIComponent(runId)}/cancel`, {
@@ -741,75 +629,6 @@ export class HttpClient {
       retryOnConflict: false,
       replaySafe: true,
     });
-  }
-
-  /**
-   * POST /api/cli/v1/projects/{projectId}/plans/generate
-   * Start whichever generation stage the project is missing next. The body
-   * is empty by contract — the server decides which rung fires. 202 both
-   * for `accepted` (a stage started) and `nothing_to_start` (proposals are
-   * already staged; the facade's no-restart guard refuses a duplicate
-   * append because it would wipe the batch and re-bill 2 credits).
-   *
-   * `retryOnConflict: false` — a 409 here is `stage_in_flight`, a flow
-   * signal the ladder answers by attaching and polling, never a transient
-   * snapshot conflict to paper over with a retry.
-   */
-  async generatePlans(
-    projectId: string,
-    options: { idempotencyKey: string; signal?: AbortSignal },
-  ): Promise<CliGeneratePlansResponse> {
-    return this.post<CliGeneratePlansResponse>(
-      `/projects/${encodeURIComponent(projectId)}/plans/generate`,
-      {
-        body: {},
-        headers: { 'idempotency-key': options.idempotencyKey },
-        signal: options.signal,
-        retryOnConflict: false,
-      },
-    );
-  }
-
-  /**
-   * GET /api/cli/v1/projects/{projectId}/plans
-   * Pure read: the facade-synthesized generation status, the staged
-   * proposal list (stable proposalIds — what `accept --only` consumes),
-   * and a best-effort credits block. When `waitSeconds` (1–25) is
-   * provided the server long-polls: one request per window, answered
-   * early on any change.
-   */
-  async getPlans(
-    projectId: string,
-    options?: { waitSeconds?: number; signal?: AbortSignal },
-  ): Promise<CliGetPlansResponse> {
-    return this.get<CliGetPlansResponse>(`/projects/${encodeURIComponent(projectId)}/plans`, {
-      query: options?.waitSeconds !== undefined ? { waitSeconds: options.waitSeconds } : undefined,
-      signal: options?.signal,
-    });
-  }
-
-  /**
-   * POST /api/cli/v1/projects/{projectId}/plans/accept
-   * Convert staged proposals into real test cases. `only` is ALWAYS an
-   * explicit, non-empty id list — the caller enforces the two §3.3 safety
-   * rules (full list when the user didn't subset; an empty selection is a
-   * client-side validation error because `[]` is server-destructive:
-   * it means "reject everything" and clears the staged batch).
-   */
-  async acceptPlans(
-    projectId: string,
-    only: string[],
-    options: { idempotencyKey: string; signal?: AbortSignal },
-  ): Promise<CliAcceptPlansResponse> {
-    return this.post<CliAcceptPlansResponse>(
-      `/projects/${encodeURIComponent(projectId)}/plans/accept`,
-      {
-        body: { only },
-        headers: { 'idempotency-key': options.idempotencyKey },
-        signal: options.signal,
-        retryOnConflict: false,
-      },
-    );
   }
 
   /**
@@ -881,8 +700,7 @@ export class HttpClient {
 
       // Compose the per-request timeout signal with any caller-supplied signal.
       // The fetch aborts on whichever fires first. This ensures every one-shot
-      // request (test create/update/delete/list/get, auth whoami, code put/get,
-      // plan put) has a client-side deadline even when the caller supplies no
+      // request (test list/get, auth status, …) has a client-side deadline even when the caller supplies no
       // signal. The polling path supplies its own deadline-aware signal per
       // iteration — this timeout (120s default) is safely larger than any single
       // long-poll window (<=25s via ?waitSeconds), so it never bites polling.
@@ -901,7 +719,7 @@ export class HttpClient {
       // `AbortSignal.any` here was measured to register ~330K dependent-signal
       // trackings against that one long-lived signal over a single request-heavy
       // test file — the same `FinalizationRegistry` backlog mechanism already
-      // fixed once in `poll.ts`, just recreated per-request instead of
+      // fixed in the polling signal lifecycle, just recreated per-request instead of
       // per-poll-iteration. `cleanupAbortComposition` MUST be called once the
       // request settles (below, alongside `requestTimeout.clear()`).
       const { signal: effectiveSignal, cleanup: cleanupAbortComposition } =
@@ -975,8 +793,7 @@ export class HttpClient {
             allowTransportRetry,
           });
           requestTimeout.clear();
-          options.onRetryWait?.(delayMs);
-          await this.sleepBeforeRetry(delayMs);
+          await this.sleepBeforeRetry(delayMs, options.signal);
           continue;
         }
 
@@ -1030,8 +847,7 @@ export class HttpClient {
                 allowTransportRetry,
               });
               requestTimeout.clear();
-              options.onRetryWait?.(delayMs);
-              await this.sleepBeforeRetry(delayMs);
+              await this.sleepBeforeRetry(delayMs, options.signal);
               continue;
             }
             try {
@@ -1149,14 +965,13 @@ export class HttpClient {
             delayMs: decision.delayMs,
           });
           requestTimeout.clear();
-          options.onRetryWait?.(decision.delayMs);
-          await this.sleepBeforeRetry(decision.delayMs);
+          await this.sleepBeforeRetry(decision.delayMs, options.signal);
           continue;
         }
 
         const retryAfterSec = parseRetryAfter(response.headers.get('retry-after'));
         // Clamp server-directed Retry-After to [1s, 300s] and surface on the
-        // thrown error so outer callers (e.g. runBatchRun outer retry loop)
+        // thrown error so outer callers (e.g. the `run wait` retry loop)
         // can honor it without re-reading the now-consumed HTTP response.
         const retryAfterMsForError =
           retryAfterSec !== undefined
@@ -1227,8 +1042,7 @@ export class HttpClient {
           delayMs: decision.delayMs,
         });
         requestTimeout.clear();
-        options.onRetryWait?.(decision.delayMs);
-        await this.sleepBeforeRetry(decision.delayMs);
+        await this.sleepBeforeRetry(decision.delayMs, options.signal);
       } finally {
         requestTimeout.clear();
         // Remove the manually-added abort listeners now, synchronously —
@@ -1321,29 +1135,33 @@ export class HttpClient {
   }
 
   /**
-   * Retry-delay sleep that bails the moment the shutdown signal fires: a
-   * RATE_LIMITED `Retry-After: 60` or a transport backoff must not delay the
-   * honest-detach exit by up to a minute — reject with the InterruptError
-   * reason immediately. Mirrors poll.ts::sleepUnlessInterrupted.
+   * Retry-delay sleep that ends the moment the shutdown signal or the caller's
+   * own signal for this request fires, rejecting with that signal's reason: a
+   * RATE_LIMITED `Retry-After: 60` or a transport backoff must neither delay
+   * the honest-detach exit by up to a minute nor outlast a deadline the caller
+   * set (`run wait --timeout`). An interrupt outranks the caller's signal when
+   * both have fired. The race itself is poll-support.ts::sleepUnlessInterrupted,
+   * over the two signals composed into one.
    */
-  private sleepBeforeRetry(ms: number): Promise<void> {
-    const signal = this.shutdownSignal;
-    if (signal == null) return this.sleep(ms);
-    if (signal.aborted) return Promise.reject(signal.reason);
-    return new Promise((resolve, reject) => {
-      const onAbort = (): void => reject(signal.reason);
-      signal.addEventListener('abort', onAbort, { once: true });
-      this.sleep(ms, signal).then(
-        () => {
-          signal.removeEventListener('abort', onAbort);
-          resolve();
-        },
-        err => {
-          signal.removeEventListener('abort', onAbort);
-          reject(err instanceof Error ? err : new Error(String(err)));
-        },
-      );
-    });
+  private async sleepBeforeRetry(ms: number, callerSignal: AbortSignal | undefined): Promise<void> {
+    const sources = [this.shutdownSignal, callerSignal].filter(
+      (source): source is AbortSignal => source != null,
+    );
+    if (sources.length === 0) return this.sleep(ms);
+    const reason = (): unknown =>
+      this.shutdownSignal?.aborted ? this.shutdownSignal.reason : callerSignal?.reason;
+    if (sources.some(source => source.aborted)) throw reason();
+    // Manual composition, as for every request (see `composeAbortSignals`).
+    const { signal, cleanup } = composeAbortSignals(sources);
+    try {
+      await sleepUnlessInterrupted(this.sleep, ms, signal);
+    } catch (err) {
+      // A fired signal rejects with its own reason; any other failure of the
+      // sleep is passed on as it came.
+      throw signal.aborted ? reason() : err;
+    } finally {
+      cleanup();
+    }
   }
 
   private debug(event: DebugEvent): void {
@@ -1483,7 +1301,7 @@ interface RequestTimeoutHandle {
   clear: () => void;
 }
 
-export interface AbortComposition {
+interface AbortComposition {
   signal: AbortSignal;
   cleanup: () => void;
 }
@@ -1503,12 +1321,11 @@ export interface AbortComposition {
  * cleanup pass. Under a request-heavy path (retries, a wide closure/batch
  * fan-out, RATE_LIMITED backoff) this reproduces — per HTTP request instead
  * of per poll-iteration — the exact backlog mechanism already fixed once in
- * `poll.ts` (`JSFinalizationRegistry::Cleanup` → `KeepDuringJob` →
+ * the former per-result poller (`JSFinalizationRegistry::Cleanup` → `KeepDuringJob` →
  * `OrderedHashSet::Add` pegging the CPU once the deferred backlog is finally
- * walked). Measured directly: the RATE_LIMITED closure-fanout scenario in
- * `test.rerun.spec.ts` alone drives ~330K `AbortSignal.any` calls against the
- * one process-lifetime `globalShutdown.signal` over the life of that single
- * test file.
+ * walked). Measured directly: a single RATE_LIMITED fan-out test file drove
+ * ~330K `AbortSignal.any` calls against the one process-lifetime
+ * `globalShutdown.signal`.
  *
  * This performs the identical "first one wins, propagate its `.reason`"
  * composition with a plain `AbortController` and ordinary
@@ -1517,11 +1334,8 @@ export interface AbortComposition {
  * `cleanup()` once the request settles (success, error, or retry) so the
  * listeners are removed immediately rather than left for a cleanup pass that,
  * for this composition, no longer exists.
- *
- * Exported for the run poll's per-read stall guard (`poll.ts`), which composes
- * its stall signal with the poll session signal on every read.
  */
-export function composeAbortSignals(signals: readonly AbortSignal[]): AbortComposition {
+function composeAbortSignals(signals: readonly AbortSignal[]): AbortComposition {
   if (signals.length <= 1) {
     return { signal: signals[0]!, cleanup: () => {} };
   }
@@ -1674,10 +1488,10 @@ export function malformedResponseError(
  * Read a successful response body as text, bounded to `maxBytes`.
  *
  * `response.json()` buffers the ENTIRE body into memory before parsing, with no
- * upper limit — a large `test result --history` page, or a run with a long
- * `steps[]` array (getRun `includeSteps`), grows the heap in proportion to the
- * payload. This reads the body incrementally and stops once the accumulated
- * size crosses `maxBytes`, so a pathological (or hostile) response fails fast
+ * upper limit — a large list page, or a result with a long `steps[]` array,
+ * grows the heap in proportion to the payload. This reads the body
+ * incrementally and stops once the accumulated size crosses `maxBytes`, so a
+ * pathological (or hostile) response fails fast
  * with a typed PAYLOAD_TOO_LARGE error instead of exhausting memory.
  *
  * A declared `Content-Length` over the cap is rejected before any body is read.
@@ -1759,8 +1573,8 @@ function responseTooLargeError(
       `The server response exceeded the client-side ${limitMiB} MiB limit and was not ` +
       `buffered, to avoid unbounded memory use.`,
     nextAction:
-      'Narrow the result set and retry — e.g. a smaller --page-size, a tighter --since ' +
-      'window, or scope --history to a single run.',
+      'Ask for fewer items and retry, e.g. with a smaller --page-size or --limit, or a ' +
+      'narrower --status, where the command offers them.',
     requestId,
     details: {
       maxBytes,
@@ -1870,9 +1684,10 @@ function apiRetryDecision(
       // self-heal by upgrading, so fail fast with the upgrade guidance.
       return { retry: false, delayMs: 0 };
     case 'CONFLICT':
-      // Read paths (e.g. GET /failure) retry once: 409 = mid-mutation snapshot.
-      // Write paths (e.g. POST /runs) must NOT retry: 409 = another run is in
-      // flight (persistent), retrying would enqueue a second run.
+      // A 409 is retried once by default: a transient server-side conflict.
+      // A caller whose 409 is persistent (a run trigger: another run is already
+      // in flight) passes `retryOnConflict: false`, since retrying would
+      // enqueue a second run.
       if (!retryOnConflict) return { retry: false, delayMs: 0 };
       if (attempt >= MAX_ATTEMPTS_CONFLICT) return { retry: false, delayMs: 0 };
       return { retry: true, delayMs: CONFLICT_DELAY_MS };
@@ -1932,22 +1747,4 @@ function isTimeoutError(err: unknown): boolean {
     return (err as { name?: string }).name === 'TimeoutError';
   }
   return false;
-}
-
-/**
- * Drop server-sent `feature: 'deprecation'` advisories from a rerun response.
- * The CLI owns the deprecation signal itself (one stderr line plus the JSON
- * `deprecations` key), so passing the server's through would announce the same
- * thing twice. Matched on the machine-readable `feature`, never on message
- * text; other advisories (autoHeal) are kept and an emptied list is removed.
- */
-function withoutDeprecationAdvisories<T extends { advisories?: { feature: string }[] }>(
-  body: T,
-): T {
-  if (!body.advisories) return body;
-  const kept = body.advisories.filter(a => a.feature !== 'deprecation');
-  if (kept.length === body.advisories.length) return body;
-  const next: { advisories?: { feature: string }[] } = { ...body, advisories: kept };
-  if (kept.length === 0) delete next.advisories;
-  return next as T;
 }

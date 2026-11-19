@@ -1,4 +1,4 @@
-import { promises as nodeFs } from 'node:fs';
+import { appendFileSync, promises as nodeFs } from 'node:fs';
 import { spawnSync as nodeSpawnSync, type SpawnSyncReturns } from 'node:child_process';
 import * as path from 'node:path';
 import { Command } from 'commander';
@@ -16,15 +16,6 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { Page } from '../lib/pagination.js';
 import { inspectTargetPath, type TargetPathFs } from '../lib/target-path.js';
 import { assertNotLocal } from '../lib/target-url.js';
-import {
-  classifyLinkage,
-  isValidRepoSlug,
-  parseDeploymentsPayload,
-  parseRepoSlug,
-  type DeploymentRecord,
-  type LinkageStatus,
-  type LinkageVerdict,
-} from '../lib/ci-linkage.js';
 import { ciRefusalOutcome, recordTelemetryExtras } from '../lib/telemetry.js';
 import type { CliProject } from './project.js';
 import {
@@ -33,11 +24,25 @@ import {
   type RunTestRunAllOptions,
   type TestDeps,
 } from './test.js';
-import { emitCiStepOutputs, type CiSummary } from '../lib/gh-output.js';
-import { previewEnvironmentName, readGithubRunContext } from '../lib/github-context.js';
+import { emitCiStepOutputs, escapeCommandData, type CiSummary } from '../lib/gh-output.js';
+import {
+  previewEnvironmentName,
+  readGithubRunContext,
+  type GithubRunContext,
+} from '../lib/github-context.js';
+import { waitForCommitSignal } from '../lib/commit-signal.js';
+import {
+  missingPlaceholders,
+  renderUrlTemplate,
+  type UrlTemplateVars,
+  unsafeHostPlaceholders,
+  validateUrlTemplate,
+} from '../lib/url-template.js';
+import { globalShutdown } from '../lib/interrupt.js';
 import type { CiGithubTrigger } from '../lib/runs.types.js';
 import { parseJUnitReportFormat } from '../lib/junit-report.js';
 import type { CliProjectEnvListResponse } from './project-env.js';
+import { terminalSafeWriter } from '../lib/terminal-text.js';
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -51,7 +56,7 @@ const DEFAULT_WORKFLOW_PATH = '.github/workflows/testsprite.yml';
 /** Where GitHub Actions picks workflows up from; `--path` must stay inside it. */
 const WORKFLOWS_DIR = '.github/workflows';
 
-/** Default terminal-verdict wait, matching the CLI's own `test run` default. */
+/** Default terminal-verdict wait, matching the CLI's own `run` default. */
 const DEFAULT_TIMEOUT_SECONDS = 600;
 
 /** The repo secret the generated workflow reads the API key from. */
@@ -117,12 +122,11 @@ const defaultCiFs: CiFs = {
 };
 
 /** Injectable subprocess runner (defaults to a real `spawnSync`), so tests never
- * shell out. Runs `git` (repo slug), `gh` (optional secret set, deployment
- * history) and `npx vercel` (`ci connect`). */
+ * shell out. Runs `gh` (optional secret set). */
 export type SpawnImpl = (
   cmd: string,
   args: string[],
-  opts: { input?: string; cwd?: string; shell?: boolean },
+  opts: { input?: string; cwd?: string },
 ) => SpawnSyncReturns<string>;
 
 const defaultSpawn: SpawnImpl = (cmd, args, opts) =>
@@ -130,7 +134,6 @@ const defaultSpawn: SpawnImpl = (cmd, args, opts) =>
     input: opts.input,
     cwd: opts.cwd,
     encoding: 'utf8',
-    shell: opts.shell ?? false,
     windowsHide: true,
   });
 
@@ -143,10 +146,8 @@ export interface CiDeps extends Pick<TestDeps, 'shutdown' | 'onWaitTimeout'> {
   cwd?: string;
   fs?: CiFs;
   spawn?: SpawnImpl;
-  /** Injected by `ci doctor --wait` tests so polling never really sleeps. */
+  /** Injected by tests so polling never really sleeps. */
   sleep?: (ms: number) => Promise<void>;
-  /** OS seam for the Windows `npx` shim handling (defaults to `process.platform`). */
-  platform?: NodeJS.Platform;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -408,6 +409,12 @@ ${envLines.join('\n')}
       #    above). The next step then reads the URL from the deployment event.
       # B. You deploy in this workflow: replace the run lines with your deploy
       #    commands and end with:  echo "url=<preview address>" >> "$GITHUB_OUTPUT"
+      # C. Your platform only posts a commit status or check on the PR (no deployment
+      #    event): delete this step, keep the pull_request trigger, and in the step below
+      #    replace the PREVIEW_URL env and the --target-url "$PREVIEW_URL" line with
+      #      --wait-for-status "<its name on the PR>" --target-url-template "<pattern>"
+      #    (placeholders {pr} {branch-slug} {sha} …, e.g. https://app-git-{branch-slug}-team.vercel.app),
+      #    then add  statuses: read  and  checks: read  under permissions: above.
       - name: Get this PR's preview URL
         id: preview
         run: |
@@ -656,7 +663,7 @@ async function runCiInitScaffold(
   onExisted: (existed: boolean) => void,
 ): Promise<void> {
   const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
   const fs = deps.fs ?? defaultCiFs;
   const cwd = deps.cwd ?? process.cwd();
   const out = new Output(opts.output, { stdout, stderr });
@@ -824,490 +831,6 @@ async function runCiInitScaffold(
   out.print(summary, d => renderCiInitText(d as CiInitSummary));
 }
 
-// ── ci doctor / ci connect ───────────────────────────────────────────────────
-
-export interface CiDoctorOptions extends CommonOptions {
-  repo?: string;
-  /** Poll until a NEW deployment record arrives (the post-connect check). */
-  wait: boolean;
-  /** Bound for `--wait`, in seconds; undefined = `--timeout` was not given. */
-  waitTimeoutSeconds?: number;
-}
-
-export interface CiDoctorSummary {
-  repo: string;
-  status: LinkageStatus;
-  ok: boolean;
-  detail: string;
-  lastDeployAt: string | null;
-  creators: string[];
-  hasPreview: boolean;
-  /** Whether this run watched for a new record (`--wait`). */
-  waited: boolean;
-  /** `--wait` only: the record whose arrival ended the wait, or null. */
-  newDeployment: DeploymentRecord | null;
-  /** Set when history could not be read at all — then the rest is not a verdict. */
-  error: string | null;
-}
-
-/** Poll interval for `--wait`. A deploy takes minutes; 15 s keeps it cheap. */
-const DOCTOR_POLL_INTERVAL_MS = 15_000;
-
-/**
- * `owner/repo` for the check: the explicit `--repo`, else the `origin` remote.
- * Returns null when neither resolves — the caller turns that into guidance
- * rather than an opaque failure.
- */
-export function resolveRepoSlug(
-  explicit: string | undefined,
-  cwd: string,
-  spawn: SpawnImpl,
-): string | null {
-  if (explicit !== undefined && explicit !== '') {
-    return isValidRepoSlug(explicit) ? explicit : null;
-  }
-  try {
-    const res = spawn('git', ['remote', 'get-url', 'origin'], { cwd });
-    if (res.error || res.status !== 0) return null;
-    return parseRepoSlug(res.stdout ?? '');
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Read the repo's deployment history through `gh` — the same soft dependency
- * `--set-secret` already uses, so this adds no new requirement. It carries the
- * user's own GitHub credentials, which a private repo needs.
- */
-function fetchDeploymentHistory(
-  repo: string,
-  cwd: string,
-  spawn: SpawnImpl,
-): { records: DeploymentRecord[] } | { error: string } {
-  let result: SpawnSyncReturns<string>;
-  try {
-    // 100 (the API maximum) rather than a small page: the classifier separates
-    // preview from production records, and a busy repo can push dozens of
-    // production deploys past its newest preview — a short page would then read
-    // as a false `production-only`.
-    result = spawn('gh', ['api', `repos/${repo}/deployments?per_page=100`], { cwd });
-  } catch (err) {
-    return { error: `failed to run gh: ${(err as Error).message}` };
-  }
-  if (result.error) {
-    const code = (result.error as NodeJS.ErrnoException).code;
-    return {
-      error:
-        code === 'ENOENT'
-          ? 'gh CLI not found on PATH — install it (https://cli.github.com), then `gh auth login`'
-          : `gh failed: ${result.error.message}`,
-    };
-  }
-  if (result.status !== 0) {
-    const stderr = (result.stderr ?? '').split('\n')[0]?.trim() ?? '';
-    return { error: `gh exited ${result.status}${stderr ? `: ${stderr}` : ''}` };
-  }
-  return { records: parseDeploymentsPayload(result.stdout ?? '') };
-}
-
-/**
- * Diagnose whether deployment events reach this repo — the precondition every
- * deployment-gated workflow rests on, and the only one that fails *silently*.
- *
- * Exits non-zero when the chain is not live, so a script (or `ci init`) can
- * gate on it. `--wait` makes the post-connect verification one command instead
- * of "go watch GitHub yourself": it baselines the history on the first read and
- * succeeds when a NEW record arrives. That success condition is a hard fact,
- * deliberately independent of the preview/production heuristic — pushing to a
- * default branch produces a *production* deployment, and that still proves the
- * link is live.
- */
-export async function runCiDoctor(opts: CiDoctorOptions, deps: CiDeps = {}): Promise<void> {
-  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const out = new Output(opts.output, { stdout, stderr });
-  const cwd = deps.cwd ?? process.cwd();
-  const spawn = deps.spawn ?? defaultSpawn;
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
-
-  if (opts.waitTimeoutSeconds !== undefined && !opts.wait) {
-    throw localValidationError(
-      'timeout',
-      'only applies with --wait — add --wait, or drop --timeout',
-    );
-  }
-  const waitTimeoutSeconds = opts.waitTimeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
-
-  const repo = resolveRepoSlug(opts.repo, cwd, spawn);
-  if (repo === null) {
-    throw localValidationError(
-      'repo',
-      opts.repo
-        ? 'must look like owner/name (e.g. acme/storefront)'
-        : 'could not read a GitHub `origin` remote here — run from the repo, or pass --repo <owner/name>',
-    );
-  }
-
-  const deadline = Date.now() + waitTimeoutSeconds * 1000;
-  let verdict: LinkageVerdict | undefined;
-  let readError: string | null = null;
-  /** Newest record's timestamp on the first successful read; -∞ when it saw none. */
-  let baselineNewestMs: number | undefined;
-  let newDeployment: DeploymentRecord | null = null;
-
-  for (;;) {
-    const budgetLeft = Date.now() + DOCTOR_POLL_INTERVAL_MS <= deadline;
-    const history = fetchDeploymentHistory(repo, cwd, spawn);
-    if ('error' in history) {
-      // A transient `gh` failure (rate limit, network blip) must not abort a
-      // ten-minute watch — keep polling while budget remains. It surfaces as
-      // exit 10 only when the whole wait ends without one successful read.
-      readError = history.error;
-      if (!opts.wait || !budgetLeft) break;
-      stderr(`[wait] could not read deployment history (${history.error}) — retrying`);
-      await sleep(DOCTOR_POLL_INTERVAL_MS);
-      continue;
-    }
-    verdict = classifyLinkage(history.records, new Date());
-    if (!opts.wait) break;
-
-    const newestMs = history.records.reduce(
-      (max, r) => Math.max(max, new Date(r.createdAt).getTime()),
-      Number.NEGATIVE_INFINITY,
-    );
-    if (baselineNewestMs === undefined) {
-      // What already exists only anchors the comparison — `--wait` is about
-      // the record the user's connect + push is producing right now.
-      baselineNewestMs = newestMs;
-    } else if (newestMs > baselineNewestMs) {
-      newDeployment =
-        history.records.find(r => new Date(r.createdAt).getTime() === newestMs) ?? null;
-      break;
-    }
-    if (!budgetLeft) break;
-    stderr(
-      `[wait] no new deployment record yet — checking again in ${DOCTOR_POLL_INTERVAL_MS / 1000}s`,
-    );
-    await sleep(DOCTOR_POLL_INTERVAL_MS);
-  }
-
-  // A read failure on the LAST attempt does not erase an earlier verdict; the
-  // error only stands when no read ever succeeded.
-  const unread = verdict === undefined;
-  const summary: CiDoctorSummary = {
-    repo,
-    status: verdict?.status ?? 'none',
-    ok: verdict?.ok ?? false,
-    detail: verdict?.detail ?? readError ?? 'could not read deployment history',
-    lastDeployAt: verdict?.lastDeployAt ?? null,
-    creators: verdict?.creators ?? [],
-    hasPreview: verdict?.hasPreview ?? false,
-    waited: opts.wait,
-    newDeployment,
-    error: unread ? readError : null,
-  };
-  out.print(summary, d => renderCiDoctorText(d as CiDoctorSummary));
-
-  // A read failure is NOT a verdict — reporting "not linked" because `gh` is
-  // missing would send the user to fix the wrong thing.
-  if (unread) {
-    throw new CLIError(`ci doctor: could not read deployment history for ${repo}`, 10);
-  }
-  // A new record arriving is what `--wait` verifies: events reach this repo.
-  // The verdict above still tells the user what KIND of gate that supports.
-  if (newDeployment !== null) return;
-  if (!summary.ok) {
-    throw new CLIError(
-      `ci doctor: ${repo} is not ready for a deployment-gated workflow (${summary.status})`,
-      1,
-    );
-  }
-}
-
-export function renderCiDoctorText(s: CiDoctorSummary): string {
-  const lines: string[] = [];
-  const mark = s.error ? '[FAIL]' : s.ok ? '[OK]  ' : '[WARN]';
-  lines.push(`${mark} deployment events   ${s.repo}`);
-  if (s.newDeployment) {
-    const day = s.newDeployment.createdAt.slice(0, 10);
-    lines.push(
-      `       new deployment record: ${s.newDeployment.environment} (${day}) ✓ — events reach this repo`,
-    );
-  }
-  lines.push(`       ${s.detail}`);
-  if (s.error) {
-    lines.push('');
-    lines.push("Could not read the repo's deployment history, so this is not a verdict:");
-    lines.push(`  ${s.error}`);
-    return lines.join('\n');
-  }
-  if (s.waited && !s.newDeployment) {
-    lines.push(
-      '       (no NEW deployment record arrived while waiting — the verdict above is from the existing history)',
-    );
-  }
-  if (s.ok) return lines.join('\n');
-
-  lines.push('');
-  lines.push('Next steps:');
-  if (s.status === 'none') {
-    lines.push('  1. Link your deploy platform to this repo:');
-    lines.push('       testsprite ci connect          # runs `vercel git connect` for you');
-    lines.push("     …or link the repo in your platform's dashboard.");
-    // A branch, not the default branch: a default-branch push deploys as
-    // PRODUCTION, which proves the link but is not what a PR gate keys on.
-    lines.push('  2. Push a commit on a branch so a preview deployment lands:');
-    lines.push('       git checkout -b verify-testsprite-ci');
-    lines.push(
-      '       git commit --allow-empty -m "verify testsprite ci" && git push -u origin HEAD',
-    );
-    lines.push('  3. Confirm the events arrive (any new deployment record counts):');
-    lines.push('       testsprite ci doctor --wait');
-  } else if (s.status === 'production-only') {
-    lines.push('  → Enable preview deployments for pull requests on your deploy platform.');
-    lines.push('    A PR gate keys on preview deployments; production-only events fire on');
-    lines.push('    releases instead, so the check would never run on a PR.');
-  } else {
-    lines.push('  → Push a commit and re-run `testsprite ci doctor --wait` to confirm the link');
-    lines.push('    is still live before scaffolding a gate on it.');
-  }
-  lines.push('');
-  lines.push('Self-hosted pipeline? Report each deploy yourself, and every path works the same:');
-  // `required_contexts: []` is load-bearing: without it GitHub answers 409 when
-  // any commit status on the SHA is failing — i.e. exactly when a PR pipeline is
-  // deploying its preview. JSON input because `-f` would send the empty array as
-  // a string. (Both learned the hard way running this against a real repo.)
-  lines.push(
-    `  ID=$(printf '{"ref":"%s","environment":"preview","auto_merge":false,"required_contexts":[]}' "$SHA" \\`,
-  );
-  lines.push(`    | gh api repos/${s.repo}/deployments --input - --jq .id)`);
-  lines.push(
-    `  gh api repos/${s.repo}/deployments/$ID/statuses -f state=success -f environment_url=$URL`,
-  );
-  return lines.join('\n');
-}
-
-export interface CiConnectOptions extends CommonOptions {
-  /** Vercel project to link when this directory is not linked yet. */
-  project?: string;
-}
-
-export interface CiConnectSummary {
-  platform: 'vercel';
-  /** The commands that were actually spawned, in order — no secrets in them. */
-  ran: string[];
-  connected: boolean;
-  alreadyConnected: boolean;
-  reason: string | null;
-}
-
-/**
- * The Vercel CLI, pinned to the major this command's flag semantics were
- * verified against (59.23.2). Unpinned, a breaking Vercel release could change
- * what `--non-interactive` refuses or creates under a tool people run in CI.
- * (Unrelated to the TestSprite CLI's own `latest` policy — this pins a THIRD
- * PARTY whose behavior we shell out to.) Bump deliberately, re-testing the
- * ladder below.
- */
-const VERCEL_CLI_SPEC = 'vercel@59';
-
-/** What Vercel accepts as a project name — and all that may reach the Windows
- * shell path below, so keep it strict. */
-const VERCEL_PROJECT_NAME_RE = /^[a-z0-9._-]{1,100}$/;
-
-/**
- * `--non-interactive` refusals come back as one JSON object with a `reason`
- * and often a `next[]` of literal commands — relay those, since Vercel's own
- * instructions beat anything we could paraphrase. Anything else falls back to
- * the first non-empty output line.
- */
-function vercelFailureDetail(result: SpawnSyncReturns<string>): string {
-  for (const chunk of [result.stdout ?? '', result.stderr ?? '']) {
-    const trimmed = chunk.trim();
-    if (!trimmed.startsWith('{')) continue;
-    try {
-      const parsed = JSON.parse(trimmed) as { reason?: unknown; next?: unknown };
-      if (typeof parsed.reason === 'string') {
-        const next = Array.isArray(parsed.next)
-          ? parsed.next.filter((n): n is string => typeof n === 'string')
-          : [];
-        return next.length > 0 ? `${parsed.reason} — next: ${next.join(' && ')}` : parsed.reason;
-      }
-    } catch {
-      /* prose after all — fall through */
-    }
-  }
-  return (
-    `${result.stdout ?? ''}\n${result.stderr ?? ''}`
-      .split('\n')
-      .find(l => l.trim() !== '')
-      ?.trim() ?? ''
-  );
-}
-
-/**
- * Link the deploy platform to the repo — the fix for `ci doctor`'s `none`.
- *
- * Runs the platform's OWN CLI as a subprocess (`npx vercel …`, so nothing needs
- * pre-installing) rather than calling Vercel's API ourselves. That is a
- * deliberate boundary: any other approach would require the user to hand us a
- * Vercel token, and a third-party credential should never pass through this
- * CLI. Vercel's CLI keeps its own credentials; we only read exit codes.
- *
- * Every step runs `--non-interactive`, and `--yes` is NEVER passed to the
- * Vercel CLI on any path. `--yes` does not mean "skip confirmations": on an
- * unlinked directory `vercel link --yes` answers the new-project questions
- * with the default scope and the current directory name — creating a project
- * nobody asked for, which `git connect` then wires the repo to and starts
- * deploying. `ci doctor` would report that as `linked`: the exact silent
- * false-green this command exists to prevent. When Vercel needs a decision it
- * refuses with a structured reason instead, and that is relayed.
- *
- * `vercel git connect` is effectively idempotent — an already-connected repo
- * says so, which also resolves the one ambiguity `ci doctor` cannot see from
- * GitHub: "never linked" vs "linked but never deployed".
- */
-export async function runCiConnect(opts: CiConnectOptions, deps: CiDeps = {}): Promise<void> {
-  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const out = new Output(opts.output, { stdout, stderr });
-  const cwd = deps.cwd ?? process.cwd();
-  const spawn = deps.spawn ?? defaultSpawn;
-  const fs = deps.fs ?? defaultCiFs;
-  const platform = deps.platform ?? process.platform;
-  const ran: string[] = [];
-
-  // Input gate before any subprocess or fs read: a bad name must fail as a
-  // validation error, not as a spawned command's stderr.
-  if (opts.project !== undefined && !VERCEL_PROJECT_NAME_RE.test(opts.project)) {
-    throw localValidationError(
-      'project',
-      'must be a Vercel project name (lowercase letters, digits, ".", "_", "-"; max 100 chars)',
-    );
-  }
-
-  const finish = (over: Partial<CiConnectSummary>, failure?: string): void => {
-    const summary: CiConnectSummary = {
-      platform: 'vercel',
-      ran,
-      connected: false,
-      alreadyConnected: false,
-      reason: null,
-      ...over,
-    };
-    out.print(summary, d => renderCiConnectText(d as CiConnectSummary));
-    if (failure !== undefined) throw new CLIError(failure, 1);
-  };
-
-  const run = (args: string[]): SpawnSyncReturns<string> | { failure: string } => {
-    ran.push(`npx ${VERCEL_CLI_SPEC} ${args.join(' ')}`);
-    try {
-      // npx's own `--yes` only suppresses its install prompt; nothing after the
-      // package spec is a `--yes` (see the function comment). On Windows `npx`
-      // is a `.cmd` shim, which `spawnSync` cannot launch with `shell: false`
-      // (EINVAL since Node 20.12's CVE-2024-27980 hardening, ENOENT before) —
-      // go through the shell there. Safe because every argument is a literal or
-      // validated against VERCEL_PROJECT_NAME_RE, never free text.
-      return platform === 'win32'
-        ? spawn('npx.cmd', ['--yes', VERCEL_CLI_SPEC, ...args], { cwd, shell: true })
-        : spawn('npx', ['--yes', VERCEL_CLI_SPEC, ...args], { cwd });
-    } catch (err) {
-      return { failure: `failed to run npx: ${(err as Error).message}` };
-    }
-  };
-
-  // `.vercel/project.json` is how the Vercel CLI itself records which project
-  // this directory is linked to. Present → the project is already decided and
-  // `git connect` is safe to run directly.
-  let dirLinked = false;
-  try {
-    await fs.readFile(path.join(cwd, '.vercel', 'project.json'));
-    dirLinked = true;
-  } catch {
-    /* not linked */
-  }
-
-  if (!dirLinked) {
-    if (opts.project === undefined || opts.project === '') {
-      // Refuse rather than guess: picking (or worse, creating) a project is
-      // the one decision this command must never make for the user.
-      finish(
-        { reason: 'this directory is not linked to a Vercel project' },
-        'ci connect: this directory is not linked to a Vercel project — pass --project <name>, or run `npx vercel link` to pick one interactively, then re-run',
-      );
-      return;
-    }
-    // `link --project <name>` targets an EXISTING project by name, so it needs
-    // no `--yes` and cannot create one as a side effect.
-    const link = run(['link', '--project', opts.project, '--non-interactive']);
-    if ('failure' in link) {
-      finish({ reason: link.failure }, `ci connect: ${link.failure}`);
-      return;
-    }
-    if (link.status !== 0) {
-      const detail = vercelFailureDetail(link);
-      finish(
-        { reason: `vercel link failed${detail ? `: ${detail}` : ''}` },
-        `ci connect: could not link this directory to Vercel project "${opts.project}"${detail ? ` — ${detail}` : ''}`,
-      );
-      return;
-    }
-  }
-
-  const connect = run(['git', 'connect', '--non-interactive']);
-  if ('failure' in connect) {
-    finish({ reason: connect.failure }, `ci connect: ${connect.failure}`);
-    return;
-  }
-  // "already connected" is prose on exit 1 with no JSON — Vercel offers no
-  // structured way to see it (`project inspect` does not expose git-link
-  // state), so a regex on the CLI's wording is load-bearing here. If Vercel
-  // rephrases it, this degrades to the generic relay below (a hard failure
-  // with Vercel's own message), never to a wrong success.
-  const output = `${connect.stdout ?? ''}\n${connect.stderr ?? ''}`;
-  const alreadyConnected = /already connected/i.test(output);
-  if (connect.status !== 0 && !alreadyConnected) {
-    const detail = vercelFailureDetail(connect);
-    // The common dead ends — not logged in (browser OAuth), the Vercel GitHub
-    // App not installed, missing org permission — all need a human. Relay the
-    // CLI's own message verbatim rather than paraphrasing the fix away.
-    finish(
-      { reason: detail || `vercel git connect exited ${connect.status}` },
-      `ci connect: ${detail || 'could not connect the repo'}`,
-    );
-    return;
-  }
-
-  finish({ connected: true, alreadyConnected });
-  stderr(
-    alreadyConnected
-      ? '[info] the repo was already connected — if `ci doctor` still reports no events, it simply has not deployed yet.'
-      : '[info] connected. Linking only affects FUTURE pushes.',
-  );
-  stderr('Next: push a commit on a branch so a preview deployment lands:');
-  stderr('  git checkout -b verify-testsprite-ci');
-  stderr('  git commit --allow-empty -m "verify testsprite ci" && git push -u origin HEAD');
-  stderr('Then: testsprite ci doctor --wait');
-}
-
-export function renderCiConnectText(s: CiConnectSummary): string {
-  if (s.connected) {
-    return s.alreadyConnected
-      ? 'Vercel is already connected to this repo.'
-      : 'Connected Vercel to this repo.';
-  }
-  const lines = [`Could not connect automatically: ${s.reason ?? 'unknown reason'}.`, ''];
-  lines.push('Do it manually:');
-  lines.push('  npx vercel login        # if you are not signed in');
-  lines.push('  npx vercel link         # pick the Vercel project for this directory');
-  lines.push('  npx vercel git connect  # link it to the git remote');
-  lines.push('');
-  lines.push('…then re-run `testsprite ci connect`, or finish from the Vercel dashboard');
-  lines.push('(Project → Settings → Git).');
-  return lines.join('\n');
-}
-
 // ── text rendering ───────────────────────────────────────────────────────────
 
 export function renderCiInitText(s: CiInitSummary): string {
@@ -1348,10 +871,31 @@ export type CiRunOptions = Omit<
   executionReportTimeoutSeconds?: number;
   /** `--no-execution-report`: job summary stays the local table; nothing is read or written for the report. */
   executionReport?: boolean;
+  /**
+   * `--target-url-template`: the preview address as a pattern (`{pr}`,
+   * `{branch-slug}`, `{sha}`, …), filled on the runner from the pull request's
+   * facts; mutually exclusive with `--target-url`.
+   */
+  targetUrlTemplate?: string;
+  /** `--wait-for-status`: the commit status context / check-run name that says the preview exists. */
+  waitForStatus?: string;
+  /** `--status-timeout`: how long `--wait-for-status` waits (seconds; default 900). */
+  statusTimeoutSeconds?: number;
 };
 
+/** How long `--wait-for-status` waits by default — a preview build is minutes, so its own budget, not `--timeout`'s. */
+export const DEFAULT_STATUS_TIMEOUT_SECONDS = 900;
+
+export function parseStatusTimeoutSeconds(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 3600) {
+    throw localValidationError('status-timeout', 'must be an integer between 1 and 3600 seconds');
+  }
+  return n;
+}
+
 /**
- * `ci run` = `test run --all --wait` with CI's defaults, plus what only a CI
+ * `ci run` = `run --project --wait` with CI's defaults, plus what only a CI
  * job can add:
  *
  *  - `admission: 'all'` — one request, one execution, server-side pacing (as
@@ -1363,14 +907,39 @@ export type CiRunOptions = Omit<
  *    deployment's commit), `--env X --target-url U` runs in a temporary clone
  *    of X at U named `github-pr-<N>`, and the run is stamped with the PR so
  *    the Portal links back to it — the GitHub App's own mechanism.
- *  - Outside a pull request the run keeps `test run`'s semantics: X's sign-in
+ *  - Outside a pull request the run keeps `run`'s semantics: X's sign-in
  *    against U, recorded under X.
  */
 export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise<void> {
   const env = deps.env ?? process.env;
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
   if (opts.targetUrl !== undefined && opts.targetUrl.trim() === '') {
     throw localValidationError('target-url', 'must be a non-empty URL');
+  }
+  // The template and the wait are checked for shape before any request: a
+  // bad pattern or a dangling --status-timeout is a configuration error, and
+  // must not first show up after minutes of waiting.
+  if (opts.targetUrlTemplate !== undefined) {
+    if (opts.targetUrl !== undefined) {
+      throw localValidationError(
+        'target-url-template',
+        'cannot be combined with --target-url; pass the address or the pattern, not both',
+      );
+    }
+    if (opts.targetUrlTemplate.trim() === '') {
+      throw localValidationError('target-url-template', 'must be a non-empty URL pattern');
+    }
+    const problem = validateUrlTemplate(opts.targetUrlTemplate.trim());
+    if (problem !== null) throw localValidationError('target-url-template', problem);
+  }
+  if (opts.waitForStatus !== undefined && opts.waitForStatus.trim() === '') {
+    throw localValidationError(
+      'wait-for-status',
+      'must name the commit status context or check run to wait for (as shown on the pull request)',
+    );
+  }
+  if (opts.statusTimeoutSeconds !== undefined && opts.waitForStatus === undefined) {
+    throw localValidationError('status-timeout', 'only applies with --wait-for-status');
   }
   // An unknown environment name is a configuration error, not an empty
   // selection: refused here, before anything dispatches or charges, so it
@@ -1405,7 +974,10 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
     }
     githubTrigger = github.trigger;
     // The clone needs a template to clone and an address to point at.
-    if (opts.targetUrl !== undefined && opts.environment !== undefined) {
+    if (
+      (opts.targetUrl !== undefined || opts.targetUrlTemplate !== undefined) &&
+      opts.environment !== undefined
+    ) {
       previewName = previewEnvironmentName(github.trigger.prNumber);
     }
   } else if (github.kind === 'no_pull_request' && github.event === 'deployment_status') {
@@ -1415,9 +987,68 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
     return;
   }
 
+  const facts = commitFacts(github, env);
+  // Shape C: the platform wrote no deployment event, only a status or check on
+  // the head commit. Wait for it before anything is rendered or dispatched.
+  if (opts.waitForStatus !== undefined && !opts.dryRun) {
+    const ready = await awaitPreviewSignal(opts, facts, { env, stderr }, deps);
+    if (!ready) return;
+  }
+  const { targetUrlTemplate, waitForStatus, statusTimeoutSeconds, ...batchOpts } = opts;
+  void waitForStatus;
+  void statusTimeoutSeconds;
+  let targetUrl = opts.targetUrl;
+  if (targetUrlTemplate !== undefined) {
+    const template = targetUrlTemplate.trim();
+    const rendered = renderUrlTemplate(template, facts);
+    if (rendered === null) {
+      // Never a guess: a pattern this run cannot fill is refused, and the
+      // reason names the placeholders so the fix is the pattern or the trigger.
+      recordTelemetryExtras({ ciRunOutcome: 'refused_url_template' });
+      const unsafe = unsafeHostPlaceholders(template, facts);
+      if (unsafe.length > 0) {
+        // The value would change the host (`{branch}` = "attacker.example/x" in
+        // `https://{branch}.preview…`): never dispatched, the environment's
+        // sign-in stays where it belongs.
+        throw ApiError.fromEnvelope({
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'Invalid request.',
+            nextAction: `Flag \`--target-url-template\` refused: ${unsafe.join(', ')} would change the host of the rendered URL (only letters, digits and - are allowed there). Use {branch-slug} in the host part, or pass --target-url.`,
+            requestId: 'local',
+            details: {
+              field: 'target-url-template',
+              reason: 'url_unsafe_host',
+              unsafe: unsafe.join(', '),
+            },
+          },
+        });
+      }
+      const missing = missingPlaceholders(template, facts).join(', ');
+      const where =
+        github.kind === 'outside_actions'
+          ? 'outside GitHub Actions'
+          : github.kind === 'no_pull_request'
+            ? `on a ${github.event || 'non-PR'} event`
+            : 'for this pull request';
+      throw ApiError.fromEnvelope({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid request.',
+          nextAction: `Flag \`--target-url-template\` could not be filled ${where}: ${missing} ${missing.includes(',') ? 'have' : 'has'} no value. Use a placeholder the trigger provides, or pass --target-url.`,
+          requestId: 'local',
+          details: { field: 'target-url-template', reason: 'url_unresolved', missing },
+        },
+      });
+    }
+    targetUrl = rendered;
+    stderr(`[ci run] --target-url-template rendered to ${rendered}`);
+  }
+
   await runTestRunAll(
     {
-      ...opts,
+      ...batchOpts,
+      ...(targetUrl !== undefined ? { targetUrl } : {}),
       timeoutSeconds: parseTimeoutSeconds(opts.timeoutSeconds),
       wait: true,
       ci: {
@@ -1443,22 +1074,147 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
 function skipCiRun(
   notice: string,
   io: { env: NodeJS.ProcessEnv; stderr: (line: string) => void },
+  opts: {
+    /**
+     * A job-summary line for a skip the reader must not mistake for a green
+     * run — `--wait-for-status` learning there is no preview is one: nothing
+     * ran, and the summary says so instead of staying empty.
+     */
+    jobSummary?: string;
+  } = {},
 ): void {
-  io.stderr(`::notice title=TestSprite::${notice}`);
-  const nothing: CiSummary = { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] };
+  // The notice can carry a third-party check's text: encoded as workflow-command
+  // data, so a line break in it cannot start a second command.
+  io.stderr(`::notice title=TestSprite::${escapeCommandData(notice)}`);
+  const nothing: CiSummary = {
+    total: 0,
+    passed: 0,
+    failed: 0,
+    skipped: 0,
+    timedOut: 0,
+    results: [],
+  };
   emitCiStepOutputs(nothing, io);
+  const summaryPath = io.env.GITHUB_STEP_SUMMARY;
+  if (opts.jobSummary !== undefined && typeof summaryPath === 'string' && summaryPath.length > 0) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- GITHUB_STEP_SUMMARY is the runner-provided job-summary path; only the CLI's own Markdown line is appended.
+      appendFileSync(summaryPath, `${opts.jobSummary}\n`, 'utf8');
+    } catch {
+      io.stderr('[ci run] could not append to GITHUB_STEP_SUMMARY; continuing');
+    }
+  }
+}
+
+/**
+ * The facts a `--target-url-template` is filled from. In a pull request they
+ * are the PR's; outside one (a push, a schedule) what the runner exposes —
+ * `{pr}` then has no value and a pattern using it is refused.
+ */
+function commitFacts(github: GithubRunContext, env: NodeJS.ProcessEnv): UrlTemplateVars {
+  if (github.kind === 'pull_request') {
+    return {
+      pr: github.trigger.prNumber,
+      branch: github.trigger.branchName ?? null,
+      sha: github.trigger.commitSha ?? null,
+    };
+  }
+  return {
+    pr: null,
+    branch: env.GITHUB_HEAD_REF || env.GITHUB_REF_NAME || null,
+    sha: env.GITHUB_SHA || null,
+  };
+}
+
+/**
+ * `--wait-for-status`: block until the named status / check run on the head
+ * commit is terminal. `true` = the preview exists, carry on. `false` = there
+ * is no preview (the deploy failed, or the build was skipped) — reported as a
+ * skip, exit 0, nothing dispatched. Nothing terminal in time is exit 7,
+ * listing every name seen on the commit so a misspelled name is obvious.
+ */
+async function awaitPreviewSignal(
+  opts: CiRunOptions,
+  facts: UrlTemplateVars,
+  io: { env: NodeJS.ProcessEnv; stderr: (line: string) => void },
+  deps: TestDeps,
+): Promise<boolean> {
+  const name = opts.waitForStatus!.trim();
+  const token = io.env.GITHUB_TOKEN;
+  if (!token) {
+    throw localValidationError(
+      'GITHUB_TOKEN',
+      '--wait-for-status reads the checks on the commit with the job token — add `GITHUB_TOKEN: ${{ github.token }}` to the step env',
+      undefined,
+      'field',
+    );
+  }
+  const [repoOwner, repoName, ...rest] = (io.env.GITHUB_REPOSITORY ?? '').split('/');
+  if (!repoOwner || !repoName || rest.length > 0 || !facts.sha) {
+    throw localValidationError(
+      'wait-for-status',
+      'needs a GitHub Actions job with a commit to watch (GITHUB_REPOSITORY and the pull request head sha, or GITHUB_SHA)',
+    );
+  }
+  const timeoutMs = (opts.statusTimeoutSeconds ?? DEFAULT_STATUS_TIMEOUT_SECONDS) * 1000;
+  io.stderr(
+    `[ci run] waiting up to ${timeoutMs / 1000}s for "${name}" on ${facts.sha.slice(0, 7)} to finish`,
+  );
+  const verdict = await waitForCommitSignal(
+    { repoOwner, repoName, sha: facts.sha, name },
+    { token, timeoutMs },
+    {
+      env: io.env,
+      fetchImpl: deps.fetchImpl ?? globalThis.fetch,
+      sleep: deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
+      shutdown: deps.shutdown ?? globalShutdown,
+      stderr: io.stderr,
+    },
+  );
+  if (verdict.kind === 'ready') {
+    io.stderr(
+      `[ci run] "${name}" succeeded (${verdict.signal.via === 'status' ? 'commit status' : 'check run'}); the preview is up`,
+    );
+    return true;
+  }
+  if (verdict.kind === 'skip') {
+    recordTelemetryExtras({ ciRunOutcome: 'skipped_no_preview' });
+    skipCiRun(`No preview for this commit — tests not run: ${verdict.reason}.`, io, {
+      jobSummary: `> **TestSprite:** no preview for this commit — tests not run: ${verdict.reason}.`,
+    });
+    return false;
+  }
+  recordTelemetryExtras({ ciRunOutcome: 'timeout_preview' });
+  const nothing: CiSummary = {
+    total: 0,
+    passed: 0,
+    failed: 0,
+    skipped: 0,
+    timedOut: 0,
+    results: [],
+  };
+  emitCiStepOutputs(nothing, io);
+  const seen = verdict.seen.length > 0 ? verdict.seen.map(s => `"${s}"`).join(', ') : 'none';
+  throw ApiError.fromEnvelope({
+    error: {
+      code: 'UNSUPPORTED',
+      message: `Waited ${Math.round(verdict.waitedMs / 1000)}s and no status or check named "${name}" reached a terminal state on ${facts.sha.slice(0, 7)}.`,
+      nextAction: `Check the name against what the pull request shows (seen on this commit: ${seen}), or raise --status-timeout.`,
+      requestId: 'local',
+      details: { field: 'wait-for-status', reason: 'preview-status-timeout', seen: verdict.seen },
+    },
+  });
 }
 
 /**
  * Strict `--env`: the name must be one of the project's environments, read
- * off the same list `test run` reads before a batch. Fails closed: a list that
+ * off the same list `run` reads before a batch. Fails closed: a list that
  * cannot be read is an error with that error's own exit code (bad key → 3,
  * backend down → 10, interrupted → the signal's code) — never a run that goes
  * on to dispatch and charge against an environment nobody checked. The one
- * read that is NOT an error is a backend answering that this project has no
- * environment surface at all (a V2 project's `UNSUPPORTED`, or an older
- * backend's 404 for the route): there is no list to check against, and the
- * batch's own `environment` validation is the only authority left. Nothing to
+ * read that is NOT an error is an older backend's 404 for the route: there is
+ * no list to check against, and the batch's own `environment` validation is
+ * the only authority left. Nothing to
  * check without a name, and a dry run makes no request.
  */
 async function assertCiEnvironmentExists(opts: CiRunOptions, deps: TestDeps): Promise<void> {
@@ -1476,7 +1232,7 @@ async function assertCiEnvironmentExists(opts: CiRunOptions, deps: TestDeps): Pr
       `/projects/${encodeURIComponent(projectId)}/env`,
     );
   } catch (err) {
-    if (err instanceof ApiError && (err.code === 'UNSUPPORTED' || err.httpStatus === 404)) {
+    if (err instanceof ApiError && err.httpStatus === 404) {
       return;
     }
     throw err;
@@ -1512,6 +1268,18 @@ export function createCiCommand(deps: CiDeps = {}): Command {
       '--target-url <url>',
       "frontend tests: the address to test, typically this pull request's preview deployment",
     )
+    .option(
+      '--target-url-template <pattern>',
+      'the preview address as a pattern filled from the pull request: {pr}, {branch}, {branch-slug}, {sha}, {short-sha} (e.g. https://app-git-{branch-slug}-team.vercel.app); instead of --target-url',
+    )
+    .option(
+      '--wait-for-status <name>',
+      'wait for this commit status context or check run on the head commit to succeed before running (the name as the pull request shows it, e.g. "Vercel"); a failed or skipped build exits 0 with a notice',
+    )
+    .option(
+      '--status-timeout <s>',
+      `max seconds --wait-for-status waits (1-3600; default ${DEFAULT_STATUS_TIMEOUT_SECONDS})`,
+    )
     .option('--skip-preflight', 'skip the pre-charge reachability probe for --target-url', false)
     .option('--timeout <s>', 'max seconds to wait for results (1-3600)', '600')
     .option(
@@ -1536,7 +1304,7 @@ export function createCiCommand(deps: CiDeps = {}): Command {
       'after',
       '\nAlways waits for results. Failed tests and timeouts fail the gate.\n' +
         'Skipped tests warn unless --fail-on-skipped; missing test ids and unknown\n' +
-        'environments always fail. Every selected test is seeded into ONE execution\n' +
+        'environments always fail. Every selected test is seeded into ONE run\n' +
         'and the server paces dispatch, as for a GitHub App run.\n' +
         'In GitHub Actions the pull request is read from the event (a deployment_status\n' +
         'event is looked up by commit with GITHUB_TOKEN); draft PRs and deployments\n' +
@@ -1545,12 +1313,18 @@ export function createCiCommand(deps: CiDeps = {}): Command {
         "the deployment's state or environment: filter deployment_status events with\n" +
         "the job's `if:` (state == 'success', not production), or a failed or\n" +
         'production deployment is gated too.\n' +
-        'Writes total, passed, failed, skipped, timedOut to GITHUB_OUTPUT when present.\n' +
+        'Writes total, passed, failed (includes blocked), blocked, failedOnly, skipped and timedOut to GITHUB_OUTPUT.\n' +
         'On a supporting backend the job summary is the execution report — the same content\n' +
         'the GitHub App posts as its PR comment — and execution-report-file /\n' +
         'execution-report-markdown-file name its JSON and Markdown for later steps.\n' +
         'Reports and outputs are emitted before the exit code is decided.\n' +
-        'Backend tests use the URL in their own code, not --target-url. PR comments are not yet supported.\n',
+        'When the platform posts only a commit status or check (no deployment event),\n' +
+        '--wait-for-status <name> holds the run until it succeeds and --target-url-template\n' +
+        'derives the preview address from the pull request; a pattern that cannot be filled\n' +
+        'is refused, never guessed. In a pull request the run happens in a github-pr-<N> clone\n' +
+        'of --env at --target-url, so backend tests whose code uses VAR_{url} follow the preview\n' +
+        "too; outside one, with --env, they use that environment's own URL. PR comments are not\n" +
+        'yet supported.\n',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts, command: Command) => {
@@ -1561,6 +1335,12 @@ export function createCiCommand(deps: CiDeps = {}): Command {
           nameFilter: parseNameFilter(cmdOpts.filter),
           environment: cmdOpts.env,
           targetUrl: cmdOpts.targetUrl,
+          targetUrlTemplate: cmdOpts.targetUrlTemplate,
+          waitForStatus: cmdOpts.waitForStatus,
+          statusTimeoutSeconds:
+            cmdOpts.statusTimeout === undefined
+              ? undefined
+              : parseStatusTimeoutSeconds(cmdOpts.statusTimeout),
           skipPreflight: cmdOpts.skipPreflight === true,
           timeoutSeconds: parseTimeoutSeconds(cmdOpts.timeout),
           executionReportTimeoutSeconds: parseExecutionReportTimeoutSeconds(
@@ -1636,95 +1416,5 @@ export function createCiCommand(deps: CiDeps = {}): Command {
       await runCiInit(opts, deps);
     });
 
-  // `ci doctor` and `ci connect` are hidden and deprecated (step 1 of 2).
-  // Platform checks and linking belong to the agent skill (`testsprite-ci`),
-  // which reads the same deployment history and runs the platform's own CLI.
-  // Behaviour and exit codes are unchanged until the commands are removed.
-  ci.command('doctor', { hidden: true })
-    .description(
-      'Check that deployment events reach this repo — the precondition for a deployment-gated workflow.\n' +
-        'Needs the GitHub CLI (`gh`), installed and authenticated.',
-    )
-    .option('--repo <owner/name>', 'repo to check (inferred from the `origin` remote if omitted)')
-    .option(
-      '--wait',
-      'keep checking until a NEW deployment record arrives (use right after connecting + pushing)',
-      false,
-    )
-    .option('--timeout <s>', 'with --wait, how long to keep checking (1-3600, default 600)')
-    .addHelpText(
-      'after',
-      '\nA deployment-triggered workflow only fires if the repo receives GitHub Deployment events;\n' +
-        'if the deploy platform is not linked, the gate stays silent with no error.\n' +
-        '--wait succeeds when any new deployment record arrives, whatever its environment.\n' +
-        '\nExit codes:\n' +
-        '  0  events reach this repo (a gate will fire), or --wait saw a new record. With --wait and\n' +
-        '     no new record before --timeout it is still 0 if earlier events exist: check the output\n' +
-        '     (JSON: newDeployment)\n' +
-        '  1  no usable events yet — see the printed next steps\n' +
-        '  5  validation error (bad --repo, or no GitHub remote here)\n' +
-        ' 10  could not read the history (gh missing / unauthenticated) — not a verdict',
-    )
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (cmdOpts, command: Command) => {
-      emitCiDeprecationNotice('doctor', deps);
-      const common = resolveCommonOptions(command, deps.env);
-      await runCiDoctor(
-        {
-          ...common,
-          repo: cmdOpts.repo,
-          wait: cmdOpts.wait === true,
-          // undefined = flag not given; runCiDoctor refuses it without --wait.
-          waitTimeoutSeconds:
-            cmdOpts.timeout === undefined ? undefined : parseTimeoutSeconds(cmdOpts.timeout),
-        },
-        deps,
-      );
-    });
-
-  ci.command('connect', { hidden: true })
-    .description('Link your deploy platform (Vercel) to this repo so deployment events are emitted')
-    .option(
-      '--project <name>',
-      'Vercel project to link when this directory is not linked yet (must already exist)',
-    )
-    .addHelpText(
-      'after',
-      `\nRuns \`npx ${VERCEL_CLI_SPEC}\` (downloads the Vercel CLI) non-interactively to link this directory\n` +
-        'and connect the repo (`vercel link` / `vercel git connect`); if a decision is needed (which\n' +
-        'project to link) it refuses rather than create anything you did not pick. Your Vercel\n' +
-        'credentials stay with the Vercel CLI; this command never asks for or stores a platform token.\n' +
-        '`vercel link` itself writes `.vercel/`, may add VERCEL_OIDC_TOKEN to `.env.local` and may\n' +
-        'update `.gitignore`. --dry-run is not honored: the link is made.\n' +
-        '\nExit codes: 0 connected, 1 could not connect\n' +
-        '\nLinking only affects FUTURE pushes: push a commit, then confirm with `testsprite ci doctor --wait`.',
-    )
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (cmdOpts, command: Command) => {
-      emitCiDeprecationNotice('connect', deps);
-      const common = resolveCommonOptions(command, deps.env);
-      await runCiConnect({ ...common, project: cmdOpts.project }, deps);
-    });
-
   return ci;
-}
-
-/**
- * One stderr line per run of a deprecated `ci` subcommand, naming the
- * equivalent commands (stdout stays clean for JSON pipelines). The
- * replacements are not `testsprite` commands, so this does not reuse
- * `emitDeprecationNotice`.
- */
-export const CI_DEPRECATION_NOTICES = {
-  doctor:
-    '[deprecated] `testsprite ci doctor` will be removed in a later release. Read the deployment history yourself: ' +
-    '`gh api repos/<owner>/<repo>/deployments` — judge preview and production records separately; a real pull request is the proof.',
-  connect:
-    "[deprecated] `testsprite ci connect` will be removed in a later release. Run the platform's own CLI: " +
-    '`npx vercel link --project <name> --non-interactive`, then `npx vercel git connect --non-interactive` (or link the repo in the Vercel dashboard).',
-} as const;
-
-function emitCiDeprecationNotice(cmd: keyof typeof CI_DEPRECATION_NOTICES, deps: CiDeps): void {
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  stderr(CI_DEPRECATION_NOTICES[cmd]);
 }

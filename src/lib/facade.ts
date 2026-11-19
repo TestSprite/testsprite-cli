@@ -13,26 +13,9 @@ export function facadeBaseUrl(endpointUrl: string): string {
 }
 
 /**
- * Resolve the Portal dashboard deep-link for a test, given the API endpoint URL
- * already known to the CLI (from the user's credential profile).
- *
- * Coverage rule: only emit a dashboardUrl where BOTH projectId AND testId are
- * already known client-side from the create/run response — no extra network calls.
- * Currently covered commands:
- *   - `test create` / `test create-batch` (projectId from opts/spec — or, on the
- *     `--plan-from` path, from the validated plan body; testId from response).
- *   - `test run --wait`, `test wait`, `test rerun --wait` terminal output —
- *     `GET /runs/{runId}` carries both projectId and testId on the wire.
- *   - `test run --all` accepted items (projectId from opts, testId per item).
- * NOT covered (wire gap, no lookup round-trip allowed): no-wait `test run` /
- * `test rerun` trigger output (TriggerRunResponse lacks projectId) and
- * `test result` (CliLatestResult lacks projectId).
- *
- * Normalization uses `new URL()` semantics (R2):
- *   - Protocol and hostname are lowercased.
- *   - An explicit `:443` on https is treated as the default port (omitted).
- *   - Trailing slashes and FACADE_PATH suffix are stripped before parsing.
- *   - URL parse failures → undefined (no crash).
+ * Map the configured API endpoint to the matching Portal origin (no path).
+ * Returns undefined for unknown hosts so callers emit nothing rather than a
+ * wrong-environment link.
  *
  * Mapping (match on normalized protocol, hostname, and port):
  *   TESTSPRITE_PORTAL_URL env var set → that origin verbatim (highest
@@ -41,27 +24,10 @@ export function facadeBaseUrl(endpointUrl: string): string {
  *   https://api.testsprite.com        (port absent or 443) → https://www.testsprite.com
  *   anything else (unknown host, non-https on prod, parse failure) → undefined
  *
- * Deep-link path: {portalBase}/dashboard/tests/{projectId}/test/{testId}
- */
-export function resolvePortalUrl(
-  apiUrl: string,
-  projectId: string,
-  testId: string,
-): string | undefined {
-  const portalBase = resolvePortalBase(apiUrl);
-  if (portalBase === undefined) return undefined;
-
-  // R4: encode path segments so future opaque ids (e.g. containing '#' or '?')
-  // produce a valid URL without breaking the path structure.
-  return `${portalBase}/dashboard/tests/${encodeURIComponent(projectId)}/test/${encodeURIComponent(testId)}`;
-}
-
-/**
- * Map the configured API endpoint to the matching Portal origin (no path).
- * Honors the TESTSPRITE_PORTAL_URL override first; otherwise same
- * normalization and host mapping as `resolvePortalUrl` (which delegates
- * here); returns undefined for unknown hosts so callers emit nothing rather
- * than a wrong-environment link.
+ * Normalization uses `new URL()` semantics: protocol and hostname are
+ * lowercased, an explicit `:443` on https is the default port, trailing
+ * slashes and the FACADE_PATH suffix are stripped before parsing, and a parse
+ * failure → undefined (no crash).
  */
 export function resolvePortalBase(apiUrl: string): string | undefined {
   // Operator override: lets any non-prod environment point dashboard links at

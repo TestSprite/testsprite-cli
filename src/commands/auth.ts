@@ -22,14 +22,13 @@ import {
   writeProfile,
 } from '../lib/credentials.js';
 import { loadConfig, normalizeEnvVar, resolveProfileName } from '../lib/config.js';
-import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
 import { ME_RESPONSE_SCHEMA } from '../lib/response-schemas.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
 import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
-import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
+import { terminalSafeLine, terminalSafeWriter } from '../lib/terminal-text.js';
 
 export interface MeResponse {
   userId: string;
@@ -46,21 +45,17 @@ export interface MeResponse {
   /** Human-readable display name for the bound account. Absent-safe (dogfood L1866). */
   displayName?: string;
   /**
-   * Authoritative per-user V3 routing bit. Absent-safe: older backends omit it,
-   * so it is only rendered when present.
-   */
-  v3Enabled?: boolean;
-  /**
-   * Legacy per-user billing projections. Absent-safe; superseded by
-   * `activeOrg` when both are present. Declared so shared fixtures typed as
-   * `MeResponse` can carry them (the `usage` command has its own richer view).
+   * The org wallet flattened (`credits` = `activeOrg.remaining`, `subPlan` =
+   * `activeOrg.plan`); present iff `activeOrg` is. Declared so shared fixtures
+   * typed as `MeResponse` can carry them (the `usage` command renders the
+   * wallet from `activeOrg`).
    */
   credits?: number;
   subPlan?: string;
   creditsPerRun?: number;
   /**
    * The caller's organization (org-based billing subject). Absent-safe:
-   * rendered as a single `org:` line when present (V3-routed callers only).
+   * rendered as a single `org:` line when present.
    */
   activeOrg?: {
     id: string;
@@ -107,7 +102,7 @@ export interface AuthDeps {
    * it is sent as the `X-CLI-Command` request header on the key-validation
    * `GET /me` so the backend can attribute the call for product analytics —
    * e.g. `init` is counted as `cli.initialized` instead of the generic
-   * `cli.session_started`. `auth configure` run directly leaves it unset.
+   * `cli.session_started`. Left unset, no header is sent.
    * Advisory only: it never changes behavior, and the backend honors only a
    * known allowlist value.
    */
@@ -135,7 +130,7 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
 const FROM_ENV_MISSING_KEY =
   'TESTSPRITE_API_KEY is not set in the environment. Set it and re-run with --from-env, or omit --from-env to enter the key interactively.';
 
-const API_KEY_PAGE_PATH = '/dashboard/settings/apikey';
+const API_KEY_PAGE_PATH = '/dashboard-v3/settings/apikey';
 
 /**
  * Where a key comes from. Names the Portal origin that matches the API
@@ -187,7 +182,7 @@ export async function runConfigure(
   // it defaults to stderr — stdout stays a pure result stream (the configured
   // JSON/text), which matters under `--output json` (§8.1 stdout purity).
   const prelude = deps.preludeWrite ?? ((chunk: string) => process.stderr.write(chunk));
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
 
   // Normalize the env endpoint: an empty / whitespace-only TESTSPRITE_API_URL is
   // treated as unset. Without this, `''` (e.g. `export TESTSPRITE_API_URL=` in a
@@ -307,10 +302,12 @@ export async function runConfigure(
     // it keeps its REQUEST_TIMEOUT code, exit 7 and request id, instead of the
     // exit-3 "rejected" wrapper below that sends the user to rotate a good key.
     if (err instanceof RequestTimeoutError) {
-      stderr(`API key check against ${apiUrl} timed out, profile NOT updated: ${message}`);
+      stderr(
+        `API key check against ${apiUrl} timed out, profile NOT updated: ${terminalSafeLine(message)}`,
+      );
       throw err;
     }
-    stderr(`API key rejected by ${apiUrl}: ${message} — profile NOT updated`);
+    stderr(`API key rejected by ${apiUrl}: ${terminalSafeLine(message)} — profile NOT updated`);
     // When the verification call returned a typed API error (AUTH_INVALID,
     // AUTH_FORBIDDEN, etc.), re-throw it directly so `index.ts` renders the
     // full typed envelope under `--output json` (code, nextAction, requestId,
@@ -358,7 +355,6 @@ export async function runConfigure(
 export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promise<MeResponse> {
   const out = makeOutput(opts.output, deps);
   const env = deps.env ?? process.env;
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Resolve the endpoint URL so it can be surfaced in text output.
   // Dry-run uses the flag/env/default chain without touching credentials.
@@ -391,41 +387,41 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
   out.print(me, data => {
     const m = data as MeResponse;
     const lines = [
-      `userId: ${m.userId}`,
+      `userId: ${terminalSafeLine(m.userId)}`,
       // Human-readable identity, rendered only when the backend supplies it
       // (dogfood L1866) — confirm the account at a glance before a billable run.
-      ...(m.displayName ? [`name:   ${m.displayName}`] : []),
-      ...(m.email ? [`email:  ${m.email}`] : []),
-      `keyId:  ${m.keyId}`,
+      ...(m.displayName ? [`name:   ${terminalSafeLine(m.displayName)}`] : []),
+      ...(m.email ? [`email:  ${terminalSafeLine(m.email)}`] : []),
+      `keyId:  ${terminalSafeLine(m.keyId)}`,
       // Show the resolved endpoint so the user knows which env they are bound to
       // without having to infer from the `env` field alone (dogfood L1788).
       `endpoint: ${resolvedEndpoint}`,
-      `env:    ${m.env}`,
-      `scopes: ${m.scopes.join(', ')}`,
-      // Org context — confirms whose wallet a billable command will draw
-      // from, so it renders only for V3-routed callers (`v3Enabled` is the
-      // authoritative routing bit; field presence alone is not trusted).
-      ...(m.v3Enabled === true && m.activeOrg
-        ? [`org:    ${m.activeOrg.name} (${m.activeOrg.plan}, ${m.activeOrg.role})`]
+      `env:    ${terminalSafeLine(m.env)}`,
+      `scopes: ${terminalSafeLine(m.scopes.join(', '))}`,
+      // Org context — confirms whose wallet a billable command will draw from.
+      ...(m.activeOrg
+        ? [
+            `org:    ${terminalSafeLine(m.activeOrg.name)} (${terminalSafeLine(m.activeOrg.plan)}, ${terminalSafeLine(m.activeOrg.role)})`,
+          ]
         : []),
       // A paused (or payment-pending) workspace refuses every write, so say so
       // next to the org it applies to instead of letting the next command find out.
-      ...(m.v3Enabled === true && formatWorkspaceStatus(m.activeOrg?.workspace)
+      ...(formatWorkspaceStatus(m.activeOrg?.workspace)
         ? [`workspace: ${formatWorkspaceStatus(m.activeOrg?.workspace)}`]
         : []),
-      // Authoritative routing mode, rendered only when the backend supplies it.
-      ...(m.v3Enabled !== undefined ? [`routing: ${routingLabel(m.v3Enabled)}`] : []),
       // Org attribution — account-wide membership list, rendered only when
       // the backend supplies a non-empty list.
       ...(formatOrgsSummary(m.organizations)
-        ? [`orgs: ${formatOrgsSummary(m.organizations)}`]
+        ? [`orgs: ${terminalSafeLine(String(formatOrgsSummary(m.organizations)))}`]
         : []),
       // The calling key's own org binding — membership keys only.
-      ...(formatOrgBinding(m.org) ? [`org binding: ${formatOrgBinding(m.org)}`] : []),
+      ...(formatOrgBinding(m.org)
+        ? [`org binding: ${terminalSafeLine(String(formatOrgBinding(m.org)))}`]
+        : []),
       // A personal-scoped key held by someone who is also in a team: say so
       // here rather than letting the team's projects just not show up.
       ...(formatPersonalScopeHint(m.organizations, m.org)
-        ? [`note: ${formatPersonalScopeHint(m.organizations, m.org)}`]
+        ? [`note: ${terminalSafeLine(String(formatPersonalScopeHint(m.organizations, m.org)))}`]
         : []),
     ];
     // C2: warn in text mode when key cannot write/run
@@ -439,18 +435,13 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
     }
     return lines.join('\n');
   });
-  // When V3 routing is on, warn (text mode only) about the still-open behavior
-  // gaps. JSON consumers read `v3Enabled` directly; stdout stays pure.
-  if (opts.output !== 'json' && me.v3Enabled === true) {
-    emitV3RoutingAdvisory(stderr);
-  }
   return me;
 }
 
 export async function runLogout(opts: CommonOptions, deps: AuthDeps = {}): Promise<void> {
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
   const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
 
   if (opts.dryRun) {
     emitDryRunBanner(stderr);
@@ -478,28 +469,16 @@ export function createAuthCommand(deps: AuthDeps = {}): Command {
     .description('Manage TestSprite credentials')
     .addHelpText('after', '\nTo add credentials, run: testsprite setup');
 
-  // `status` (primary; formerly `whoami`). Credential WRITES no longer live
-  // here — `auth configure` is a hidden, deprecated alias for `setup` (attached
-  // in index.ts), and `setup` is the only command that writes credentials.
+  // Credential writes live in `setup`, the only command that writes credentials.
 
   auth
     .command('status')
     .summary('Show the active profile and its credentials')
     .description(
-      'Show the active profile: user, API key id, endpoint, env, scopes and, when available, org, workspace and routing',
+      'Show the active profile: user, API key id, endpoint, env, scopes and, when available, org and workspace',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
-      await runWhoami(resolveCommonOptions(command, deps.env), deps);
-    });
-
-  // `whoami` — hidden, deprecated alias for `status` (kept so scripts/agents
-  // on the old name keep working; invisible to --help).
-  auth
-    .command('whoami', { hidden: true })
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (_cmdOpts, command: Command) => {
-      emitDeprecationNotice('auth whoami', 'auth status', deps.stderr);
       await runWhoami(resolveCommonOptions(command, deps.env), deps);
     });
 
@@ -511,15 +490,6 @@ export function createAuthCommand(deps: AuthDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
-      await runLogout(resolveCommonOptions(command, deps.env), deps);
-    });
-
-  // `logout` — hidden, deprecated alias for `remove`.
-  auth
-    .command('logout', { hidden: true })
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (_cmdOpts, command: Command) => {
-      emitDeprecationNotice('auth logout', 'auth remove', deps.stderr);
       await runLogout(resolveCommonOptions(command, deps.env), deps);
     });
 

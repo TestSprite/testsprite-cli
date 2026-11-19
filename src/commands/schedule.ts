@@ -13,7 +13,7 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import { formatScheduleFrequencyAdvisory, runsPerMonth } from '../lib/cron.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
-import { historyRetentionNote, type HistoryRetentionMeta } from '../lib/history-retention.js';
+import { terminalSafeLine, terminalSafeWriter } from '../lib/terminal-text.js';
 
 /** A schedule as returned by the API. */
 export interface CliSchedule {
@@ -144,36 +144,6 @@ export interface CliDeleteScheduleResponse {
   scheduleId: string;
 }
 
-export interface RunListOptions extends CommonOptions {
-  scheduleId: string;
-  columns?: string;
-  noHeader?: boolean;
-}
-
-export interface CliScheduleRun {
-  runId: string;
-  scheduleId: string | null;
-  status: 'queued' | 'running' | 'passed' | 'failed' | 'blocked' | 'cancelled';
-  projectId: string | null;
-  testListId: string | null;
-  stats: {
-    total: number;
-    passed: number;
-    failed: number;
-    blocked: number;
-    running: number;
-    cancelled: number;
-  };
-  createdAt: string;
-  updatedAt: string;
-}
-
-/** `GET /schedules/{id}/runs` response. Not paginated. */
-interface ScheduleRunListResponse {
-  runs: CliScheduleRun[];
-  meta?: HistoryRetentionMeta;
-}
-
 // ---------------------------------------------------------------------------
 // schedule list
 // ---------------------------------------------------------------------------
@@ -222,7 +192,7 @@ export async function runCreate(
   deps: ScheduleDeps = {},
 ): Promise<CliCreateScheduleResponse> {
   const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
 
   assertIdempotencyKey(opts.idempotencyKey);
 
@@ -389,7 +359,7 @@ export async function runUpdate(
   deps: ScheduleDeps = {},
 ): Promise<CliSchedule> {
   const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
 
   assertIdempotencyKey(opts.idempotencyKey);
 
@@ -471,7 +441,7 @@ export async function runDelete(
   deps: ScheduleDeps = {},
 ): Promise<CliDeleteScheduleResponse> {
   const out = makeOutput(opts.output, deps);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
 
   assertIdempotencyKey(opts.idempotencyKey);
 
@@ -501,37 +471,11 @@ export async function runDelete(
     { headers: { 'idempotency-key': idempotencyKey } },
   );
 
-  out.print(deleted, data => `deleted: ${(data as CliDeleteScheduleResponse).scheduleId}`);
+  out.print(
+    deleted,
+    data => `deleted: ${terminalSafeLine((data as CliDeleteScheduleResponse).scheduleId)}`,
+  );
   return deleted;
-}
-
-// ---------------------------------------------------------------------------
-// schedule run list
-// ---------------------------------------------------------------------------
-
-export async function runRunList(
-  opts: RunListOptions,
-  deps: ScheduleDeps = {},
-): Promise<ScheduleRunListResponse> {
-  const out = makeOutput(opts.output, deps);
-  if (opts.output === 'text') {
-    resolveTextColumns(opts.columns, RUN_LIST_COLUMNS);
-  }
-  const client = makeClient(opts, deps);
-
-  const response = await client.get<ScheduleRunListResponse>(
-    `/schedules/${encodeURIComponent(opts.scheduleId)}/runs`,
-  );
-  const runs = response.runs ?? [];
-  const outputResponse = { ...response, runs };
-  out.print(outputResponse, () =>
-    renderRunListText(runs, { columns: opts.columns, noHeader: opts.noHeader }),
-  );
-  if (opts.output === 'text') {
-    const note = historyRetentionNote(response.meta, client.resolvedBaseUrl);
-    if (note) (deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)))(note);
-  }
-  return outputResponse;
 }
 
 // ---------------------------------------------------------------------------
@@ -596,21 +540,21 @@ function renderScheduleListText(
 
 function renderScheduleText(s: CliSchedule): string {
   const lines = [
-    `id:         ${s.scheduleId}`,
-    `name:       ${s.name}`,
+    `id:         ${terminalSafeLine(s.scheduleId)}`,
+    `name:       ${terminalSafeLine(s.name)}`,
     `status:     ${statusOf(s)}`,
-    `targetType: ${s.targetType}`,
-    `targetId:   ${s.targetId ?? '(none)'}`,
-    `cron:       ${s.cron ?? '(none)'}`,
-    `timezone:   ${s.timezone ?? '(none)'}`,
-    `startAt:    ${s.startAt ?? '(none)'}`,
-    `endAt:      ${s.endAt ?? '(open-ended)'}`,
-    `sendTo:     ${s.sendTo ?? '(none)'}`,
-    `lastRunId:  ${s.lastRunId ?? '(never run)'}`,
-    `createdAt:  ${s.createdAt}`,
-    `updatedAt:  ${s.updatedAt}`,
+    `targetType: ${terminalSafeLine(s.targetType)}`,
+    `targetId:   ${terminalSafeLine(s.targetId ?? '(none)')}`,
+    `cron:       ${terminalSafeLine(s.cron ?? '(none)')}`,
+    `timezone:   ${terminalSafeLine(s.timezone ?? '(none)')}`,
+    `startAt:    ${terminalSafeLine(s.startAt ?? '(none)')}`,
+    `endAt:      ${terminalSafeLine(s.endAt ?? '(open-ended)')}`,
+    `sendTo:     ${terminalSafeLine(s.sendTo ?? '(none)')}`,
+    `lastRunId:  ${terminalSafeLine(s.lastRunId ?? '(never run)')}`,
+    `createdAt:  ${terminalSafeLine(s.createdAt)}`,
+    `updatedAt:  ${terminalSafeLine(s.updatedAt)}`,
   ];
-  if (s.autoPausedAt) lines.push(`autoPaused: ${s.autoPausedAt}`);
+  if (s.autoPausedAt) lines.push(`autoPaused: ${terminalSafeLine(s.autoPausedAt)}`);
   if (s.environmentMode !== undefined) {
     lines.push(`environment: ${scheduleEnvironmentText(s)}`);
   }
@@ -627,8 +571,8 @@ function renderScheduleText(s: CliSchedule): string {
  * reaches this renderer — `confirmCreateEnvironmentPin` refuses first.)
  */
 function renderCreateScheduleText(r: CliCreateScheduleResponse): string {
-  if (r.environmentMode === undefined) return `id: ${r.scheduleId}`;
-  return `id: ${r.scheduleId}\nenvironment: ${scheduleEnvironmentText(r)}`;
+  if (r.environmentMode === undefined) return `id: ${terminalSafeLine(r.scheduleId)}`;
+  return `id: ${terminalSafeLine(r.scheduleId)}\nenvironment: ${scheduleEnvironmentText(r)}`;
 }
 
 interface ScheduleEnvironmentFields {
@@ -639,7 +583,7 @@ interface ScheduleEnvironmentFields {
 function scheduleEnvironmentText(schedule: ScheduleEnvironmentFields): string {
   if (schedule.environmentMode === 'inherit') return 'project default (inherits)';
   if (schedule.environmentMode === 'pinned' && schedule.environment) {
-    return `${schedule.environment} (pinned)`;
+    return `${terminalSafeLine(schedule.environment)} (pinned)`;
   }
   return '-';
 }
@@ -725,32 +669,6 @@ function unsupportedEnvironmentError(
   });
 }
 
-const RUN_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliScheduleRun>> = [
-  {
-    header: 'RUN ID',
-    width: rows => Math.max(6, ...rows.map(r => r.runId.length)),
-    render: r => r.runId,
-  },
-  { header: 'STATUS', width: 9, render: r => r.status },
-  { header: 'TOTAL', width: 5, render: r => String(r.stats.total) },
-  { header: 'PASS', width: 4, render: r => String(r.stats.passed) },
-  { header: 'FAIL', width: 4, render: r => String(r.stats.failed) },
-  { header: 'BLOCK', width: 5, render: r => String(r.stats.blocked) },
-  { header: 'STARTED', width: 0, render: r => r.createdAt },
-];
-
-function renderRunListText(
-  runs: readonly CliScheduleRun[],
-  options: { columns?: string; noHeader?: boolean } = {},
-): string {
-  // Distinct from a missing schedule, which is reported as not found.
-  if (runs.length === 0) return 'No runs yet.';
-  return renderTextTable(runs, RUN_LIST_COLUMNS, {
-    columns: options.columns,
-    noHeader: options.noHeader,
-  });
-}
-
 function localValidationError(message: string): ApiError {
   return ApiError.fromEnvelope({
     error: {
@@ -769,9 +687,9 @@ function localValidationError(message: string): ApiError {
 
 export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
   const schedule = new Command('schedule')
-    .summary('Manage schedules (V3 workspace)')
+    .summary('Manage schedules')
     .description(
-      'Manage TestSprite schedules. Needs a V3 workspace and an API key with the read:schedules / write:schedules scopes.',
+      'Manage TestSprite schedules. Needs an API key with the read:schedules / write:schedules scopes.',
     );
 
   schedule
@@ -965,44 +883,6 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
             scheduleId,
             confirm: cmdOpts.confirm === true,
             idempotencyKey: cmdOpts.idempotencyKey,
-          },
-          deps,
-        );
-      },
-    );
-
-  const run = schedule.command('run').description("Inspect a schedule's runs");
-
-  run
-    .command('list <schedule-id>')
-    .summary("List a schedule's most recent runs")
-    .description(
-      "List a schedule's most recent runs (up to 100, within your plan's history window;\n" +
-        'JSON `meta.hiddenCount` shows how many are hidden)\n' +
-        '\nExit codes:\n' +
-        '  0  success\n' +
-        '  3  auth error\n' +
-        '  4  not found\n' +
-        '  5  validation error (e.g., bad --columns)\n' +
-        '  7  schedules are not available on this account\n' +
-        ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
-        ' 13  not available on your plan',
-    )
-    .option('--columns <list>', 'select/reorder text table columns (comma-separated keys)')
-    .option('--no-header', 'suppress the text table header row')
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(
-      async (
-        scheduleId: string,
-        cmdOpts: { columns?: string; header?: boolean },
-        command: Command,
-      ) => {
-        await runRunList(
-          {
-            ...resolveCommonOptions(command, deps.env),
-            scheduleId,
-            columns: cmdOpts.columns,
-            noHeader: cmdOpts.header === false,
           },
           deps,
         );

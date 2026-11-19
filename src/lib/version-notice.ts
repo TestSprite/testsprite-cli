@@ -29,6 +29,7 @@
  */
 import { compareSemver, UPDATE_CHECK_OPT_OUT_ENV } from './update-check.js';
 import { VERSION } from '../version.js';
+import { terminalSafeLine, terminalSafeWriter } from './terminal-text.js';
 
 /** Version-compatibility signal observed on a backend response (the floor). */
 export interface ServerVersionInfo {
@@ -108,7 +109,7 @@ export function shouldWarnPinnedInActions(
  */
 export function formatBelowFloorNotice(currentVersion: string, minVersion: string): string {
   return (
-    `Your testsprite-cli (${currentVersion}) is below the minimum supported version ${minVersion}. ` +
+    `Your testsprite-cli (${currentVersion}) is below the minimum supported version ${terminalSafeLine(minVersion)}. ` +
     `Upgrade: npm install -g @testsprite/testsprite-cli ` +
     `(disable this notice with ${UPDATE_CHECK_OPT_OUT_ENV}=1).`
   );
@@ -124,7 +125,7 @@ export function formatBelowFloorNotice(currentVersion: string, minVersion: strin
 export function formatPinnedVersionWarning(currentVersion: string, minVersion: string): string {
   return (
     `::warning title=TestSprite::testsprite-cli ${currentVersion} is pinned in this workflow ` +
-    `and is below the minimum supported version ${minVersion}. ` +
+    `and is below the minimum supported version ${terminalSafeLine(minVersion)}. ` +
     `Regenerate with testsprite ci init github --force.`
   );
 }
@@ -155,7 +156,7 @@ export function noteServerVersion(info: ServerVersionInfo, deps: VersionNoticeDe
     if (!minVersion) return;
 
     const currentVersion = deps.currentVersion ?? VERSION;
-    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    const stderr = terminalSafeWriter(deps.stderr);
     stderr(
       inActions
         ? formatPinnedVersionWarning(currentVersion, minVersion)

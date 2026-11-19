@@ -10,10 +10,11 @@
  *    impl. Doing that once here is safer than three near-copies.
  *
  * The factory is intentionally narrow: it only takes the HTTP-relevant
- * deps. Per-command deps (auth's `prompt`, test's `rawStdout`) stay
+ * deps. Per-command deps (auth's `prompt`, test's `createTunnelClient`) stay
  * with the command.
  */
-import { loadConfig, type Config } from './config.js';
+import type { Command } from 'commander';
+import { loadConfig, resolveProfileName, type Config } from './config.js';
 import { DEFAULT_PROFILE, defaultCredentialsPath } from './credentials.js';
 import { ApiError, localValidationError } from './errors.js';
 import { facadeBaseUrl } from './facade.js';
@@ -25,11 +26,12 @@ import {
   REQUEST_TIMEOUT_MIN_MS,
 } from './http.js';
 import { globalShutdown, type ShutdownHandle } from './interrupt.js';
-import type { OutputMode } from './output.js';
+import { resolveOutputMode, type OutputMode } from './output.js';
 import { createDryRunFetch, withDryRunBannerOnce } from './dry-run/fetch.js';
 import { redactDeep } from './redact.js';
 import { noteServerVersion } from './version-notice.js';
 import { VERSION } from '../version.js';
+import { jsonForTerminal, terminalSafeWriter, verboseWriter } from './terminal-text.js';
 
 export interface CommonOptions {
   profile: string;
@@ -294,6 +296,27 @@ export function parseRequestTimeoutFlag(raw: string | undefined): number | undef
 }
 
 /**
+ * The global flags as a command reads them (`--profile`, `--output`,
+ * `--dry-run`, `--endpoint-url`, `--debug`, `--verbose`, `--request-timeout`).
+ * An invalid `--output` or `--request-timeout` is a validation error (exit 5),
+ * never a silent fall-back.
+ */
+export function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
+  const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
+    requestTimeout?: string;
+  };
+  return {
+    profile: resolveProfileName(globals.profile, env),
+    output: resolveOutputMode(globals.output),
+    dryRun: globals.dryRun ?? false,
+    endpointUrl: globals.endpointUrl,
+    debug: globals.debug ?? false,
+    verbose: globals.verbose ?? false,
+    requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
+  };
+}
+
+/**
  * The profile name to echo in a missing-key error, or `undefined` to keep the
  * generic wording.
  *
@@ -329,7 +352,7 @@ export function createHttpClientFactory(
 }
 
 function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps): HttpClientOptions {
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
   const env = deps.env ?? process.env;
   const requestTimeoutMs = resolveRequestTimeoutMs(opts, env);
 
@@ -352,7 +375,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
       apiKey: DRY_RUN_API_KEY,
       fetchImpl,
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
-      onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
+      onTransition: opts.verbose ? verboseWriter(stderr) : undefined,
       env,
       requestTimeoutMs,
       shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
@@ -380,7 +403,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
     apiKey: config.apiKey,
     fetchImpl: deps.fetchImpl,
     onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDebug(event)) : undefined,
-    onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
+    onTransition: opts.verbose ? verboseWriter(stderr) : undefined,
     // Warn once if the backend advertises a minimum supported version above
     // this binary's. Gating (opt-out env, TTY, output mode, dry-run) lives in
     // noteServerVersion; the client just forwards the observed headers.
@@ -410,9 +433,9 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
  * forward-compatibility contract.
  */
 export function formatDebug(event: DebugEvent): string {
-  return `[debug ${new Date().toISOString()}] ${JSON.stringify(redactDeep(event))}`;
+  return `[debug ${new Date().toISOString()}] ${jsonForTerminal(redactDeep(event))}`;
 }
 
 export function formatDryRunDebug(event: DebugEvent): string {
-  return `[debug ${new Date().toISOString()}] ${JSON.stringify(redactDeep({ ...event, mode: 'dry-run' }))}`;
+  return `[debug ${new Date().toISOString()}] ${jsonForTerminal(redactDeep({ ...event, mode: 'dry-run' }))}`;
 }

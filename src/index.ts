@@ -4,24 +4,19 @@ import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
 import { createCiCommand } from './commands/ci.js';
+import { createConversationCommands } from './commands/conversation.js';
 import { createCompletionCommand, type CompletionSpec } from './commands/completion.js';
 import { createDoctorCommand } from './commands/doctor.js';
-import {
-  addSetupOptions,
-  createDeprecatedInitCommand,
-  createSetupCommand,
-  runConfigureViaSetup,
-  type SetupCmdOpts,
-} from './commands/init.js';
+import { createSetupCommand } from './commands/init.js';
 import { createProjectCommand } from './commands/project.js';
+import { createResultCommand } from './commands/result.js';
 import { createScheduleCommand } from './commands/schedule.js';
 import { createTunnelCommand } from './commands/tunnel.js';
-import { createTestCommand } from './commands/test.js';
+import { createTestCommand, createRunCommand } from './commands/test.js';
 import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
 import { resolveProfileName } from './lib/config.js';
 import { classifyBillingRefusal } from './lib/billing-refusal.js';
-import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
 import { validatePositionalArgs } from './lib/args.js';
 import {
   ApiError,
@@ -38,14 +33,17 @@ import {
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
 import { redactDeep } from './lib/redact.js';
+import { removedCommandPointer, removedOptionPointer } from './lib/removed-commands.js';
+import { jsonForTerminal, terminalSafe, terminalSafeLine } from './lib/terminal-text.js';
 import {
   buildInterruptEnvelope,
   renderAmbiguousOrgCandidates,
   renderTunnelBindingLimitIds,
+  redactUnknownOptionValue,
   renderCommanderError,
   rephraseUnknownOption,
 } from './lib/render-error.js';
-import { isPlanTemplateInvocation, maybeEmitSkillNudge } from './lib/skill-nudge.js';
+import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
 import {
   classifyCliError,
   isTelemetryOptedOut,
@@ -84,51 +82,34 @@ program
   .option('--debug', 'Print HTTP method/path, request id, latency, retry decisions to stderr')
   .option(
     '--dry-run',
-    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Exception: run commands (`test run`, `test rerun`, `test create --run`, `testlist run`) with credentials and no explicit target may make read-only GETs to preview an automatic tunnel target; nothing is created or started. File inputs (--plan-from/--plans/--steps) are still read locally; --code-file uses a placeholder.',
+    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Exception: run launches (`run --project`, `run <test-id...>`, `run --testlist`) with credentials and no explicit target may make read-only GETs to preview an automatic tunnel target; nothing is created or started.',
   )
   .option(
     '--request-timeout <seconds>',
     'Per-request timeout in seconds (default 120; range 1–600, values outside are clamped). ' +
-      'Does not affect the --timeout polling ceiling for `test run/wait`.',
+      'Does not affect the --timeout polling ceiling for `run` or `run wait`.',
   );
 
 // `setup` is the primary onboarding command, listed FIRST in --help so a coding
-// agent reaches it before anything else. `init` is kept as a hidden, deprecated
-// alias (invisible to --help; still works for existing scripts/agents).
+// agent reaches it before anything else.
 program.addCommand(createSetupCommand({}));
-program.addCommand(createDeprecatedInitCommand({}), { hidden: true });
 
-// `auth configure` is a hidden, deprecated alias that runs FULL `setup`
-// (configure + skill install), so an agent reaching for the old command still
-// ends up with the skill. `setup` remains the ONLY path that writes credentials.
-// Attach the SAME flag set `setup` has (previously only
-// `--from-env` was wired up, so README's "runs the full setup" claim didn't
-// hold — `--yes`/`--agent`/`--api-key`/`--force`/`--dir`/`--no-agent` were all
-// rejected as `unknown option`).
-const authCommand = createAuthCommand();
-const authConfigureValidTargets = Object.keys(TARGETS) as AgentTarget[];
-addSetupOptions(
-  authCommand.command('configure', { hidden: true }),
-  authConfigureValidTargets,
-  'claude',
-).action(async (cmdOpts: SetupCmdOpts, command: Command) => {
-  process.stderr.write(
-    '[deprecated] `testsprite auth configure` now runs full setup (configure + skill install) — ' +
-      'use `testsprite setup` (add --no-agent to skip the skill).\n',
-  );
-  await runConfigureViaSetup(command, {}, cmdOpts);
-});
-program.addCommand(authCommand);
+// The project's agent: the same conversations, cards and memory the portal has.
+for (const command of createConversationCommands()) program.addCommand(command);
+
+program.addCommand(createAuthCommand());
 
 program.addCommand(createProjectCommand({}));
 let waitTimeoutTelemetry: Partial<WaitTimeoutTelemetry> = {};
 program.addCommand(
-  createTestCommand({
+  createRunCommand({
     onWaitTimeout: context => {
       waitTimeoutTelemetry = context;
     },
   }),
 );
+program.addCommand(createTestCommand());
+program.addCommand(createResultCommand());
 program.addCommand(createTestListCommand());
 program.addCommand(
   createCiCommand({
@@ -143,6 +124,34 @@ program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
 program.addCommand(createDoctorCommand());
 program.addCommand(createCompletionCommand(() => buildCompletionSpec()));
+
+// The root accepts global flags anywhere. Its ordinary parser also collects
+// child operands before the first unknown option. Feed the whole run tail to
+// the hybrid parser together, so it can stop at wait/cancel before consuming
+// their flags. Other groups retain Commander's existing parsing behavior.
+const parseRootOptions = program.parseOptions.bind(program);
+program.parseOptions = args => {
+  const parsed = parseRootOptions(args);
+  if (parsed.operands[0] !== 'run') return parsed;
+  const tail = [...parsed.operands.slice(1), ...parsed.unknown];
+  // Commander consumes a terminator encountered before any unknown option.
+  // Reinsert it before reprocessing operands, so literal IDs cannot turn into
+  // project/list launch flags. A required global option may itself take `--`
+  // as its value; that occurrence is not an option terminator.
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === '--') {
+      if (parsed.unknown.length === 0) {
+        const literalCount = args.length - index - 1;
+        tail.splice(Math.max(0, parsed.operands.length - 1 - literalCount), 0, '--');
+      }
+      break;
+    }
+    const option = program.options.find(option => option.long === arg || option.short === arg);
+    if (option?.required) index++;
+  }
+  return { operands: ['run'], unknown: tail };
+};
 
 // Derive the shell-completion spec from the fully-assembled command tree at call
 // time (not module-load), so `testsprite completion` can never drift from the
@@ -177,8 +186,8 @@ let pendingCommanderErrorMsg: string | null = null;
 let ranCommandPath = '';
 
 // Whether the command that ran should emit telemetry. `completion` (its stdout
-// is eval'd by shells) and `--plan-template` (pure-local) are kept off the
-// beacon, same as the update notice. Set by the preAction hook.
+// is eval'd by shells) is kept off the beacon, same as the update notice. Set by
+// the preAction hook.
 let telemetryEmit = false;
 
 // Auth resolved in the preAction hook, before the command's action runs, so
@@ -199,8 +208,9 @@ function applyExitOverrideDeep(cmd: Command): void {
   cmd.exitOverride();
   cmd.configureOutput({
     outputError(str, _write) {
-      const rephrased = rephraseUnknownOption(str);
-      pendingCommanderErrorMsg = rephrased !== null ? `${rephrased}\n` : str;
+      const safe = redactUnknownOptionValue(str);
+      const rephrased = rephraseUnknownOption(safe);
+      pendingCommanderErrorMsg = rephrased !== null ? `${rephrased}\n` : safe;
     },
   });
   for (const child of cmd.commands) {
@@ -209,26 +219,66 @@ function applyExitOverrideDeep(cmd: Command): void {
 }
 applyExitOverrideDeep(program);
 
-function isRegisteredRootCommand(name: string): boolean {
-  return (
-    name === 'help' ||
-    program.commands.some(command => command.name() === name || command.aliases().includes(name))
+/** The subcommand of `group` that `name` names, by name or alias. */
+function subcommandNamed(group: Command, name: string): Command | undefined {
+  return group.commands.find(
+    command => command.name() === name || command.aliases().includes(name),
   );
 }
 
 /**
- * Commander checks its implicit help option before reporting an unknown root
- * command. It also falls back to root help when `help <command>` names a
- * missing command. Detect both cases while help is being rendered so the
- * normal unknown-command error wins before any misleading help is written.
+ * Commander checks its implicit help option before reporting an unknown
+ * command, at every level: `<group> <unknown> --help` prints the group's
+ * help, and `help <group> <unknown>` or `<group> help <unknown>` fall back to
+ * it too.
+ * Walk the command names the program was given, from the root down, while
+ * help is being rendered: the first name that is not a subcommand of the
+ * group before it is the unknown command, and that error wins before any
+ * misleading help is written. Only groups are walked; a leaf's arguments
+ * are its own. `-h` / `--help` is skipped wherever it stands, so the order of
+ * the words does not matter; the walk stops at any other option, so a flag's
+ * value is never read as a command. Returns the unknown name and the group it
+ * was looked up in; the error handler walks the same way to name where a
+ * removed command went.
  */
-function unknownRootCommandMaskedByHelp(args: readonly string[]): string | undefined {
-  const [first, second] = args;
-  if (first === 'help') {
-    return second && !isRegisteredRootCommand(second) ? second : undefined;
+function unknownCommandIn(args: readonly string[]): { group: Command; name: string } | undefined {
+  let group: Command = program;
+  // `help <name>…` at the root names the path to describe.
+  let explicitHelpPath = args[0] === 'help';
+  for (const name of explicitHelpPath ? args.slice(1) : args) {
+    if (group.commands.length === 0) return undefined;
+    // The help flag asks for help wherever it stands; the names after it still
+    // have to exist (`test --help result`).
+    if (name === '-h' || name === '--help') continue;
+    if (name.startsWith('-')) return undefined;
+    // A group's own `help` subcommand: the name after it is its subcommand.
+    if (name === 'help') {
+      explicitHelpPath = true;
+      continue;
+    }
+    const next = subcommandNamed(group, name);
+    if (next === undefined) {
+      if (group.name() === 'run' && group.parent === program && !explicitHelpPath) return undefined;
+      return { group, name };
+    }
+    group = next;
   }
-  if (!first || first.startsWith('-') || isRegisteredRootCommand(first)) return undefined;
-  return args.slice(1).some(arg => arg === '--help' || arg === '-h') ? first : undefined;
+  return undefined;
+}
+
+/**
+ * The command the leading names reach, which is the one that parses the
+ * options after them. The walk stops at the first option or the first word
+ * that is not a subcommand (an argument), like the walk above.
+ */
+function commandNamedBy(args: readonly string[]): Command {
+  let command: Command = program;
+  for (const name of args) {
+    const next = name.startsWith('-') ? undefined : subcommandNamed(command, name);
+    if (next === undefined) break;
+    command = next;
+  }
+  return command;
 }
 
 program.addHelpText(
@@ -239,9 +289,8 @@ program.addHelpText(
     '  (milliseconds) mirror --endpoint-url, --profile and --request-timeout.',
 );
 
-program.addHelpText('beforeAll', context => {
-  if (context.command !== program) return '';
-  const unknownCommand = unknownRootCommandMaskedByHelp(program.args);
+program.addHelpText('beforeAll', () => {
+  const unknownCommand = unknownCommandIn(program.args)?.name;
   if (unknownCommand) {
     program.error(`error: unknown command '${unknownCommand}'`, {
       code: 'commander.unknownCommand',
@@ -251,8 +300,8 @@ program.addHelpText('beforeAll', context => {
 });
 
 /**
- * Render a leaf command's full path (group + leaf), e.g. `test run` /
- * `auth whoami`, by walking parents up to (but not including) the root program.
+ * Render a leaf command's full path (group + leaf), e.g. `run` /
+ * `auth status`, by walking parents up to (but not including) the root program.
  */
 function commandPathOf(cmd: Command): string {
   const names: string[] = [];
@@ -290,16 +339,12 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   // Record which leaf command ran, for the telemetry emit around parseAsync.
   ranCommandPath = commandPath;
 
-  // Validate positional arguments across all commands before executing their actions.
-  validatePositionalArgs(actionCommand);
-
   const globals = actionCommand.optsWithGlobals() as {
     output?: string;
     profile?: string;
     endpointUrl?: string;
     dryRun?: boolean;
     debug?: boolean;
-    planTemplate?: boolean;
     local?: string;
     localHost?: string;
   };
@@ -309,19 +354,23 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   telemetryLocalProject =
     commandPath === 'project create' &&
     (globals.local !== undefined || globals.localHost !== undefined);
-  // See `isPlanTemplateInvocation` for why this one case is
-  // filtered here rather than in skill-nudge.ts / update-check.ts.
-  const isPlanTemplate = isPlanTemplateInvocation(commandPath, globals.planTemplate);
+  // Telemetry gate, same reason as the update notice below: skip `completion`
+  // (its stdout is eval'd by shells). Resolve auth now, before the command's
+  // action runs, so `auth remove` still reports on the key it used; skip the
+  // read for opt-out / dry-run.
+  telemetryEmit = commandPath !== 'completion';
 
-  // Telemetry gate, same reasons as the update notice below: skip `completion`
-  // (its stdout is eval'd by shells) and `--plan-template` (pure-local). Resolve
-  // auth now, before the command's action runs, so `auth remove` still reports
-  // on the key it used; skip the read for opt-out / dry-run. The read is
-  // best-effort: an unreadable credentials file must not end the process here,
-  // before the command could run — `doctor` exists to diagnose exactly that, and
-  // offline commands never need the key. On failure the command runs as if
-  // telemetry were off (no event, and no fallback read at exit either).
-  telemetryEmit = commandPath !== 'completion' && !isPlanTemplate;
+  // Refuse an empty or whitespace-only positional before the action runs.
+  // This sits below the telemetry gate so the refusal is still reported as a
+  // VALIDATION_ERROR outcome, as it was when each command checked for itself,
+  // and above the auth read so a bad profile cannot replace this error.
+  validatePositionalArgs(actionCommand);
+
+  // The auth read is best-effort: an unreadable credentials file must not end
+  // the process here, before the command could run — `doctor` exists to
+  // diagnose exactly that, and offline commands never need the key. On failure
+  // the command runs as if telemetry were off (no event, and no fallback read
+  // at exit either).
   if (telemetryEmit && !isTelemetryOptedOut(process.env) && globals.dryRun !== true) {
     telemetryAuth = tryResolveTelemetryAuth(
       { profile: globals.profile, endpointUrl: globals.endpointUrl },
@@ -336,32 +385,22 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     );
     if (telemetryAuth === undefined) telemetryEmit = false;
   }
-  if (!isPlanTemplate) {
-    maybeEmitSkillNudge({
-      commandPath,
-      output: isOutputMode(globals.output) ? globals.output : 'text',
-      dryRun: globals.dryRun ?? false,
-      profile: resolveProfileName(globals.profile),
-      cwd: process.cwd(),
-      env: process.env,
-      debug: globals.debug ?? false,
-    });
-  }
+  maybeEmitSkillNudge({
+    commandPath,
+    output: isOutputMode(globals.output) ? globals.output : 'text',
+    dryRun: globals.dryRun ?? false,
+    profile: resolveProfileName(globals.profile),
+    cwd: process.cwd(),
+    env: process.env,
+    debug: globals.debug ?? false,
+  });
 
   // Best-effort update notice (see lib/update-check.ts): self-gates on the
   // opt-out env, CI, TTY, and a 24h cache; the wiring adds the flag-level
   // gates the lib cannot see. Skipped for `completion` (its stdout is eval'd
-  // by shells), under --output json, under --dry-run, and for
-  // `--plan-template` (pure-local — this check hits the npm registry over
-  // the network and writes ~/.testsprite/update-check.json, both of which
-  // contradict "no network" for this flag). Deliberately not awaited: an
-  // advisory must never delay the real command.
-  if (
-    globals.output !== 'json' &&
-    globals.dryRun !== true &&
-    commandPath !== 'completion' &&
-    !isPlanTemplate
-  ) {
+  // by shells), under --output json and under --dry-run. Deliberately not
+  // awaited: an advisory must never delay the real command.
+  if (globals.output !== 'json' && globals.dryRun !== true && commandPath !== 'completion') {
     void maybeNotifyUpdate();
   }
 });
@@ -444,43 +483,43 @@ try {
   const output = new Output(mode);
   if (err instanceof ApiError) {
     const billingRefusal = classifyBillingRefusal(err);
-    const message =
-      err.code === 'UNSUPPORTED' &&
-      err.getDetail('reason') === 'tunnel-unsupported-for-backend-test'
-        ? '--local only supports frontend tests today. Re-run without --local, or point the test at a reachable base URL.'
-        : err.message;
+    const { message, nextAction, details } = err;
     if (mode === 'json') {
       const envelope = {
         error: {
           code: err.code,
           message,
-          nextAction: err.nextAction,
+          nextAction,
           requestId: err.requestId,
           // `err.details` is already redacted at ApiError construction (see
           // `errors.ts`); redacting again here is defence in depth for this
           // hand-built envelope specifically, independent of that.
-          details: redactDeep(err.details),
+          details: redactDeep(details),
           ...(billingRefusal ? { links: billingRefusal.links } : {}),
         },
       };
-      process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
+      process.stderr.write(`${jsonForTerminal(envelope, 2)}\n`);
     } else {
-      process.stderr.write(`Error: ${message}\n`);
-      if (err.nextAction) process.stderr.write(`${err.nextAction}\n`);
+      // Server text on a terminal: escape sequences and other control
+      // characters are removed, and the message and request id stay on their
+      // own line, so the server cannot write a line of its own beneath them.
+      // The JSON envelope above keeps what the server sent.
+      process.stderr.write(`Error: ${terminalSafeLine(message)}\n`);
+      if (nextAction) process.stderr.write(`${terminalSafe(nextAction)}\n`);
       if (billingRefusal) {
         for (const line of billingRefusal.lines) process.stderr.write(`${line}\n`);
       }
       if (err.requestId && err.requestId !== 'local')
-        process.stderr.write(`requestId: ${err.requestId}\n`);
+        process.stderr.write(`requestId: ${terminalSafeLine(err.requestId)}\n`);
       // C1: surface requiredScopes / grantedScopes on AUTH_FORBIDDEN
       if (err.code === 'AUTH_FORBIDDEN') {
         const required = err.getDetail('requiredScopes');
         const granted = err.getDetail('grantedScopes');
         if (Array.isArray(required) && required.length > 0) {
-          process.stderr.write(`  required: ${(required as string[]).join(', ')}\n`);
+          process.stderr.write(`  required: ${terminalSafeLine(required.join(', '))}\n`);
         }
         if (Array.isArray(granted)) {
-          process.stderr.write(`  granted:  ${(granted as string[]).join(', ')}\n`);
+          process.stderr.write(`  granted:  ${terminalSafeLine(granted.join(', '))}\n`);
         }
       }
       // Surface the version gap on CLIENT_TOO_OLD so the user sees exactly what
@@ -490,7 +529,9 @@ try {
         const your = err.getDetail('yourVersion');
         const min = err.getDetail('minVersion');
         if (typeof your === 'string' && typeof min === 'string') {
-          process.stderr.write(`  your version: ${your}, minimum supported: ${min}\n`);
+          process.stderr.write(
+            `  your version: ${terminalSafeLine(your)}, minimum supported: ${terminalSafeLine(min)}\n`,
+          );
         }
       }
       // AMBIGUOUS_ORG: the same testId resolved inside more than one of the
@@ -513,9 +554,9 @@ try {
     // A disarmed request has no run ID, so its JSON hint describes checking
     // current state before retrying. Both use the conventional 128+signum code.
     if (mode === 'json') {
-      process.stderr.write(`${JSON.stringify(buildInterruptEnvelope(err), null, 2)}\n`);
+      process.stderr.write(`${jsonForTerminal(buildInterruptEnvelope(err), 2)}\n`);
     } else {
-      process.stderr.write(`Error: ${err.message}\n`);
+      process.stderr.write(`Error: ${terminalSafeLine(err.message)}\n`);
     }
     await flushThenSetExitCode(err.exitCode);
     armInterruptExitBackstop(err.exitCode);
@@ -535,9 +576,9 @@ try {
           details: { timeoutMs: err.timeoutMs },
         },
       };
-      process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
+      process.stderr.write(`${jsonForTerminal(envelope, 2)}\n`);
     } else {
-      process.stderr.write(`Error: ${err.message}\n`);
+      process.stderr.write(`Error: ${terminalSafeLine(err.message)}\n`);
     }
     await flushThenSetExitCode(err.exitCode);
   } else if (err instanceof CommanderError) {
@@ -575,8 +616,20 @@ try {
         }
         return mode;
       })();
+      // A removed command also says where it went, by the
+      // same walk that found the unknown name (Commander's own error and the
+      // one raised before a group's help both arrive here). A removed option
+      // does too, from the command the arguments name and the message it wrote.
+      const unknown =
+        err.code === 'commander.unknownCommand' ? unknownCommandIn(program.args) : undefined;
+      const removedPointer =
+        unknown !== undefined
+          ? removedCommandPointer(commandPathOf(unknown.group), unknown.name)
+          : err.code === 'commander.unknownOption'
+            ? removedOptionPointer(commandPathOf(commandNamedBy(program.args)), err.message)
+            : undefined;
       process.stderr.write(
-        renderCommanderError(pendingCommanderErrorMsg, err.message, commanderMode),
+        renderCommanderError(pendingCommanderErrorMsg, err.message, commanderMode, removedPointer),
       );
       await flushThenSetExitCode(5);
     }

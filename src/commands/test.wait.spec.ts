@@ -1,2221 +1,477 @@
-/**
- * Unit tests for `test wait <run-id>` — M3.3 piece-3.
- *
- * Behavior matrix is identical to `--wait` path of `test run` except
- * there is no trigger step.
- */
-
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
-import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { describe, expect, it, vi } from 'vitest';
+import { onFakeTimers } from '../../test/helpers/fake-timers.js';
+import { resultLine } from '../../test/helpers/result-list.js';
+import { InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
-import type { RunResponse } from '../lib/runs.types.js';
-import { RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS, runTestWait } from './test.js';
+import { buildInterruptEnvelope } from '../lib/render-error.js';
+import { runTestWait } from './test.js';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-type FetchInput = Parameters<typeof globalThis.fetch>[0];
-
-function makeFetch(
-  handler: (url: string, init: RequestInit) => { status?: number; body: unknown },
-): typeof globalThis.fetch {
-  return (async (input: FetchInput, init: RequestInit = {}) => {
-    const url =
-      typeof input === 'string'
-        ? input
-        : input instanceof URL
-          ? input.toString()
-          : (input as { url: string }).url;
-    const { status = 200, body } = handler(url, init);
-    return new Response(JSON.stringify(body), {
-      status,
-      headers: { 'content-type': 'application/json' },
-    });
-  }) as typeof globalThis.fetch;
-}
-
-function makeCreds(
-  apiKey = 'sk-user-test',
-  apiUrl = 'http://localhost:13502',
-): { credentialsPath: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-m33-wait-'));
-  const credentialsPath = join(dir, 'credentials');
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(credentialsPath, `[default]\napi_url = ${apiUrl}\napi_key = ${apiKey}\n`, {
-    mode: 0o600,
-  });
-  return { credentialsPath };
-}
-
-function makeRun(status: RunResponse['status']): RunResponse {
-  return {
-    runId: 'run_abc',
-    testId: 'test_xyz',
-    projectId: 'project_1',
-    userId: 'user_1',
+const json = (body: unknown, status = 200, headers = {}): Response =>
+  new Response(JSON.stringify(body), {
     status,
-    source: 'cli',
-    createdAt: '2026-05-15T10:00:00.000Z',
-    startedAt: status !== 'queued' ? '2026-05-15T10:00:01.000Z' : null,
-    finishedAt: status !== 'queued' && status !== 'running' ? '2026-05-15T10:00:30.000Z' : null,
-    codeVersion: 'v1',
-    targetUrl: 'https://example.com',
-    createdFrom: 'cli',
-    failedStepIndex: null,
-    failureKind: null,
-    error: null,
-    videoUrl: null,
-    stepSummary: { total: 5, completed: 5, passedCount: 5, failedCount: 0 },
-  };
-}
-
-function errorBody(code: string, details: Record<string, unknown> = {}) {
-  const statusMap: Record<string, number> = {
-    AUTH_REQUIRED: 401,
-    AUTH_FORBIDDEN: 403,
-    NOT_FOUND: 404,
-    VALIDATION_ERROR: 400,
-    CONFLICT: 409,
-    RATE_LIMITED: 429,
-    INTERNAL: 500,
-  };
-  return {
-    status: statusMap[code] ?? 400,
-    body: {
+    headers: { 'content-type': 'application/json', ...headers },
+  });
+const fail = (code: string, status: number, details: Record<string, unknown> = {}) =>
+  json(
+    {
       error: {
         code,
-        message: `Error: ${code}`,
-        nextAction: 'do something',
-        requestId: 'req_test',
+        message: `${code} from server`,
+        nextAction: 'Server instruction.',
+        requestId: 'server-id',
         details,
       },
     },
-  };
-}
-
-const instantSleep = () => Promise.resolve();
-
-// ---------------------------------------------------------------------------
-// Happy paths
-// ---------------------------------------------------------------------------
-
-describe('runTestWait — happy paths', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('returns passed RunResponse, exit 0 (no throw)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('passed') }));
-    const stdout: string[] = [];
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-    );
-    expect(result.status).toBe('passed');
-    expect(result.runId).toBe('run_abc');
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.status).toBe('passed');
-  });
-
-  it('polls multiple times before reaching terminal', async () => {
-    const { credentialsPath } = makeCreds();
-    let getCount = 0;
-    const fetchImpl = makeFetch(() => {
-      getCount++;
-      if (getCount < 3) return { body: makeRun('running') };
-      return { body: makeRun('passed') };
-    });
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
-    );
-    expect(result.status).toBe('passed');
-    expect(getCount).toBe(3);
-  });
-
-  it('sends GET to /runs/{runId}', async () => {
-    const { credentialsPath } = makeCreds();
-    const seenUrls: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      seenUrls.push(url);
-      return { body: makeRun('passed') };
-    });
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
-    );
-    expect(seenUrls.some(u => u.includes('/runs/run_abc'))).toBe(true);
-  });
-
-  it('uses long-poll (waitSeconds param)', async () => {
-    const { credentialsPath } = makeCreds();
-    const seenUrls: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      seenUrls.push(url);
-      return { body: makeRun('passed') };
-    });
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
-    );
-    expect(seenUrls.some(u => u.includes('waitSeconds'))).toBe(true);
-  });
-
-  it('--output json prints JSON RunResponse on stdout', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('passed') }));
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-    );
-    const parsed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(parsed.runId).toBe('run_abc');
-    expect(parsed.status).toBe('passed');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Non-passed terminal states
-// ---------------------------------------------------------------------------
-
-describe('runTestWait — non-passed terminal states', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('failed status → CLIError exit 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('failed') }));
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-    expect(err.name).toBe('CLIError');
-  });
-
-  it('blocked status → CLIError exit 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('blocked') }));
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-  });
-
-  it('cancelled status → CLIError exit 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('cancelled') }));
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-  });
-
-  it('non-passed prints artifact hint to stderr', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('failed') }));
-    const stderrLines: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(() => {});
-    expect(stderrLines.some(l => l.includes('artifact'))).toBe(true);
-    expect(stderrLines.some(l => l.includes('run_abc'))).toBe(true);
-  });
-
-  // B3 — cancelled must NOT emit the artifact hint (no artifacts were captured)
-  it('B3 — cancelled status → CLIError exit 1 with NO artifact hint', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('cancelled') }));
-    const stderrLines: string[] = [];
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    // Exit 1, but no artifact hint — cancelled runs have no failure bundle
-    expect(err.exitCode).toBe(1);
-    expect(stderrLines.some(l => l.includes('artifact'))).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Error scenarios
-// ---------------------------------------------------------------------------
-
-describe('runTestWait — error scenarios', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('404 NOT_FOUND → ApiError exit 4 (cross-tenant runId)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => errorBody('NOT_FOUND', { reason: 'not_found' }));
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('NOT_FOUND');
-    expect((err as ApiError).exitCode).toBe(4);
-  });
-
-  it('timeout → UNSUPPORTED error exit 7 with nextAction containing run-id', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('running') }));
-
-    let callCount = 0;
-    const base = Date.now();
-    const realDateNow = Date.now;
-    Date.now = () => (callCount++ > 4 ? base + 2000 : base);
-
-    try {
-      const err = await runTestWait(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          runId: 'run_abc',
-          timeoutSeconds: 1,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => {},
-          stderr: () => {},
-          sleep: instantSleep,
-        },
-      ).catch(e => e);
-      expect(err).toBeInstanceOf(ApiError);
-      expect((err as ApiError).code).toBe('UNSUPPORTED');
-      expect((err as ApiError).exitCode).toBe(7);
-      expect((err as ApiError).nextAction).toContain('run_abc');
-    } finally {
-      Date.now = realDateNow;
-    }
-  });
-
-  it('403 AUTH_FORBIDDEN → ApiError exit 3', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => errorBody('AUTH_FORBIDDEN'));
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).exitCode).toBe(3);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Dry-run
-// ---------------------------------------------------------------------------
-
-describe('runTestWait — dry-run', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    resetDryRunBannerForTesting();
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('dry-run: no network call; prints envelope with method=GET and run-id in path', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network');
-    });
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        stdout: line => stdout.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(fetchImpl).not.toHaveBeenCalled();
-    const envelope = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(envelope.method).toBe('GET');
-    expect(envelope.path as string).toContain('run_abc');
-    expect(envelope.path as string).toContain('waitSeconds=25');
-  });
-
-  it('dry-run: timeoutSeconds in envelope', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        runId: 'run_abc',
-        timeoutSeconds: 300,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: {} })),
-        stdout: line => stdout.push(line),
-        sleep: instantSleep,
-      },
-    );
-    const envelope = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(envelope.timeoutSeconds).toBe(300);
-  });
-
-  it('dry-run: exit 0 (no throw)', async () => {
-    const { credentialsPath } = makeCreds();
-    await expect(
-      runTestWait(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: true,
-          runId: 'run_abc',
-          timeoutSeconds: 60,
-        },
-        {
-          credentialsPath,
-          fetchImpl: makeFetch(() => ({ body: {} })),
-          stdout: () => {},
-          sleep: instantSleep,
-        },
-      ),
-    ).resolves.toBeDefined();
-  });
-
-  // defect-2 fix: dry-run getRun sample must return status: "passed".
-  // Prior to fix, a duplicate failed-shape getRun entry appeared before
-  // the passed-shape entry in samples.ts; findSample's first-match-wins
-  // always returned status: "failed" for `test wait --dry-run`.
-  //
-  // In dry-run mode, runTestWait emits a describe-only envelope
-  // { method, path, timeoutSeconds } and exits 0. The canned sample is
-  // not actually fetched — the important invariant is that the command
-  // completes without throwing (exit 0) even though no real run is
-  // resolved. The getRun sample correctness is asserted separately in
-  // samples.test.ts ("GET /runs/{runId} resolves to the passed-shape…").
-  it('dry-run: command exits 0 and envelope contains GET path for run-id', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdout: string[] = [];
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        runId: 'run_xyz',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: {} })),
-        stdout: line => stdout.push(line),
-        sleep: instantSleep,
-      },
-    );
-    // runTestWait in dry-run mode returns the describe envelope — not a real RunResponse
-    const envelope = result as unknown as Record<string, unknown>;
-    expect(envelope.method).toBe('GET');
-    expect(envelope.path as string).toContain('run_xyz');
-    // The command must not throw (exit 0 — verifies defect-2 regression:
-    // prior to fix, a duplicate failed getRun sample caused `test wait --dry-run`
-    // to emit the wrong happy-path response)
-    expect(stdout.length).toBeGreaterThan(0);
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.method).toBe('GET');
-  });
-
-  // L1782 banner fix: test wait --dry-run must write the [dry-run] banner
-  // to stderr (like test run --dry-run and test artifact get --dry-run do),
-  // while the canned envelope stays on stdout only.
-  it('dry-run: emits [dry-run] banner to stderr and canned envelope to stdout, exit 0', async () => {
-    const { credentialsPath } = makeCreds();
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        runId: 'run_banner',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({ body: {} })),
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    // Banner must appear on stderr
-    expect(stderrLines).toContain(DRY_RUN_BANNER);
-    // Envelope must appear on stdout and be parseable
-    const envelope = JSON.parse(stdoutLines.join('')) as Record<string, unknown>;
-    expect(envelope.method).toBe('GET');
-    expect(envelope.path as string).toContain('run_banner');
-    // Return value must be defined (exit 0 — no throw)
-    expect(result).toBeDefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Backoff fallback path (VALIDATION_ERROR on waitSeconds)
-// ---------------------------------------------------------------------------
-
-describe('runTestWait — backoff fallback', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('400 VALIDATION_ERROR on waitSeconds → switches to backoff path and eventually succeeds', async () => {
-    const { credentialsPath } = makeCreds();
-    let callCount = 0;
-    const fetchImpl = makeFetch(url => {
-      callCount++;
-      // First call with waitSeconds → returns VALIDATION_ERROR
-      if (callCount === 1 && url.includes('waitSeconds')) {
-        return errorBody('VALIDATION_ERROR');
-      }
-      return { body: makeRun('passed') };
-    });
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(result.status).toBe('passed');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Backend testId fallback (dogfood L1888)
-//
-// Backend run-surface rows never finalize server-side, so the run-row poll
-// would always hit --timeout (exit 7) even on a passing BE test. `test wait`
-// falls back to the testId-scoped verdict (GET /tests/{id}/result) once it is
-// terminal for this run.
-// ---------------------------------------------------------------------------
-
-interface BeResult {
-  testId: string;
-  status: string;
-  startedAt: string | null;
-  finishedAt: string | null;
-  videoUrl: string | null;
-  failureAnalysisUrl: string | null;
-  snapshotId: string;
-  runIdIfAvailable: string | null;
-  codeVersion: string | null;
-  targetUrl: string | null;
-  failedStepIndex: number | null;
-  failureKind: string | null;
-  summary: { passed: number; failed: number; skipped: number };
-}
-
-function makeBeResult(overrides: Partial<BeResult> = {}): BeResult {
-  return {
-    testId: 'test_xyz',
-    status: 'passed',
-    startedAt: '2026-05-15T10:00:01.000Z',
-    finishedAt: '2026-05-15T10:00:30.000Z',
-    videoUrl: null,
-    failureAnalysisUrl: null,
-    snapshotId: 'snap_1',
-    runIdIfAvailable: 'run_abc',
-    codeVersion: 'v1',
-    targetUrl: 'https://example.com',
-    failedStepIndex: null,
-    failureKind: null,
-    summary: { passed: 1, failed: 0, skipped: 0 },
-    ...overrides,
-  };
-}
-
-function beWaitRouter(args: {
-  type?: string;
-  runStatus?: RunResponse['status'] | (() => RunResponse['status']);
-  result: () => BeResult;
-}) {
-  const counts = { type: 0, result: 0, run: 0 };
-  const handler = (url: string) => {
-    if (url.includes('/tests/test_xyz/result')) {
-      counts.result += 1;
-      return { body: args.result() };
-    }
-    if (url.includes('/tests/test_xyz')) {
-      counts.type += 1;
-      return {
-        body: {
-          id: 'test_xyz',
-          projectId: 'p1',
-          name: 'BE test',
-          type: args.type ?? 'backend',
-          createdFrom: 'mcp',
-          status: 'running',
-          createdAt: '2026-05-15T10:00:00.000Z',
-          updatedAt: '2026-05-15T10:00:00.000Z',
-        },
-      };
-    }
-    counts.run += 1;
-    const rs =
-      typeof args.runStatus === 'function' ? args.runStatus() : (args.runStatus ?? 'running');
-    return { body: makeRun(rs) };
-  };
-  return { handler, counts };
-}
-
-describe('runTestWait — backend testId fallback (L1888)', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('passing backend test resolves via testId result (exit 0) + emits advisory', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beWaitRouter({ result: () => makeBeResult({ status: 'passed' }) });
-    const stderr: string[] = [];
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: l => stderr.push(l),
-        sleep: instantSleep,
-      },
-    );
-    expect(result.status).toBe('passed');
-    expect(result.testId).toBe('test_xyz');
-    expect(router.counts.type).toBeGreaterThan(0);
-    expect(router.counts.result).toBeGreaterThan(0);
-    expect(stderr.join(' ')).toContain('test record');
-  });
-
-  it('backend fallback with no URL on either side keeps targetUrl null and omits the text line', async () => {
-    const { credentialsPath } = makeCreds();
-    // Both the run row and the test record report no target URL — the shape a
-    // backend run has (no browser URL to record).
-    const router = beWaitRouter({
-      runStatus: 'running',
-      result: () => makeBeResult({ status: 'passed', targetUrl: null, codeVersion: null }),
-    });
-    const stdoutLines: string[] = [];
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch((url: string) =>
-          url.includes('/runs/run_abc')
-            ? { body: { ...makeRun('running'), targetUrl: null, codeVersion: null } }
-            : router.handler(url),
-        ),
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(result.status).toBe('passed');
-    expect(result.targetUrl).toBeNull();
-    const stdoutBlock = stdoutLines.join('\n');
-    // No dangling "targetUrl" label with an empty value, and no literal "null".
-    expect(stdoutBlock).not.toMatch(/^targetUrl/m);
-    expect(stdoutBlock).not.toContain('null');
-  });
-
-  it('failing backend test resolves via fallback (CLIError exit 1) + testId artifact hint', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beWaitRouter({
-      result: () =>
-        makeBeResult({
-          status: 'failed',
-          failureKind: 'assertion',
-          failedStepIndex: 1,
-          summary: { passed: 0, failed: 1, skipped: 0 },
-        }),
-    });
-    const stderr: string[] = [];
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: l => stderr.push(l),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-    expect(err.name).toBe('CLIError');
-    expect(stderr.join(' ')).toContain('test failure get test_xyz');
-  });
-
-  it('frontend test is untouched — terminal run row resolves with zero testId lookups', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beWaitRouter({
-      type: 'frontend',
-      runStatus: 'passed',
-      result: () => makeBeResult(),
-    });
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(result.status).toBe('passed');
-    expect(router.counts.type).toBe(0);
-    expect(router.counts.result).toBe(0);
-  });
-
-  it('frontend test with a non-terminal tick resolves via the run row, never the result endpoint', async () => {
-    const { credentialsPath } = makeCreds();
-    let runCall = 0;
-    const router = beWaitRouter({
-      type: 'frontend',
-      runStatus: () => (++runCall >= 2 ? 'passed' : 'running'),
-      result: () => makeBeResult(),
-    });
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(result.status).toBe('passed');
-    // The fallback probed the type once (FE) but never read the result endpoint.
-    expect(router.counts.type).toBe(1);
-    expect(router.counts.result).toBe(0);
-  });
-
-  it('a transient type-probe error does not permanently disable the fallback (retries next tick)', async () => {
-    const { credentialsPath } = makeCreds();
-    let typeCalls = 0;
-    const handler = (url: string) => {
-      if (url.includes('/tests/test_xyz/result')) {
-        return { body: makeBeResult({ status: 'passed' }) };
-      }
-      if (url.includes('/tests/test_xyz')) {
-        typeCalls += 1;
-        // First probe 500s (transient); second succeeds as backend.
-        if (typeCalls === 1) return { status: 500, body: { error: { code: 'INTERNAL' } } };
-        return {
-          body: {
-            id: 'test_xyz',
-            projectId: 'p1',
-            name: 'BE',
-            type: 'backend',
-            createdFrom: 'mcp',
-            status: 'running',
-            createdAt: '2026-05-15T10:00:00.000Z',
-            updatedAt: '2026-05-15T10:00:00.000Z',
-          },
-        };
-      }
-      return { body: makeRun('running') };
-    };
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(handler),
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    // Despite the first probe failing, a later tick re-probed → backend → resolved.
-    expect(result.status).toBe('passed');
-    expect(typeCalls).toBeGreaterThanOrEqual(2);
-  });
-
-  it('rejects a stale prior-run verdict, then accepts the matching one', async () => {
-    const { credentialsPath } = makeCreds();
-    let call = 0;
-    const router = beWaitRouter({
-      result: () => {
-        call += 1;
-        // First result names a DIFFERENT run (stale) → must be rejected; the
-        // next names this run → accepted.
-        return call === 1
-          ? makeBeResult({ status: 'passed', runIdIfAvailable: 'run_OLD' })
-          : makeBeResult({ status: 'passed', runIdIfAvailable: 'run_abc' });
-      },
-    });
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(router.handler),
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(result.status).toBe('passed');
-    expect(router.counts.result).toBeGreaterThanOrEqual(2);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Fix 3 — D4: RequestTimeoutError under test wait emits partial stdout + exit 7
-// ---------------------------------------------------------------------------
-
-describe('runTestWait: Fix 3 — RequestTimeoutError writes partial JSON to stdout', () => {
-  it('exit 7 AND stdout contains {runId, status:"running"} when poll throws RequestTimeoutError', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl: typeof globalThis.fetch = async () => {
-      throw new RequestTimeoutError(120000, 'req_timeout_wait_test');
-    };
-
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    await expect(
-      runTestWait(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          runId: 'run_abc',
-          timeoutSeconds: 600,
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: line => stdoutLines.push(line),
-          stderr: line => stderrLines.push(line),
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 7 });
-
-    // Stdout must contain the partial object with runId + status:"running"
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-      runId: string;
-      status: string;
-    };
-    expect(stdoutJson.runId).toBe('run_abc');
-    expect(stdoutJson.status).toBe('running');
-
-    // Stderr should mention the runId and suggest test wait
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toContain('run_abc');
-    expect(stderrBlock).toContain('test wait');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// RATE_LIMITED during test wait polling — partial stdout + honest hint, exit
-// 11 kept (never reclassified to 7). The 429 must be a real HTTP response
-// (not thrown directly) so it exercises http.ts's own RATE_LIMITED
-// retry-then-throw path (MAX_ATTEMPTS_RATE_LIMITED = 3).
-// ---------------------------------------------------------------------------
-
-function rateLimitedResponse(retryAfterSeconds?: number): Response {
-  return new Response(
-    JSON.stringify({
-      error: {
-        code: 'RATE_LIMITED',
-        message: 'Run trigger rate limit exceeded: too many requests from this IP.',
-        nextAction: '',
-        requestId: 'req_rl_wait_test',
-        details: {},
-      },
+    status,
+  );
+const snapshot = (id: string, status = 'finished', statuses = ['PASSED']) => ({
+  run: {
+    runId: id,
+    status,
+    cancelled: false,
+    projectId: 'p1',
+    created: '2026-11-15T00:00:00Z',
+    modified: '2026-11-15T00:00:00Z',
+    targetUrl: null,
+    dashboardUrl: 'https://portal.example/run',
+  },
+  results: statuses.map((testStatus, index) =>
+    resultLine({
+      resultId: `${id}-${index}`,
+      runId: id,
+      caseKey: `case-${index}`,
+      testStatus,
+      created: `2026-11-15T00:00:0${index}Z`,
     }),
-    {
-      status: 429,
-      headers: {
-        'content-type': 'application/json',
-        ...(retryAfterSeconds !== undefined ? { 'retry-after': String(retryAfterSeconds) } : {}),
-      },
+  ),
+});
+type Answer = Response | 'hang' | 'request-timeout';
+function harness(
+  answer: (id: string, n: number, init: RequestInit) => Answer = id => json(snapshot(id)),
+) {
+  const calls: Array<{ id: string; query: URLSearchParams }> = [];
+  const counts = new Map<string, number>();
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const shutdown = new ShutdownController();
+  const deps = {
+    env: { TESTSPRITE_API_KEY: 'sk-user-test', TESTSPRITE_API_URL: 'https://api.example.com' },
+    shutdown,
+    stdout: (s: string) => stdout.push(s),
+    stderr: (s: string) => stderr.push(s),
+    fetchImpl: async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      const url = new URL(
+        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
+      );
+      if (init.method !== 'GET' || !url.pathname.endsWith('/results'))
+        throw new Error(`unexpected request ${url}`);
+      const id = url.searchParams.get('run')!;
+      const n = (counts.get(id) ?? 0) + 1;
+      counts.set(id, n);
+      calls.push({ id, query: url.searchParams });
+      const value = answer(id, n, init);
+      if (value === 'request-timeout') throw new RequestTimeoutError(1000, 'request');
+      if (value === 'hang')
+        return new Promise<Response>((_resolve, reject) => {
+          if (init.signal?.aborted) reject(init.signal.reason);
+          else
+            init.signal?.addEventListener('abort', () => reject(init.signal!.reason), {
+              once: true,
+            });
+        });
+      return value;
     },
-  );
+  };
+  return {
+    calls,
+    counts,
+    stdout,
+    stderr,
+    shutdown,
+    deps,
+    wait: (ids = ['e1'], extra: Partial<Parameters<typeof runTestWait>[0]> = {}) =>
+      runTestWait(
+        {
+          profile: 'default',
+          debug: false,
+          output: 'json',
+          runIds: ids,
+          timeoutSeconds: 6,
+          ...extra,
+        },
+        deps,
+      ),
+    doc: () => JSON.parse(stdout.join('\n')),
+  };
+}
+async function clock<T>(work: () => Promise<T>): Promise<T> {
+  return onFakeTimers(async () => {
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => vi.getMockedSystemTime()!.getTime());
+    try {
+      return await work();
+    } finally {
+      now.mockRestore();
+    }
+  });
 }
 
-describe('runTestWait: RATE_LIMITED writes partial JSON to stdout, keeps exit 11', () => {
-  it('exit 11 (NOT reclassified to 7) AND stdout contains {runId, status:"running"} when poll exhausts RATE_LIMITED retries', async () => {
-    const { credentialsPath } = makeCreds();
-    // retry-after: 0 keeps http.ts's internal retry-then-throw budget fast.
-    const fetchImpl: typeof globalThis.fetch = async () => rateLimitedResponse(0);
-
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('RATE_LIMITED');
-    expect((err as ApiError).exitCode).toBe(11);
-
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
-    expect(stdoutJson.runId).toBe('run_abc');
-    expect(stdoutJson.status).toBe('running');
-
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toContain('run_abc');
-    expect(stderrBlock).toContain('test wait');
-    expect(stderrBlock).toContain('test cancel');
-    expect(stderrBlock).toContain('Rate limited');
+describe('run wait: native run snapshots', () => {
+  it('requests every status including cancelled without polling result cards', async () => {
+    const h = harness();
+    await h.wait();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]!.query.get('status')).toBe('passed,failed,running,blocked,cancelled');
+    expect(h.calls[0]!.query.has('waitSeconds')).toBe(false);
   });
-
-  it('text mode: renders human-readable partial (not raw JSON), still exit 11', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl: typeof globalThis.fetch = async () => rateLimitedResponse(0);
-
-    const stdoutLines: string[] = [];
-
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-
-    expect((err as ApiError).exitCode).toBe(11);
-    const stdoutBlock = stdoutLines.join('\n');
-    expect(stdoutBlock).toContain('runId');
-    expect(stdoutBlock).toContain('running');
-    expect(stdoutBlock).not.toMatch(/^\{/);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// TimeoutError on test wait: partial stdout + exit 7
-// ---------------------------------------------------------------------------
-
-describe('runTestWait: TimeoutError writes partial JSON to stdout', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    logSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('running') }));
-
-    let callCount = 0;
-    const base = Date.now();
-    const realDateNow = Date.now;
-    Date.now = () => (callCount++ > 4 ? base + 2000 : base);
-
-    try {
-      const stdoutLines: string[] = [];
-      const stderrLines: string[] = [];
-
-      await expect(
-        runTestWait(
-          {
-            profile: 'default',
-            output: 'json',
-            debug: false,
-            dryRun: false,
-            runId: 'run_abc',
-            timeoutSeconds: 1,
-          },
-          {
-            credentialsPath,
-            fetchImpl,
-            stdout: line => stdoutLines.push(line),
-            stderr: line => stderrLines.push(line),
-            sleep: instantSleep,
-          },
-        ),
-      ).rejects.toMatchObject({ exitCode: 7 });
-
-      const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-        runId: string;
-        status: string;
-      };
-      expect(stdoutJson.runId).toBe('run_abc');
-      expect(stdoutJson.status).toBe('running');
-    } finally {
-      Date.now = realDateNow;
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Network outage mid-wait (#437), on the real HttpClient with fake timers
-// ---------------------------------------------------------------------------
-
-describe('runTestWait: network outage mid-wait', () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  const jsonRunResponse = (status: RunResponse['status']): Response =>
-    new Response(JSON.stringify(makeRun(status)), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
+  it('prints native run and result identities and server metadata', async () => {
+    const h = harness();
+    await h.wait();
+    expect(h.doc().results).toEqual([
+      expect.objectContaining({
+        runId: 'e1',
+        resultId: 'e1-0',
+        testId: 'case-0',
+        title: 'Test case-0',
+        status: 'passed',
+      }),
+    ]);
+    expect(h.doc().runs[0]).toMatchObject({
+      runId: 'e1',
+      status: 'finished',
+      dashboardUrl: 'https://portal.example/run',
     });
-
-  it('waits out an outage longer than two transport-retry bursts and prints the verdict (exit 0)', async () => {
-    vi.useFakeTimers();
-    const { credentialsPath } = makeCreds();
-    // Fetch 1 answers (the endpoint is proven); fetches 2-9 are a dead network,
-    // two full http.ts bursts of 4 attempts, which ended the wait with exit 10
-    // before; fetch 10 is the verdict.
-    let fetchCalls = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
-      fetchCalls += 1;
-      if (fetchCalls > 1 && fetchCalls <= 9) throw new TypeError('fetch failed');
-      return jsonRunResponse(fetchCalls === 1 ? 'running' : 'passed');
-    };
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    const pending = runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        verbose: true,
-        runId: 'run_abc',
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-      },
-    );
-    await vi.advanceTimersByTimeAsync(60_000);
-    const result = await pending;
-
-    expect(result.status).toBe('passed');
-    expect(fetchCalls).toBe(10);
-    expect(JSON.parse(stdoutLines.join('\n'))).toMatchObject({
-      runId: 'run_abc',
-      status: 'passed',
+    expect(h.doc().summary).toEqual({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      timedOut: 0,
+      skipped: 0,
     });
-    const stderr = stderrLines.join('\n');
-    expect(stderr).toContain(
-      '[verbose] Cannot reach the TestSprite API (fetch failed); run run_abc keeps executing server-side.',
-    );
-    expect(stderr).toMatch(/\[verbose\] Reconnected after \d+s; still waiting for run run_abc/);
   });
-
-  it('exits 10 with {runId, status} on stdout when the outage outlasts --timeout', async () => {
-    vi.useFakeTimers();
-    const { credentialsPath } = makeCreds();
-    let fetchCalls = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
-      fetchCalls += 1;
-      if (fetchCalls > 1) throw new TypeError('fetch failed');
-      return jsonRunResponse('running');
-    };
-    const stdoutLines: string[] = [];
-
-    const pending = runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 30,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
-    ).catch((caught: unknown) => caught);
-    await vi.advanceTimersByTimeAsync(60_000);
-
-    const caught = await pending;
-    expect(caught).toBeInstanceOf(ApiError);
-    expect(caught).toMatchObject({
-      code: 'UNAVAILABLE',
-      exitCode: 10,
-      details: { runId: 'run_abc', timeoutSeconds: 30 },
-    });
-    expect((caught as ApiError).nextAction).toContain('testsprite test wait run_abc');
-    expect(JSON.parse(stdoutLines.join('\n'))).toEqual({ runId: 'run_abc', status: 'running' });
-  });
-
-  it('fails fast with exit 10 when the first read cannot reach the API (first contact)', async () => {
-    vi.useFakeTimers();
-    const { credentialsPath } = makeCreds();
-    let fetchCalls = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
-      fetchCalls += 1;
-      throw new TypeError('fetch failed');
-    };
-    const stdoutLines: string[] = [];
-
-    const pending = runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 600,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
-    ).catch((caught: unknown) => caught);
-    await vi.advanceTimersByTimeAsync(60_000);
-
-    expect(await pending).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
-    // Two http.ts transport-retry bursts of 4 attempts, then the error: no
-    // waiting out, and no partial, since the run was never read.
-    expect(fetchCalls).toBe(8);
-    expect(stdoutLines).toEqual([]);
-  });
-
-  it('aborts a long-poll read that never answers after 45s and reconnects, instead of waiting ~300s', async () => {
-    vi.useFakeTimers();
-    const { credentialsPath } = makeCreds();
-    // Poll read 1 answers; poll read 2 is a dead socket (no answer, no error)
-    // until its signal aborts; poll read 3, on a fresh connection, is the
-    // verdict. Other requests (the backend-result lookup) answer normally.
-    let pollReads = 0;
-    let secondReadAbortedAtMs: number | undefined;
-    const startMs = Date.now();
-    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
-      const url = input instanceof Request ? input.url : String(input);
-      if (!url.includes('/runs/run_abc')) return jsonRunResponse('running');
-      pollReads += 1;
-      if (pollReads === 2) {
-        return new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener(
-            'abort',
-            () => {
-              secondReadAbortedAtMs = Date.now() - startMs;
-              reject(init.signal!.reason);
-            },
-            { once: true },
-          );
-        });
-      }
-      return jsonRunResponse(pollReads === 1 ? 'running' : 'passed');
-    };
-    const stderrLines: string[] = [];
-
-    const pending = runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        verbose: true,
-        runId: 'run_abc',
-        timeoutSeconds: 600,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
-    );
-    await vi.advanceTimersByTimeAsync(60_000);
-    const result = await pending;
-
-    expect(result.status).toBe('passed');
-    expect(pollReads).toBe(3);
-    // Read 2 starts at 2s (the long-poll floor after an instant answer) and is
-    // aborted 45s later.
-    expect(secondReadAbortedAtMs).toBe(47_000);
-    expect(stderrLines.join('\n')).toContain(
-      '[verbose] Cannot reach the TestSprite API (no answer for 45s); run run_abc keeps executing server-side.',
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// FIX 4 — D5-UX: text mode shows the `error` string for failed/blocked runs
-// ---------------------------------------------------------------------------
-describe('[fix-4-ux] runTestWait — text mode shows error string for failed/blocked runs', () => {
-  it('failed run with error string renders "error <msg>" line in text mode', async () => {
-    const { credentialsPath } = makeCreds();
-    const run: RunResponse = {
-      ...makeRun('failed'),
-      failureKind: 'assertion',
-      error: 'Element not found: .checkout-button',
-    };
-    const stdoutLines: string[] = [];
-
-    const fetchImpl = makeFetch(() => ({ body: run }));
-
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(() => {
-      // exit 1 (failed run) — we only care about stdout
-    });
-
-    const stdoutBlock = stdoutLines.join('\n');
-    // Must include the error line
-    expect(stdoutBlock).toContain('error');
-    expect(stdoutBlock).toContain('Element not found: .checkout-button');
-  });
-
-  it('failed run with multi-line error shows first line truncated to 200 chars', async () => {
-    const { credentialsPath } = makeCreds();
-    const longFirstLine = 'A'.repeat(250);
-    const run: RunResponse = {
-      ...makeRun('failed'),
-      failureKind: 'assertion',
-      error: `${longFirstLine}\nsecond line`,
-    };
-    const stdoutLines: string[] = [];
-
-    const fetchImpl = makeFetch(() => ({ body: run }));
-
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(() => {
-      // exit 1
-    });
-
-    const stdoutBlock = stdoutLines.join('\n');
-    // First line truncated to 200 chars + ellipsis
-    expect(stdoutBlock).toContain('error');
-    expect(stdoutBlock).toContain('A'.repeat(200));
-    expect(stdoutBlock).toContain('…');
-    // Second line should NOT appear
-    expect(stdoutBlock).not.toContain('second line');
-  });
-
-  it('passed run with null error does NOT render error line', async () => {
-    const { credentialsPath } = makeCreds();
-    const run: RunResponse = { ...makeRun('passed'), error: null };
-    const stdoutLines: string[] = [];
-
-    const fetchImpl = makeFetch(() => ({ body: run }));
-
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-
-    const stdoutBlock = stdoutLines.join('\n');
-    // Must NOT include an "error" line for a passing run
-    expect(stdoutBlock).not.toMatch(/^error\s+/m);
-  });
-
-  it('run with targetUrl: null completes normally and omits the targetUrl line in text mode', async () => {
-    const { credentialsPath } = makeCreds();
-    // A backend run (and every V3-executed run) reports no target URL; those
-    // rows also report no codeVersion when the test has no stored code body.
-    const run: RunResponse = { ...makeRun('passed'), targetUrl: null, codeVersion: null };
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    const fetchImpl = makeFetch(() => ({ body: run }));
-
-    const result = await runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-
-    // Resolves (exit 0) instead of raising a response-validation INTERNAL.
-    expect(result.status).toBe('passed');
-    const stdoutBlock = stdoutLines.join('\n');
-    expect(stdoutBlock).toMatch(/^status\s+passed$/m);
-    // Absent fields are omitted, never printed as the literal "null".
-    expect(stdoutBlock).not.toMatch(/^targetUrl/m);
-    expect(stdoutBlock).not.toMatch(/^codeVersion/m);
-    expect(stdoutBlock).not.toContain('null');
-    expect(stderrLines.join('\n')).not.toContain('INTERNAL');
-  });
-
-  it('run with targetUrl: null passes the null through the JSON envelope', async () => {
-    const { credentialsPath } = makeCreds();
-    const run: RunResponse = { ...makeRun('passed'), targetUrl: null, codeVersion: null };
-    const stdoutLines: string[] = [];
-
-    const fetchImpl = makeFetch(() => ({ body: run }));
-
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-
-    const parsed = JSON.parse(stdoutLines.join('')) as RunResponse;
-    expect(parsed.status).toBe('passed');
-    expect(parsed.targetUrl).toBeNull();
-    expect(parsed.codeVersion).toBeNull();
-  });
-
-  it('JSON mode does NOT change: error field passes through wire envelope unchanged', async () => {
-    const { credentialsPath } = makeCreds();
-    const run: RunResponse = {
-      ...makeRun('failed'),
-      failureKind: 'assertion',
-      error: 'Something went wrong',
-    };
-    const stdoutLines: string[] = [];
-
-    const fetchImpl = makeFetch(() => ({ body: run }));
-
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(() => {
-      // exit 1
-    });
-
-    // JSON mode: parse stdout and verify error field is present
-    const parsed = JSON.parse(stdoutLines.join('')) as RunResponse;
-    expect(parsed.error).toBe('Something went wrong');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// dashboardUrl on terminal output (colleague feedback 2026-06-10) — the
-// GET /runs/{runId} wire row carries projectId+testId, so `test wait`
-// closes with a Portal deep link on known API hosts.
-// ---------------------------------------------------------------------------
-
-describe('runTestWait — dashboardUrl on terminal output', () => {
-  it('JSON mode (prod endpoint): terminal envelope includes dashboardUrl', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const fetchImpl = makeFetch(() => ({ body: makeRun('passed') }));
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-    );
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.dashboardUrl).toBe(
-      'https://www.testsprite.com/dashboard/tests/project_1/test/test_xyz',
-    );
-  });
-
-  it('text mode (TESTSPRITE_PORTAL_URL override): card ends with the overridden dashboard line', async () => {
-    vi.stubEnv('TESTSPRITE_PORTAL_URL', 'https://portal.internal.example.com');
-    try {
-      const { credentialsPath } = makeCreds('sk-user-test', 'https://api.example.com:8443');
-      const fetchImpl = makeFetch(() => ({ body: makeRun('passed') }));
-      const stdout: string[] = [];
-      await runTestWait(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          runId: 'run_abc',
-          timeoutSeconds: 60,
-        },
-        { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-      );
-      expect(stdout.join('\n')).toContain(
-        'dashboard   https://portal.internal.example.com/dashboard/tests/project_1/test/test_xyz',
-      );
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
-
-  it('unknown API host (localhost): no dashboardUrl field', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('passed') }));
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-    );
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.dashboardUrl).toBeUndefined();
-  });
-
-  // A server-sent link supersedes the client computation, because the server
-  // knows which STORE answered the read and the client does not: a V3-served
-  // run's page is a different route family, and the `/dashboard/tests/…` route
-  // the client templates reads DynamoDB only — for a V3-native project there is
-  // no row there at all, so the client's link cannot render.
-  it('server-sent dashboardUrl wins over the client computation', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const serverUrl =
-      'https://www.testsprite.com/dashboard-v3/o/org-1/projects/project_1/test-cases/test_xyz';
-    const fetchImpl = makeFetch(() => ({
-      body: { ...makeRun('passed'), dashboardUrl: serverUrl },
-    }));
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-    );
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.dashboardUrl).toBe(serverUrl);
-  });
-
-  // An explicit `null` is the server saying "no correct link exists for this
-  // run" (e.g. the workspace-scoped page isn't served by this environment's
-  // portal build yet). Falling back to the client guess there would put back
-  // exactly the broken link the server declined to send.
-  it('server dashboardUrl:null suppresses the link — the client guess is NOT substituted', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const fetchImpl = makeFetch(() => ({ body: { ...makeRun('passed'), dashboardUrl: null } }));
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-    );
-    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(printed.dashboardUrl).toBeUndefined();
-  });
-
-  it('text mode: a server link renders on the card in place of the client shape', async () => {
-    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const serverUrl =
-      'https://www.testsprite.com/dashboard-v3/o/org-1/projects/project_1/test-cases/test_xyz';
-    const fetchImpl = makeFetch(() => ({
-      body: { ...makeRun('passed'), dashboardUrl: serverUrl },
-    }));
-    const stdout: string[] = [];
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
-    );
-    const out = stdout.join('\n');
-    expect(out).toContain(`dashboard   ${serverUrl}`);
-    expect(out).not.toContain('/dashboard/tests/');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Graceful detach on SIGINT/SIGTERM during test wait
-// ---------------------------------------------------------------------------
-
-describe('runTestWait — InterruptError graceful detach', () => {
-  function hangingFetch(): typeof globalThis.fetch {
-    return (async (_input: FetchInput, init: RequestInit = {}) => {
-      return new Promise<Response>((_resolve, reject) => {
-        const signal = init.signal;
-        const rejectWithReason = (): void => {
-          const reason: unknown = signal?.reason;
-          reject(reason instanceof Error ? reason : new Error('aborted'));
-        };
-        if (signal?.aborted) {
-          rejectWithReason();
-          return;
-        }
-        signal?.addEventListener('abort', rejectWithReason, { once: true });
+  it("prints each run's Dashboard link under its results in the text card", async () => {
+    const h = harness((id: string) => {
+      const body = snapshot(id);
+      return json({
+        ...body,
+        run: { ...body.run, dashboardUrl: `https://portal.example/run/${id}` },
       });
-    }) as typeof globalThis.fetch;
-  }
-
-  it('emits partial JSON to stdout, honest billing line to stderr, rethrows exit 130', async () => {
-    const { credentialsPath } = makeCreds();
-    const shutdown = new ShutdownController();
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    const pending = runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl: hangingFetch(),
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-        shutdown,
-      },
-    );
-    // Simulate Ctrl-C while the long-poll fetch is in flight.
-    setTimeout(() => shutdown.interrupt('SIGINT'), 5);
-
-    const err = await pending.catch(e => e);
-    expect(err).toBeInstanceOf(InterruptError);
-    expect((err as InterruptError).exitCode).toBe(130);
-    expect((err as InterruptError).signal).toBe('SIGINT');
-
-    // Stdout stays parseable and carries the runId for re-attach.
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
-    expect(stdoutJson.runId).toBe('run_abc');
-    expect(stdoutJson.status).toBe('running');
-
-    // The honest line: run keeps executing AND billing; re-attach hint.
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toContain('Interrupted (SIGINT)');
-    expect(stderrBlock).toContain('billing');
-    expect(stderrBlock).toContain('testsprite test wait run_abc');
-  });
-
-  it('SIGTERM maps to exit 143', async () => {
-    const { credentialsPath } = makeCreds();
-    const shutdown = new ShutdownController();
-    const pending = runTestWait(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 600,
-      },
-      {
-        credentialsPath,
-        fetchImpl: hangingFetch(),
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-        shutdown,
-      },
-    );
-    setTimeout(() => shutdown.interrupt('SIGTERM'), 5);
-    const err = await pending.catch(e => e);
-    expect(err).toBeInstanceOf(InterruptError);
-    expect((err as InterruptError).exitCode).toBe(143);
-  });
-
-  it('arms the shutdown scope during the wait and disarms after a terminal result', async () => {
-    const { credentialsPath } = makeCreds();
-    const shutdown = new ShutdownController();
-    const fetchImpl = makeFetch(() => ({ body: makeRun('passed') }));
-    await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-        shutdown,
-      },
-    );
-    expect(shutdown.isArmed).toBe(false); // disarmed after the poll completes
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Progress line shape at the call site (TTY + NO_COLOR, so the ticker writes
-// plain lines through the injectable `stderr` and the 1s refresher — which
-// only makes sense for an in-place redraw — must stay unarmed)
-// ---------------------------------------------------------------------------
-
-describe('test wait — stderr progress line', () => {
-  it('shows the recorded step count with no denominator, and arms no refresher under NO_COLOR', async () => {
-    const isTTYDescriptor = Object.getOwnPropertyDescriptor(process.stderr, 'isTTY');
-    const priorNoColor = process.env.NO_COLOR;
-    Object.defineProperty(process.stderr, 'isTTY', { value: true, configurable: true });
-    process.env.NO_COLOR = '1';
-    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
-    try {
-      const { credentialsPath } = makeCreds();
-      const stderrLines: string[] = [];
-      let polls = 0;
-      const fetchImpl = makeFetch(() => {
-        polls++;
-        if (polls === 1) {
-          return {
-            body: {
-              ...makeRun('running'),
-              stepSummary: { total: 2, completed: 2, passedCount: 2, failedCount: 0 },
-            },
-          };
-        }
-        return { body: makeRun('passed') };
-      });
-      await runTestWait(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          runId: 'run_abc',
-          timeoutSeconds: 60,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => {},
-          stderr: line => stderrLines.push(line),
-          sleep: instantSleep,
-        },
-      );
-      const progress = stderrLines.filter(l => l.includes('Run run_abc —'));
-      expect(progress.length).toBeGreaterThanOrEqual(2);
-      expect(progress[0]).toMatch(/Run run_abc — running · 2 steps · \d+s$/);
-      expect(progress.at(-1)).toMatch(/Run run_abc — passed · 5 steps · \d+s$/);
-      expect(progress.every(l => !/\d+\/\d+ step/.test(l))).toBe(true);
-      expect(setIntervalSpy).not.toHaveBeenCalled();
-    } finally {
-      setIntervalSpy.mockRestore();
-      if (priorNoColor === undefined) delete process.env.NO_COLOR;
-      else process.env.NO_COLOR = priorNoColor;
-      if (isTTYDescriptor) Object.defineProperty(process.stderr, 'isTTY', isTTYDescriptor);
-      else delete (process.stderr as { isTTY?: boolean }).isTTY;
-    }
-  });
-});
-
-describe('runTestWait — failure recovery hint for a run that is terminal on the first poll', () => {
-  // Backend run rows finalize server-side, so the wait fallback (which already
-  // knew the type) rarely fires; the run row itself comes back failed/blocked.
-  async function waitTerminal(args: {
-    output: 'text' | 'json';
-    runStatus: RunResponse['status'];
-    type?: string;
-    typeLookupFails?: boolean;
-  }) {
-    const { credentialsPath } = makeCreds();
-    const router = beWaitRouter({
-      type: args.type,
-      runStatus: args.runStatus,
-      result: () => makeBeResult(),
     });
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: args.output,
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(url =>
-          args.typeLookupFails && /\/tests\/test_xyz(\?|$)/.test(url)
-            ? errorBody('INTERNAL')
-            : router.handler(url),
+    await h.wait(['e1', 'e2'], { output: 'text' });
+    expect(h.stdout.join('\n').split('\n')).toEqual([
+      'Run e1',
+      '  e1-0  Test case-0  passed',
+      '  Dashboard: https://portal.example/run/e1',
+      'Run e2',
+      '  e2-0  Test case-0  passed',
+      '  Dashboard: https://portal.example/run/e2',
+      '2/2 passed, 0 failed, 0 timed out',
+    ]);
+  });
+  it('prints no Dashboard line for a run the server gave no link', async () => {
+    const h = harness((id: string) => {
+      const body = snapshot(id);
+      return json({ ...body, run: { ...body.run, dashboardUrl: null } });
+    });
+    await h.wait(['e1'], { output: 'text' });
+    expect(h.stdout.join('\n').split('\n')).toEqual([
+      'Run e1',
+      '  e1-0  Test case-0  passed',
+      '1/1 passed, 0 failed, 0 timed out',
+    ]);
+  });
+  it('previews each distinct read without fetching or simulating a verdict', async () => {
+    const h = harness();
+    await h.wait(['r/1', 'r/1', 'two'], { dryRun: true });
+    expect(h.calls).toHaveLength(0);
+    expect(h.doc()).toMatchObject({
+      dryRun: true,
+      runs: [],
+      results: [],
+      requests: [
+        {
+          method: 'GET',
+          path: '/api/cli/v1/results?run=r%2F1&status=passed,failed,running,blocked,cancelled',
+        },
+        {
+          method: 'GET',
+          path: '/api/cli/v1/results?run=two&status=passed,failed,running,blocked,cancelled',
+        },
+      ],
+      summary: { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0 },
+    });
+    expect(h.doc().summary).not.toHaveProperty('results');
+  });
+  it('keeps input run order and deduplicates repeated runs', async () => {
+    const h = harness();
+    await h.wait(['e2', 'e1', 'e2']);
+    expect(h.calls.map(c => c.id)).toEqual(['e2', 'e1']);
+    expect(h.doc().runs.map((r: { runId: string }) => r.runId)).toEqual(['e2', 'e1']);
+  });
+  it('renders every result under its run in text', async () => {
+    const h = harness(id => json(snapshot(id, 'finished', ['PASSED', 'PASSED'])));
+    await h.wait(['e1'], { output: 'text' });
+    expect(h.stdout.join('')).toContain(
+      'Run e1\n  e1-0  Test case-0  passed\n  e1-1  Test case-1  passed',
+    );
+  });
+  it('retains a result whose case key is unknown without inventing a test ID', async () => {
+    const body = snapshot('e1');
+    body.results[0]!.caseKey = null;
+    const h = harness(() => json(body));
+    const result = await h.wait();
+    expect(result.results[0]).not.toHaveProperty('testId');
+  });
+  it('allows a finished run with no results', async () => {
+    const h = harness(id => json(snapshot(id, 'finished', [])));
+    expect((await h.wait()).summary.total).toBe(0);
+  });
+  it('does not finish when all unit results pass before integration is added', () =>
+    clock(async () => {
+      const h = harness((id, n) =>
+        json(
+          snapshot(id, n < 3 ? 'running' : 'finished', n < 3 ? ['PASSED'] : ['PASSED', 'PASSED']),
         ),
-        stdout: line => stdout.push(line),
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    const hint = stderr.find(line => line.startsWith('Run finished')) ?? '';
-    return { err, hint, stdout, counts: router.counts };
-  }
-
-  it.each(['failed', 'blocked'] as const)(
-    'JSON: a %s backend run points at test failure get <test-id> (one type lookup)',
-    async runStatus => {
-      const { err, hint, counts } = await waitTerminal({ output: 'json', runStatus });
-      expect(err.exitCode).toBe(1);
-      expect(hint).toContain(`status: ${runStatus}`);
-      expect(hint).toContain("'testsprite test failure get test_xyz'");
-      expect(hint).not.toContain('artifact get');
-      expect(counts.type).toBe(1);
+      );
+      expect((await h.wait(['e1'], { timeoutSeconds: 20 })).summary.total).toBe(2);
+      expect(h.counts.get('e1')).toBe(3);
+    }));
+  it('does not finish a running run with no result rows', () =>
+    clock(async () => {
+      const h = harness((id, n) =>
+        json(snapshot(id, n === 1 ? 'running' : 'finished', n === 1 ? [] : ['PASSED'])),
+      );
+      expect((await h.wait()).summary.passed).toBe(1);
+      expect(h.calls).toHaveLength(2);
+    }));
+  it.each(['FAILED', 'BLOCKED', 'CANCELLED'])('fails a terminal %s result', async status => {
+    const h = harness(id => json(snapshot(id, 'finished', [status])));
+    await expect(h.wait()).rejects.toMatchObject({ exitCode: 1 });
+    expect(h.doc().results[0].status).toBe(status.toLowerCase());
+    expect(h.doc()).not.toHaveProperty('partial');
+  });
+  it.each([[], ['PASSED']])(
+    'fails run cancellation independently of result verdicts: %j',
+    async (...statuses) => {
+      const body = snapshot('e1', 'finished', statuses as string[]);
+      body.run.cancelled = true;
+      const h = harness(() => json(body));
+      await expect(h.wait()).rejects.toMatchObject({ exitCode: 1 });
+      expect(h.doc().runs[0].cancelled).toBe(true);
     },
   );
-
-  it('JSON: text and JSON now give the same hint for the same failed backend run', async () => {
-    const text = await waitTerminal({ output: 'text', runStatus: 'failed' });
-    const json = await waitTerminal({ output: 'json', runStatus: 'failed' });
-    expect(json.hint).toBe(text.hint);
-  });
-
-  it('JSON: stdout is still the run row verbatim — the lookup only feeds the stderr hint', async () => {
-    const { stdout } = await waitTerminal({ output: 'json', runStatus: 'failed' });
-    expect(JSON.parse(stdout.join('\n'))).toMatchObject(makeRun('failed'));
-  });
-
-  it('JSON: a passed run makes no type lookup', async () => {
-    const { err, counts } = await waitTerminal({ output: 'json', runStatus: 'passed' });
-    expect(err.status).toBe('passed');
-    expect(counts.type).toBe(0);
-  });
-
-  it('JSON: a failed frontend run keeps the run-scoped artifact hint', async () => {
-    const { hint, counts } = await waitTerminal({
-      output: 'json',
-      runStatus: 'failed',
-      type: 'frontend',
+  it('refuses an older server with no authoritative run state', async () => {
+    const h = harness(id => json({ results: snapshot(id).results }));
+    await expect(h.wait()).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      exitCode: 7,
+      details: { reason: 'run_status_missing' },
     });
-    expect(hint).toContain("'testsprite test artifact get run_abc'");
-    expect(counts.type).toBe(1);
   });
+});
 
-  it('JSON: a rate-limited type lookup is tried once, never retried, and falls back', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beWaitRouter({ runStatus: 'failed', result: () => makeBeResult() });
-    let lookups = 0;
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(url => {
-          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
-            lookups += 1;
-            return errorBody('RATE_LIMITED');
-          }
-          return router.handler(url);
-        }),
-        stdout: line => stdout.push(line),
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(lookups).toBe(1);
-    expect(err.exitCode).toBe(1);
-    expect(JSON.parse(stdout.join('\n'))).toMatchObject({ runId: 'run_abc', status: 'failed' });
-    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
-      "'testsprite test artifact get run_abc'",
-    );
-  });
-
-  it('JSON: a 5xx type lookup is tried once, not retried, and falls back', async () => {
-    const { credentialsPath } = makeCreds();
-    const router = beWaitRouter({ runStatus: 'failed', result: () => makeBeResult() });
-    let lookups = 0;
-    const stderr: string[] = [];
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(url => {
-          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
-            lookups += 1;
-            return errorBody('INTERNAL');
-          }
-          return router.handler(url);
-        }),
-        stdout: () => {},
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(lookups).toBe(1);
-    expect(err.exitCode).toBe(1);
-    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
-      "'testsprite test artifact get run_abc'",
-    );
-  });
-
-  it('reuses the backend type found while polling when the hint lookup later fails', async () => {
-    // Poll 1: run row still running → the BE fallback probes the type (backend)
-    // but the testId result is not ready. Poll 2: the run row is failed. The
-    // hint's own lookup then fails, yet the type is already known.
-    const { credentialsPath } = makeCreds();
-    let polls = 0;
-    let typeReads = 0;
-    const stderr: string[] = [];
-    const err = await runTestWait(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runId: 'run_abc',
-        timeoutSeconds: 60,
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(url => {
-          if (url.includes('/tests/test_xyz/result')) return errorBody('NOT_FOUND');
-          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
-            typeReads += 1;
-            return typeReads === 1
-              ? {
-                  body: {
-                    id: 'test_xyz',
-                    projectId: 'p1',
-                    name: 'BE test',
-                    type: 'backend',
-                    createdFrom: 'mcp',
-                    status: 'running',
-                    createdAt: '2026-05-15T10:00:00.000Z',
-                    updatedAt: '2026-05-15T10:00:00.000Z',
-                  },
-                }
-              : errorBody('INTERNAL');
-          }
-          polls += 1;
-          return { body: makeRun(polls === 1 ? 'running' : 'failed') };
-        }),
-        stdout: () => {},
-        stderr: line => stderr.push(line),
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
-      "'testsprite test failure get test_xyz'",
-    );
-    // The polled type was reused: no second lookup for the hint.
-    expect(typeReads).toBe(1);
-  });
-
-  it('JSON: a type lookup that never answers is abandoned at its deadline', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    try {
-      const { credentialsPath } = makeCreds();
-      const router = beWaitRouter({ runStatus: 'failed', result: () => makeBeResult() });
-      const stderr: string[] = [];
-      const answer = makeFetch(router.handler);
-      const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
-        const url =
-          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-        if (!/\/tests\/test_xyz(\?|$)/.test(url)) return answer(input, init);
-        // Hang until the caller aborts — the shape of a stalled lookup.
-        return new Promise<Response>((_resolve, reject) => {
-          init.signal?.addEventListener('abort', () =>
-            reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
-          );
-        });
-      }) as typeof globalThis.fetch;
-      const pending = runTestWait(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          runId: 'run_abc',
-          timeoutSeconds: 60,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => {},
-          stderr: l => stderr.push(l),
-          sleep: instantSleep,
-        },
-      ).catch(e => e);
-      await vi.advanceTimersByTimeAsync(RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS);
-      const err = await pending;
-      expect(err.exitCode).toBe(1);
-      expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
-        "'testsprite test artifact get run_abc'",
+describe('run wait: shared deadlines and partial output', () => {
+  it('keeps passed rows while timing out unfinished results', () =>
+    clock(async () => {
+      const h = harness(id => json(snapshot(id, 'running', ['PASSED', 'RUNNING'])));
+      await expect(h.wait()).rejects.toMatchObject({
+        exitCode: 7,
+        details: { runIds: ['e1'], timedOutResultIds: ['e1-1'] },
+      });
+      expect(h.doc().partial).toBe(true);
+      expect(h.doc().results.map((r: { status: string }) => r.status)).toEqual([
+        'passed',
+        'timeout',
+      ]);
+    }));
+  it('takes one final listing when a result settles at the deadline', () =>
+    clock(async () => {
+      const start = Date.now();
+      const h = harness(id =>
+        json(
+          snapshot(id, Date.now() - start >= 6000 ? 'finished' : 'running', [
+            Date.now() - start >= 6000 ? 'PASSED' : 'RUNNING',
+          ]),
+        ),
       );
-    } finally {
-      vi.useRealTimers();
-    }
+      expect((await h.wait()).summary.passed).toBe(1);
+    }));
+  it('cuts a hanging first read after the bounded grace and names the unlisted run', () =>
+    clock(async () => {
+      const start = Date.now();
+      const h = harness(() => 'hang');
+      await expect(h.wait()).rejects.toMatchObject({ exitCode: 7, details: { runIds: ['e1'] } });
+      expect(Date.now() - start).toBeLessThanOrEqual(8100);
+      expect(h.doc().runs[0]).toMatchObject({ runId: 'e1', listed: false, timedOut: true });
+    }));
+  it('keeps concurrent runs on the same deadline', () =>
+    clock(async () => {
+      const start = Date.now();
+      const h = harness(() => 'hang');
+      await expect(h.wait(['e1', 'e2'])).rejects.toMatchObject({
+        exitCode: 7,
+      });
+      expect(Date.now() - start).toBeLessThanOrEqual(10200);
+    }));
+  it('starts one independent waiter for each run', () =>
+    clock(async () => {
+      let active = 0;
+      let peak = 0;
+      const h = harness((_id, _n, init) => {
+        active++;
+        peak = Math.max(peak, active);
+        init.signal!.addEventListener('abort', () => active--);
+        return 'hang';
+      });
+      await h.wait(['e1', 'e2', 'e3']).catch(() => undefined);
+      expect(peak).toBe(3);
+    }));
+  it('names every timed-out run', () =>
+    clock(async () => {
+      const h = harness(id => json(snapshot(id, 'running', ['RUNNING'])));
+      await expect(h.wait(['e1', 'e2'])).rejects.toMatchObject({
+        exitCode: 7,
+        details: { runId: null, runIds: ['e1', 'e2'] },
+      });
+    }));
+  it('preserves a per-request timeout and earlier snapshots', () =>
+    clock(async () => {
+      const h = harness((id, n) =>
+        n === 1 ? json(snapshot(id, 'running', ['PASSED', 'RUNNING'])) : 'request-timeout',
+      );
+      await expect(h.wait()).rejects.toBeInstanceOf(RequestTimeoutError);
+      expect(h.doc().partial).toBe(true);
+      expect(h.doc().results.map((r: { status: string }) => r.status)).toEqual([
+        'passed',
+        'running',
+      ]);
+    }));
+  it('prints a parseable unlisted run on a first-request timeout', async () => {
+    const h = harness(() => 'request-timeout');
+    await expect(h.wait()).rejects.toBeInstanceOf(RequestTimeoutError);
+    expect(h.doc().runs[0]).toEqual({ runId: 'e1', listed: false });
   });
+});
 
-  it('JSON: a failed type lookup falls back to the artifact hint without changing the exit code', async () => {
-    const { err, hint } = await waitTerminal({
-      output: 'json',
-      runStatus: 'failed',
-      typeLookupFails: true,
+describe('run wait: errors, throttling and outages', () => {
+  it.each([
+    ['AUTH_INVALID', 401, 3],
+    ['CLIENT_TOO_OLD', 426, 14],
+    ['VALIDATION_ERROR', 400, 5],
+    ['INSUFFICIENT_CREDITS', 402, 12],
+    ['CONFLICT', 409, 6],
+  ] as const)('keeps %s and its raw server fields', async (code, status, exitCode) => {
+    const h = harness(() => fail(code, status));
+    await expect(h.wait()).rejects.toMatchObject({
+      code,
+      exitCode,
+      message: `${code} from server`,
+      nextAction: 'Server instruction.',
     });
-    expect(err.exitCode).toBe(1);
-    expect(hint).toContain("'testsprite test artifact get run_abc'");
+    expect(h.stdout).toHaveLength(1);
+  });
+  it('unknown run wins over a later request timeout', async () => {
+    const h = harness(id =>
+      id === 'e1' ? fail('NOT_FOUND', 404, { resource: 'run' }) : 'request-timeout',
+    );
+    await expect(h.wait(['e1', 'e2'])).rejects.toMatchObject({
+      exitCode: 4,
+    });
+    expect(h.doc()).toMatchObject({
+      partial: true,
+      results: [],
+      runs: [
+        { runId: 'e1', error: { code: 'NOT_FOUND' } },
+        { runId: 'e2', listed: false },
+      ],
+    });
+  });
+  it('unknown run wins over another run timeout', () =>
+    clock(async () => {
+      const h = harness(id => (id === 'e1' ? fail('NOT_FOUND', 404, { resource: 'run' }) : 'hang'));
+      await expect(h.wait(['e1', 'e2'])).rejects.toMatchObject({ exitCode: 4 });
+    }));
+  it('reads through a transient rate limit to a verdict', () =>
+    clock(async () => {
+      const h = harness((id, n) => (n < 3 ? fail('RATE_LIMITED', 429) : json(snapshot(id))));
+      expect((await h.wait()).summary.passed).toBe(1);
+    }));
+  it('persistent throttling at the deadline remains a timeout', () =>
+    clock(async () => {
+      const h = harness(() => fail('RATE_LIMITED', 429));
+      await expect(h.wait()).rejects.toMatchObject({ exitCode: 7 });
+    }));
+  it('does not retry a standing rate limit', async () => {
+    const h = harness(() => fail('RATE_LIMITED', 429, { reason: 'inflight_cap' }));
+    await expect(h.wait()).rejects.toMatchObject({ exitCode: 11 });
+  });
+  it('recovers from an outage after a successful listing', () =>
+    clock(async () => {
+      const h = harness((id, n) =>
+        n === 1
+          ? json(snapshot(id, 'running', ['RUNNING']))
+          : n < 4
+            ? fail('UNAVAILABLE', 503)
+            : json(snapshot(id)),
+      );
+      expect((await h.wait(['e1'], { timeoutSeconds: 20 })).summary.passed).toBe(1);
+    }));
+  it('an outage lasting through the deadline preserves exit 10 and raw server diagnostics', () =>
+    clock(async () => {
+      const h = harness(() => fail('UNAVAILABLE', 503));
+      await expect(h.wait()).rejects.toMatchObject({
+        exitCode: 10,
+        message: 'UNAVAILABLE from server',
+        nextAction: 'Server instruction.',
+        details: {},
+        requestId: 'server-id',
+      });
+    }));
+  it('preserves completed rows when a later listing fails', () =>
+    clock(async () => {
+      const h = harness((id, n) =>
+        n === 1 ? json(snapshot(id, 'running', ['PASSED', 'RUNNING'])) : fail('AUTH_INVALID', 401),
+      );
+      await expect(h.wait()).rejects.toMatchObject({ exitCode: 3 });
+      expect(h.doc().results[0].status).toBe('passed');
+      expect(h.doc().results[1]).toMatchObject({ status: 'error', errorCode: 'AUTH_INVALID' });
+    }));
+});
+
+describe('run wait: signal ownership', () => {
+  it.each(['SIGINT', 'SIGTERM'] as const)('detaches on %s while a listing is outstanding', signal =>
+    clock(async () => {
+      const h = harness(() => 'hang');
+      const pending = h.wait();
+      setTimeout(() => h.shutdown.interrupt(signal), 100);
+      const error = (await pending.catch(e => e)) as InterruptError;
+      expect(error.exitCode).toBe(signal === 'SIGINT' ? 130 : 143);
+      expect(h.doc().runs[0]).toEqual({ runId: 'e1', listed: false });
+      expect(buildInterruptEnvelope(error).error.nextAction).toContain('testsprite run wait e1');
+      expect(h.shutdown.isArmed).toBe(false);
+    }),
+  );
+  it('interrupt during inter-read sleep retains passed rows', () =>
+    clock(async () => {
+      const h = harness(id => json(snapshot(id, 'running', ['PASSED', 'RUNNING'])));
+      const pending = h.wait();
+      setTimeout(() => h.shutdown.interrupt('SIGINT'), 100);
+      await expect(pending).rejects.toBeInstanceOf(InterruptError);
+      expect(h.doc().partial).toBe(true);
+      expect(h.doc().results.map((r: { status: string }) => r.status)).toEqual([
+        'passed',
+        'running',
+      ]);
+    }));
+  it('interrupt wins over a previously unknown run', () =>
+    clock(async () => {
+      const h = harness(id => (id === 'e1' ? fail('NOT_FOUND', 404, { resource: 'run' }) : 'hang'));
+      const pending = h.wait(['e1', 'e2']);
+      setTimeout(() => h.shutdown.interrupt('SIGINT'), 100);
+      await expect(pending).rejects.toMatchObject({ exitCode: 130 });
+    }));
+  it('disarms once every run has finished', async () => {
+    const h = harness();
+    await h.wait();
+    expect(h.shutdown.isArmed).toBe(false);
   });
 });

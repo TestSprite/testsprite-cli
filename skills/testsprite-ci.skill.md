@@ -38,17 +38,28 @@ Decide from configuration. Read `.github/workflows/` and the repo root, in this 
 - No workflow deploys, and `vercel.json` / `.vercel/` / `netlify.toml` or the platform's
   git integration is present: **A — the platform deploys every PR**. Trigger:
   `on: deployment_status`.
+- The platform is connected but writes **no deployment**, only a status or check on
+  the PR (Vercel with its `deployment_status` events switched off, Cloudflare Pages):
+  **C — wait for the check and derive the URL**. Trigger: `on: pull_request`.
 - Neither is clear: ask the user who deploys their pull-request previews.
 
-Deployment history is a reference, not the decision:
+Tell A from C on a recent pull request (`<sha>` = its head commit):
 
 ```bash
-gh api repos/{owner}/{repo}/deployments --jq '.[] | "\(.environment) \(.ref[0:8]) \(.created_at)"'
+gh api "repos/{owner}/{repo}/deployments?sha=<sha>" --jq 'length'              # > 0 → A
+gh api repos/{owner}/{repo}/commits/<sha>/status --jq '.statuses[].context'     # the status name → C
+gh api repos/{owner}/{repo}/commits/<sha>/check-runs --jq '.check_runs[].name'  # or the check name → C
+gh api repos/{owner}/{repo}/issues/<pr>/comments --jq '.[].body' | grep -o 'https://[a-z0-9.-]*'   # the preview URL
 ```
 
-Recent **preview** records support A; production-only records mean preview deploys are
-off on the platform. History is evidence, not configuration — the proof is a real pull
-request (step 5).
+For C, turn the URL the platform's bot posted into a pattern by replacing the per-PR
+part: Vercel `https://<project>-git-{branch-slug}-<team>.vercel.app`, Cloudflare Pages
+`https://{branch-slug}.<project>.pages.dev`, Netlify
+`https://deploy-preview-{pr}--<site>.netlify.app` (`{branch-slug}` = the branch
+lowercased, runs of other characters → `-`). Then `curl -sI` the real URL: a `302` to
+`vercel.com/sso-api` is Deployment Protection — the user must disable it for previews
+or create a Protection Bypass secret first. History is evidence, not configuration —
+the proof is a real pull request (step 5).
 
 Not linked but the user wants A: connect the repository to the platform's git
 integration (Vercel: project → Settings → Git, or `npx vercel git connect` with the
@@ -82,13 +93,20 @@ This writes `.github/workflows/testsprite.yml` with one step marked `REPLACE ME`
 - **B:** replace the placeholder's `run:` with the deploy commands, ending in
   `echo "url=<preview address>" >> "$GITHUB_OUTPUT"`. The platform token goes in its
   own repo secret.
+- **C:** keep `pull_request:`, delete the placeholder step, add
+  `statuses: read` and `checks: read` under `permissions:`, and extend the `ci run`
+  line with `--wait-for-status "<name from step 1>" --target-url-template "<pattern>"`
+  (drop `--target-url "$PREVIEW_URL"`). `ci run` polls the status/check for up to
+  `--status-timeout` (default 900 s), skips with exit 0 when the build failed or was
+  ignored, and refuses a pattern it cannot fill — never a production fallback.
 
 Keep what the template fixes: `testsprite ci run … --target-url "$PREVIEW_URL"
 --fail-on-skipped --summary-file`, `npm i -g @testsprite/testsprite-cli@latest` (no
-version pin — verdicts come from the backend), fork and draft PRs skipped, the upload
-step on `if: always()`, and `concurrency` on the **job** (keyed by PR number in B, by
-commit in A). Never re-judge pass/fail in YAML (`jq` + `exit 1`): `ci run`'s exit code
-is the gate. Regenerate with `--force`; the previous file is kept as `.bak`.
+version pin — verdicts come from the backend), fork, Dependabot and draft PRs skipped,
+the upload step on `if: always()`, and `concurrency` on the **job** (keyed by the
+workflow's filename plus the PR number in B, the commit in A). Never re-judge pass/fail
+in YAML (`jq` + `exit 1`): `ci run`'s exit code is the gate. Regenerate with `--force`;
+the previous file is kept as `.bak`.
 
 ## 4. Secrets
 
@@ -113,7 +131,7 @@ actionlint .github/workflows/testsprite.yml     # the file parses — or `gh wor
 
 Commit and push the workflow on a branch, open a PR that is **not a draft** and has
 **no merge conflicts**, and watch the `TestSprite / testsprite-tests` check. The log shows
-`Dispatched N tests.` then `CI run: x/y passed …`; the job summary is the execution
+`Dispatched N tests.`, `Run <runId>`, then `CI run: x/y passed …`; the job summary is the execution
 report (the same content as the App's PR comment); a `testsprite-results` artifact
 holds `testsprite-summary.json`. Then suggest making the check **required** in branch
 protection. In shape A the workflow file runs **at the deployed commit**, so the PR
@@ -132,19 +150,26 @@ deployments are filtered out by the `if:`).
 
 - The check is `ci run`'s exit code: 1 = a test failed, 7 = timeout or an unsupported
   backend, 5 = configuration. A summary opening with a **CI gate** warning means the
-  CLI's own counts differ from the report (a run it could not read, a timeout) — the
-  check is right, the report is the server's view of the execution.
-- `exit 7` with "did not confirm the single-execution admission mode" = the backend is
-  too old for `ci run`; the dispatched runs were cancelled and refunded.
+  CLI's own counts differ from the report (a test result it could not read, a timeout) —
+  the check is right, the report is the server's view of the run.
+- `exit 7` with "did not confirm the single-run admission mode" = the backend is
+  too old for `ci run`; the dispatched tests were cancelled (the server attempts a refund).
 - `exit 5` with `target-protected` = the preview is behind Vercel Deployment Protection,
   so nothing was dispatched. Ask the user to turn off Vercel Authentication for previews,
   or to add a Protection Bypass for Automation secret as a repo secret and append
   `?x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true` to the URL.
-- Screenshots in the report are capped at 12 per execution; later rows show `—`.
+- Screenshots in the report are capped at 12 per run; later rows show `—`.
 - Shape A is per commit: a new push starts its own run against its own preview, and
-  cancelling the job only stops the CLI — the execution keeps running and reports in
-  the Portal.
-- Backend tests use the URL baked into their code, not `--target-url`.
+  cancelling the job only stops the CLI — the run keeps running and reports in the
+  Portal.
+- Shape C: `No preview for this commit — tests not run` with exit 0 means the platform's
+  check failed or the build was ignored — not a TestSprite problem; `exit 7` naming the
+  checks it saw means `--wait-for-status` has the wrong name — copy one from that list.
+- Backend tests follow `--target-url` only where their code reads the base URL from
+  `VAR_{url}` (`BASE_URL = "VAR_{url}"`, replaced server-side with the run's environment
+  URL) — which in a pull request is the preview, because `ci run --env X --target-url U`
+  runs in a `github-pr-<N>` clone of X at U. Outside a pull request they use the environment's
+  own URL (`--env`'s, or the default's). A hard-coded URL is left as is and always tests that address.
 - Testing `ci run` locally: a shell that exports `TESTSPRITE_API_URL` or
   `TESTSPRITE_API_KEY` overrides `--profile` — a `fetch failed` against a healthy API is
   usually that. Check `env | grep TESTSPRITE_` first.
@@ -155,4 +180,5 @@ deployments are filtered out by the `if:`).
 - Don't run `vercel link --yes`; don't pass secrets as arguments.
 - Don't pin the CLI version in the workflow; don't parse the summary to decide the verdict.
 - Don't commit a loopback or private `--target-url` (`ci run` refuses it).
+- Don't script a production fallback for a missing preview; `ci run` skips, on purpose.
 - Don't skip step 5: a workflow that has not run on a real PR is not onboarded.

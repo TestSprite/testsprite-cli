@@ -36,19 +36,7 @@ import { ApiError } from './errors.js';
 // the rest of `127.0.0.0/8`, which `--local` cannot dial by name at all. See
 // `'loopback-other'` below for that distinction.
 const LOCAL_DEV_RUNTIME_HINT =
-  "This looks like a local-dev target. Save `--url http://localhost:<port>` on an environment, then run `testsprite test run <test-id> --env <name>` — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope).";
-
-// Creation-time callers that take a per-run target (`test create
-// --target-url`, which only applies with `--run`). A project or environment
-// that names an app on this machine is created with `--local <port>`, so this
-// says that instead of sending the reader after a public URL they may not have.
-// It also serves the bind-all addresses (`0.0.0.0` / `::`), which are not
-// loopback and are refused everywhere.
-const LOCAL_DEV_BOOTSTRAP_HINT =
-  'TestSprite executes tests from the cloud, so the runner needs an address it can reach: ' +
-  'a deployed or staging URL. For an app that only runs on this machine, create the project ' +
-  'or environment with `--url http://localhost:<port>`, then run with ' +
-  '`testsprite test run <test-id> --env <name>`.';
+  "This looks like a local-dev target. Save `--url http://localhost:<port>` on an environment, then run `testsprite run <test-id> --env <name>` — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope).";
 
 /**
  * `0.0.0.0` / `::` bind every interface, so an app listening there IS reachable
@@ -60,9 +48,9 @@ const UNSPECIFIED_ADDRESS_REASON =
 
 const LOCAL_PROJECT_CREATE_HINT =
   'Use --url http://localhost:<port> for an app on this machine. ' +
-  'Local projects are frontend-only and require the V3 project platform.';
+  'Local projects are frontend-only.';
 
-type TargetUrlHintContext = 'runtime' | 'bootstrap' | 'local-project-create';
+type TargetUrlHintContext = 'runtime' | 'local-project-create';
 
 export interface TargetUrlCaller {
   /** CLI flag name without the leading `--`, used in the error envelope. */
@@ -74,7 +62,7 @@ export interface TargetUrlCaller {
 
 const DEFAULT_TARGET_URL_CALLER: TargetUrlCaller = {
   field: 'target-url',
-  helpCommand: 'testsprite test run',
+  helpCommand: 'testsprite run',
   hintContext: 'runtime',
 };
 
@@ -147,8 +135,9 @@ export function assertNotLocal(
 }
 
 function localDevHintFor(hintContext: TargetUrlHintContext): string {
-  if (hintContext === 'local-project-create') return LOCAL_PROJECT_CREATE_HINT;
-  return hintContext === 'bootstrap' ? LOCAL_DEV_BOOTSTRAP_HINT : LOCAL_DEV_RUNTIME_HINT;
+  return hintContext === 'local-project-create'
+    ? LOCAL_PROJECT_CREATE_HINT
+    : LOCAL_DEV_RUNTIME_HINT;
 }
 
 /**

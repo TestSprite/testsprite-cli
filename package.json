@@ -1,6 +1,6 @@
 {
   "name": "@testsprite/testsprite-cli",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "description": "Official TestSprite command-line interface",
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,6 @@
   "files": [
     "dist",
     "skills",
-    "schemas",
     "!dist/**/*.map"
   ],
   "scripts": {

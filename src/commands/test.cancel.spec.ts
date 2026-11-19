@@ -1,543 +1,278 @@
-/**
- * Unit tests for `test cancel <run-id...>`.
- *
- * Covers: single-id happy path (text + json), `alreadyCancelled` advisory,
- * multi-id mixed summary + exit precedence, 404, 409, dry-run.
- */
-
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
-import { ApiError, InterruptError } from '../lib/errors.js';
-import type { CancelRunResponse } from '../lib/runs.types.js';
-import { runTestCancel, type CliCancelSummary } from './test.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
+import type { CancelRunResponse, CancelRunRefund } from '../lib/runs.types.js';
+import { runTestCancel } from './test.js';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-type FetchInput = Parameters<typeof globalThis.fetch>[0];
-
-function makeFetch(
-  handler: (url: string, init: RequestInit) => { status?: number; body: unknown },
-): typeof globalThis.fetch {
-  return (async (input: FetchInput, init: RequestInit = {}) => {
-    const url =
-      typeof input === 'string'
-        ? input
-        : input instanceof URL
-          ? input.toString()
-          : (input as { url: string }).url;
-    const { status = 200, body } = handler(url, init);
-    return new Response(JSON.stringify(body), {
-      status,
-      headers: { 'content-type': 'application/json' },
-    });
-  }) as typeof globalThis.fetch;
-}
-
-function makeCreds(
-  apiKey = 'sk-user-test',
-  apiUrl = 'http://localhost:13503',
-): { credentialsPath: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-cancel-'));
-  const credentialsPath = join(dir, 'credentials');
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(credentialsPath, `[default]\napi_url = ${apiUrl}\napi_key = ${apiKey}\n`, {
-    mode: 0o600,
-  });
-  return { credentialsPath };
-}
-
-function makeCancelResponse(
-  runId: string,
-  overrides: Partial<CancelRunResponse> = {},
-): CancelRunResponse {
-  return {
-    runId,
-    testId: 'test_xyz',
-    projectId: 'project_1',
-    userId: 'user_1',
-    status: 'cancelled',
-    source: 'cli',
-    createdAt: '2026-05-15T10:00:00.000Z',
-    startedAt: '2026-05-15T10:00:01.000Z',
-    finishedAt: '2026-05-15T10:00:30.000Z',
-    codeVersion: 'v1',
-    targetUrl: 'https://example.com',
-    createdFrom: 'cli',
-    failedStepIndex: null,
-    failureKind: null,
-    error: null,
-    videoUrl: null,
-    stepSummary: { total: 5, completed: 2, passedCount: 2, failedCount: 0 },
-    alreadyCancelled: false,
-    ...overrides,
-  };
-}
-
-function errorBody(code: string, details: Record<string, unknown> = {}) {
-  const statusMap: Record<string, number> = {
-    NOT_FOUND: 404,
-    CONFLICT: 409,
-    AUTH_INVALID: 401,
-    AUTH_FORBIDDEN: 403,
-    CLIENT_TOO_OLD: 426,
-  };
-  return {
-    status: statusMap[code] ?? 400,
-    body: {
+const json = (body: unknown, status = 200): Response =>
+  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+const failure = (code: string, status: number) =>
+  json(
+    {
       error: {
         code,
-        message: `Error: ${code}`,
-        nextAction: 'do something',
-        requestId: 'req_test',
-        details,
+        message: `${code} from server`,
+        nextAction: 'Keep server instruction.',
+        requestId: 'server-request',
+        details: { resource: 'run' },
       },
     },
+    status,
+  );
+const response = (runId: string, extra: Partial<CancelRunResponse> = {}): CancelRunResponse => ({
+  runId,
+  alreadyCancelled: false,
+  alreadyFinished: false,
+  results: ['a', 'b'].map(id => ({
+    resultId: `${runId}-${id}`,
+    runId,
+    testId: id,
+    title: `Test ${id}`,
+    status: 'cancelled',
+    alreadyCancelled: false,
+    alreadyFinished: false,
+  })),
+  ...extra,
+});
+function harness(
+  answer: (runId: string, init: RequestInit) => Response | Promise<Response> = id =>
+    json(response(id)),
+) {
+  const calls: string[] = [];
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const shutdown = new ShutdownController();
+  const deps = {
+    env: { TESTSPRITE_API_KEY: 'sk-user-test', TESTSPRITE_API_URL: 'https://api.example.com' },
+    shutdown,
+    stdout: (s: string) => stdout.push(s),
+    stderr: (s: string) => stderr.push(s),
+    sleep: async () => undefined,
+    fetchImpl: async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      const url = new URL(
+        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
+      );
+      calls.push(`${init.method} ${url.pathname}`);
+      const match = /^\/api\/cli\/v1\/runs\/([^/]+)\/cancel$/.exec(url.pathname);
+      if (init.method !== 'POST' || !match) throw new Error(`unexpected request ${url}`);
+      return answer(decodeURIComponent(match[1]!), init);
+    },
+  };
+  return {
+    calls,
+    stdout,
+    stderr,
+    shutdown,
+    deps,
+    cancel: (runIds = ['e1'], output: 'json' | 'text' = 'json') =>
+      runTestCancel({ profile: 'default', debug: false, output, runIds }, deps),
+    doc: () => JSON.parse(stdout.join('\n')),
   };
 }
 
-/** Extract the runId embedded in a `POST /runs/{runId}/cancel` URL. */
-function runIdFromCancelUrl(url: string): string | undefined {
-  const match = /\/runs\/([^/]+)\/cancel/.exec(url);
-  return match?.[1];
-}
-
-// ---------------------------------------------------------------------------
-// Single id — happy path
-// ---------------------------------------------------------------------------
-
-describe('runTestCancel — single id happy path', () => {
-  it('CXL-1: fresh cancel of a queued/running run → 200, alreadyCancelled:false, no advisory', async () => {
-    const { credentialsPath } = makeCreds();
-    let seenUrl = '';
-    let seenMethod = '';
-    const fetchImpl = makeFetch((url, init) => {
-      seenUrl = url;
-      seenMethod = init.method ?? 'GET';
-      return { body: makeCancelResponse('run_abc') };
+describe('run cancel: one request per execution', () => {
+  it('does not list members and sends each unique run once in input order', async () => {
+    const h = harness();
+    const summary = await h.cancel(['e2', 'e1', 'e2']);
+    expect(h.calls).toEqual(['POST /api/cli/v1/runs/e2/cancel', 'POST /api/cli/v1/runs/e1/cancel']);
+    expect(summary.cancelled).toEqual(['e2', 'e1']);
+    expect(h.doc().runs).toEqual([response('e2'), response('e1')]);
+  });
+  it('preserves every native result identity and status in JSON', async () => {
+    const h = harness();
+    await h.cancel();
+    expect(h.doc()).toEqual({
+      runs: [response('e1')],
+      cancelled: ['e1'],
+      alreadyCancelled: [],
+      alreadyFinished: [],
+      notFound: [],
+      errors: [],
     });
-    const stderrLines: string[] = [];
-    const result = (await runTestCancel(
-      { profile: 'default', output: 'json', debug: false, dryRun: false, runIds: ['run_abc'] },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
-    )) as CancelRunResponse;
-
-    expect(seenMethod).toBe('POST');
-    expect(runIdFromCancelUrl(seenUrl)).toBe('run_abc');
-    expect(result.status).toBe('cancelled');
-    expect(result.alreadyCancelled).toBe(false);
-    expect(stderrLines.some(l => l.includes('already cancelled'))).toBe(false);
   });
-
-  it('renders the run card in text mode with status cancelled', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: makeCancelResponse('run_abc') }));
-    const stdoutLines: string[] = [];
-    await runTestCancel(
-      { profile: 'default', output: 'text', debug: false, dryRun: false, runIds: ['run_abc'] },
-      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
-    );
-    const block = stdoutLines.join('\n');
-    expect(block).toContain('run_abc');
-    expect(block).toContain('status');
-    expect(block).toContain('cancelled');
+  it('renders run and result identities separately in text', async () => {
+    const h = harness();
+    await h.cancel(['e1'], 'text');
+    expect(h.stdout.join('\n')).toBe('Run e1 — cancelled\n  e1-a  cancelled\n  e1-b  cancelled');
   });
+  it.each(['alreadyCancelled', 'alreadyFinished'] as const)(
+    'accepts %s on HTTP 200',
+    async field => {
+      const body = response('e1', { [field]: true });
+      const h = harness(() => json(body));
+      const result = await h.cancel();
+      expect(result[field]).toEqual(['e1']);
+      expect(result.cancelled).toEqual([]);
+      expect(h.doc().runs).toEqual([body]);
+    },
+  );
+  it('still cancels a run whose current result list is empty', async () => {
+    const h = harness(() => json(response('e1', { results: [] })));
+    expect((await h.cancel()).cancelled).toEqual(['e1']);
+    expect(h.calls).toHaveLength(1);
+  });
+  it('keeps mixed finished and cancelled result statuses from the server', async () => {
+    const body = response('e1');
+    body.results[0] = { ...body.results[0]!, status: 'passed', alreadyFinished: true };
+    const h = harness(() => json(body));
+    await h.cancel();
+    expect(h.doc().runs[0].results).toEqual(body.results);
+  });
+  it('uses the server terminal-race response without a second request', async () => {
+    const body = response('e1', { alreadyFinished: true });
+    const h = harness(() => json(body));
+    await h.cancel();
+    expect(h.calls).toHaveLength(1);
+    expect(h.doc().alreadyFinished).toEqual(['e1']);
+  });
+});
 
-  const baseText = (runId: string) =>
-    [
-      `runId       ${runId}`,
-      'testId      test_xyz',
-      'status      cancelled',
-      'codeVersion v1',
-      'targetUrl   https://example.com',
-      'createdAt   2026-05-15T10:00:00.000Z',
-      'startedAt   2026-05-15T10:00:01.000Z',
-      'finishedAt  2026-05-15T10:00:30.000Z',
-      'steps       2/5 (passed=2, failed=0)',
-    ].join('\n');
-
-  const refundCases: Array<{
-    name: string;
-    refund?: { status: 'refunded' | 'not_charged' | 'failed'; amount?: number };
-    textLine?: string;
-  }> = [
-    {
-      name: 'refunded with original amount',
-      refund: { status: 'refunded', amount: 2.5 },
-      textLine: 'refund      credits returned: 2.5',
-    },
-    {
-      name: 'not charged',
-      refund: { status: 'not_charged' },
-      textLine: 'refund      run was never charged; nothing to return',
-    },
-    {
-      name: 'refund failed',
-      refund: { status: 'failed' },
-      textLine:
-        'refund      failed — cancellation succeeded, but credits were not returned; contact TestSprite support',
-    },
-    { name: 'refund field absent' },
+describe('run cancel: refunds', () => {
+  const cases: Array<CancelRunRefund | undefined> = [
+    { status: 'refunded', amount: 2.5 },
+    { status: 'refunded' },
+    { status: 'not_charged' },
+    { status: 'failed' },
+    undefined,
   ];
-
-  it.each(refundCases)('renders $name truthfully in text mode', async ({ refund, textLine }) => {
-    const { credentialsPath } = makeCreds();
-    const response = makeCancelResponse('run_refund', refund === undefined ? {} : { refund });
-    const fetchImpl = makeFetch(() => ({ body: response }));
-    const stdoutLines: string[] = [];
-
-    await runTestCancel(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_refund'],
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+  it.each(cases)('preserves refund %j on its result', async refund => {
+    const body = response('e1');
+    if (refund) body.results[0]!.refund = refund;
+    const h = harness(() => json(body));
+    await h.cancel();
+    expect(h.doc().runs[0].results[0]).toEqual(body.results[0]);
+  });
+  it.each(cases)('renders refund %j honestly', async refund => {
+    const body = response('e1');
+    if (refund) body.results[0]!.refund = refund;
+    const h = harness(() => json(body));
+    await h.cancel(['e1'], 'text');
+    if (refund?.status === 'failed')
+      expect(h.stdout.join('')).toContain('retry testsprite run cancel');
+    else if (refund?.status === 'not_charged') expect(h.stdout.join('')).toContain('never charged');
+    else if (refund) expect(h.stdout.join('')).toContain('credits returned');
+    else expect(h.stdout.join('')).not.toContain('refund:');
+  });
+  it('reissues cancellation for a failed refund even when the run was already cancelled', async () => {
+    let attempts = 0;
+    const h = harness(() => {
+      const body = response('e1', { alreadyCancelled: true });
+      body.results[0]!.refund =
+        ++attempts === 1 ? { status: 'failed' } : { status: 'refunded', amount: 1 };
+      return json(body);
+    });
+    await h.cancel();
+    h.stdout.length = 0;
+    await h.cancel();
+    expect(h.calls).toHaveLength(2);
+    expect(h.doc().runs[0].results[0].refund).toEqual({ status: 'refunded', amount: 1 });
+  });
+  it('refuses malformed nested refund metadata at the schema boundary', async () => {
+    const body = response('e1');
+    const h = harness(() =>
+      json({ ...body, results: [{ ...body.results[0], refund: { amount: 3 } }] }),
     );
-
-    const expected = textLine ? `${baseText('run_refund')}\n${textLine}` : baseText('run_refund');
-    expect(stdoutLines).toEqual([expected]);
-  });
-
-  it.each(refundCases)('passes $name through unchanged in JSON mode', async ({ refund }) => {
-    const { credentialsPath } = makeCreds();
-    const response = makeCancelResponse('run_refund', refund === undefined ? {} : { refund });
-    const fetchImpl = makeFetch(() => ({ body: response }));
-    const stdoutLines: string[] = [];
-
-    await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_refund'],
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
-    );
-
-    const printed = JSON.parse(stdoutLines.join('\n')) as { refund?: unknown };
-    if (refund === undefined) {
-      expect('refund' in printed).toBe(false);
-    } else {
-      expect(printed.refund).toEqual(refund);
-    }
-  });
-
-  it('rejects a malformed refund object at the HttpClient validation boundary', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      body: { ...makeCancelResponse('run_refund'), refund: { amount: 2.5 } },
-    }));
-
-    const error = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_refund'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch((caught: unknown) => caught);
-
-    expect(error).toMatchObject({ code: 'INTERNAL' });
-    expect(JSON.stringify((error as ApiError).getDetail('issues'))).toContain('refund.status');
-  });
-
-  it('CXL-5: alreadyCancelled:true → [advisory] stderr line, still exit 0 (no throw)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      body: makeCancelResponse('run_abc', { alreadyCancelled: true }),
-    }));
-    const stderrLines: string[] = [];
-    const result = (await runTestCancel(
-      { profile: 'default', output: 'json', debug: false, dryRun: false, runIds: ['run_abc'] },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
-    )) as CancelRunResponse;
-    expect(result.alreadyCancelled).toBe(true);
-    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('already cancelled'))).toBe(
-      true,
-    );
-  });
-
-  it('CXL-6: unknown/cross-tenant runId → 404 propagates as ApiError exit 4', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => errorBody('NOT_FOUND'));
-    const err = await runTestCancel(
-      { profile: 'default', output: 'json', debug: false, dryRun: false, runIds: ['run_ghost'] },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).exitCode).toBe(4);
-  });
-
-  it('CXL-4: already-terminal run → 409 propagates as ApiError exit 6', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => errorBody('CONFLICT', { status: 'passed' }));
-    const err = await runTestCancel(
-      { profile: 'default', output: 'json', debug: false, dryRun: false, runIds: ['run_done'] },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).exitCode).toBe(6);
+    await expect(h.cancel()).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(h.doc().errors[0].runId).toBe('e1');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Multi-id — summary + exit precedence (CXL-11)
-// ---------------------------------------------------------------------------
-
-describe('runTestCancel — multi-id summary + exit precedence (CXL-11)', () => {
-  it('stops cancelling remaining runs after an interrupted request', async () => {
-    const { credentialsPath } = makeCreds();
-    const interruption = new InterruptError('SIGINT');
-    const cancelled: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      cancelled.push(url);
-      if (cancelled.length === 1) throw interruption;
-      return { body: makeCancelResponse('run_2') };
+describe('run cancel: partial failures and precedence', () => {
+  it.each([
+    ['AUTH_INVALID', 401, 3],
+    ['CLIENT_TOO_OLD', 426, 14],
+    ['NOT_FOUND', 404, 4],
+    ['CONFLICT', 409, 6],
+    ['RATE_LIMITED', 429, 11],
+    ['INTERNAL', 500, 1],
+  ] as const)('preserves %s with its server message and hint', async (code, status, exitCode) => {
+    const h = harness(() => failure(code, status));
+    await expect(h.cancel()).rejects.toMatchObject({
+      code,
+      exitCode,
+      message: `${code} from server`,
+      nextAction: 'Keep server instruction.',
+      requestId: 'server-request',
+      details: { resource: 'run' },
     });
-
-    await expect(
-      runTestCancel(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: false,
-          runIds: ['run_1', 'run_2'],
-        },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-      ),
-    ).rejects.toBe(interruption);
-    expect(cancelled).toHaveLength(1);
+    expect(h.stdout).toHaveLength(1);
   });
-
-  it('all cancelled/alreadyCancelled → exit 0, summary buckets correct', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      const runId = runIdFromCancelUrl(url)!;
-      if (runId === 'run_2') {
-        return { body: makeCancelResponse(runId, { alreadyCancelled: true }) };
-      }
-      return { body: makeCancelResponse(runId) };
+  it('continues to the next run after a request failed', async () => {
+    const h = harness(id => (id === 'missing' ? failure('NOT_FOUND', 404) : json(response(id))));
+    await expect(h.cancel(['missing', 'e1'])).rejects.toMatchObject({ exitCode: 4 });
+    expect(h.doc().cancelled).toEqual(['e1']);
+    expect(h.doc().notFound).toEqual(['missing']);
+  });
+  it.each([
+    ['NOT_FOUND', 404, 'INTERNAL', 500, 4],
+    ['AUTH_INVALID', 401, 'NOT_FOUND', 404, 3],
+    ['CLIENT_TOO_OLD', 426, 'AUTH_INVALID', 401, 3],
+    ['CLIENT_TOO_OLD', 426, 'NOT_FOUND', 404, 14],
+  ] as const)(
+    'chooses precedence across %s and %s',
+    async (first, firstStatus, second, secondStatus, exitCode) => {
+      const h = harness(id =>
+        id === 'e1' ? failure(first, firstStatus) : failure(second, secondStatus),
+      );
+      await expect(h.cancel(['e1', 'e2'])).rejects.toMatchObject({ exitCode });
+    },
+  );
+  it('reports a request timeout as an attempted run, retaining earlier successes', async () => {
+    const h = harness(id => {
+      if (id === 'e2') throw new RequestTimeoutError(1000, 'request');
+      return json(response(id));
     });
-    const result = (await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_1', 'run_2'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    )) as CliCancelSummary;
-    expect(result.cancelled).toEqual(['run_1']);
-    expect(result.alreadyCancelled).toEqual(['run_2']);
-    expect(result.conflicts).toEqual([]);
-    expect(result.notFound).toEqual([]);
-    // Stable machine shape (codex finding 2): errors is ALWAYS present,
-    // an empty array on full success — never an absent key.
-    expect(result.errors).toEqual([]);
+    await expect(h.cancel(['e1', 'e2'])).rejects.toMatchObject({ exitCode: 1 });
+    expect(h.doc().cancelled).toEqual(['e1']);
+    expect(h.doc().errors[0].runId).toBe('e2');
   });
-
-  it('mixed: cancelled + conflict + notFound → notFound wins (exit 4), all buckets populated', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      const runId = runIdFromCancelUrl(url)!;
-      if (runId === 'run_conflict') return errorBody('CONFLICT', { status: 'failed' });
-      if (runId === 'run_ghost') return errorBody('NOT_FOUND');
-      return { body: makeCancelResponse(runId) };
-    });
-    const err = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_ok', 'run_conflict', 'run_ghost'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(4); // notFound outranks conflict
-    expect(err.message).toContain('run_ghost');
-  });
-
-  it('cancelled + conflict, no notFound → conflict wins (exit 6)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      const runId = runIdFromCancelUrl(url)!;
-      if (runId === 'run_conflict') return errorBody('CONFLICT', { status: 'blocked' });
-      return { body: makeCancelResponse(runId) };
-    });
-    const err = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_ok', 'run_conflict'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(6);
-    expect(err.message).toContain('run_conflict');
-    expect(err.message).toContain('blocked');
-  });
-
-  it('JSON summary shape carries the conflicting run status', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      const runId = runIdFromCancelUrl(url)!;
-      if (runId === 'run_conflict') return errorBody('CONFLICT', { status: 'passed' });
-      return { body: makeCancelResponse(runId) };
-    });
-    const stdoutLines: string[] = [];
-    await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_ok', 'run_conflict'],
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => {},
-      },
-    ).catch(() => {});
-    const summary = JSON.parse(stdoutLines.join('\n')) as CliCancelSummary;
-    expect(summary.cancelled).toEqual(['run_ok']);
-    expect(summary.conflicts).toEqual([{ runId: 'run_conflict', status: 'passed' }]);
-  });
-
-  it('a rejected key on every id → exits 3 with the typed AUTH_INVALID error, summary still printed', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => errorBody('AUTH_INVALID'));
-    const stdoutLines: string[] = [];
-    const err = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_1', 'run_2'],
-      },
-      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
-    ).catch(e => e);
-
-    // Same answer the single-id form gives — not the generic per-member 1.
-    expect(err).toBeInstanceOf(ApiError);
-    expect(err.exitCode).toBe(3);
-    expect(err.code).toBe('AUTH_INVALID');
-    const summary = JSON.parse(stdoutLines.join('\n')) as CliCancelSummary;
-    expect(summary.errors.map(e => e.runId)).toEqual(['run_1', 'run_2']);
-  });
-
-  it('a too-old CLI (426 CLIENT_TOO_OLD) → exits 14, as with a single id', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => errorBody('CLIENT_TOO_OLD'));
-    const err = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_1', 'run_2'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(14);
-    expect(err.code).toBe('CLIENT_TOO_OLD');
-  });
-
-  it('auth outranks notFound and conflict: cancelled + 404 + 409 + 401 → exit 3', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      const runId = runIdFromCancelUrl(url)!;
-      if (runId === 'run_ghost') return errorBody('NOT_FOUND');
-      if (runId === 'run_conflict') return errorBody('CONFLICT', { status: 'failed' });
-      if (runId === 'run_denied') return errorBody('AUTH_INVALID');
-      return { body: makeCancelResponse(runId) };
-    });
-    const err = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_ok', 'run_ghost', 'run_conflict', 'run_denied'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(3);
-    expect(err.code).toBe('AUTH_INVALID');
-  });
-
-  it('auth outranks a too-old CLI: 426 on the first id, 401 on the second → exit 3', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url =>
-      runIdFromCancelUrl(url) === 'run_1' ? errorBody('CLIENT_TOO_OLD') : errorBody('AUTH_INVALID'),
-    );
-    const err = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_1', 'run_2'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(3);
-    expect(err.code).toBe('AUTH_INVALID');
-  });
-
-  it('a non-batch-wide member error keeps the generic exit 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(url => {
-      const runId = runIdFromCancelUrl(url)!;
-      if (runId === 'run_bad') return errorBody('VALIDATION_ERROR');
-      return { body: makeCancelResponse(runId) };
-    });
-    const err = await runTestCancel(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        runIds: ['run_ok', 'run_bad'],
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-    expect(err.exitCode).toBe(1);
-    expect(err.message).toContain('run_bad');
+  it('renders missing runs and request errors in text', async () => {
+    const h = harness(id => (id === 'e1' ? failure('NOT_FOUND', 404) : failure('CONFLICT', 409)));
+    await expect(h.cancel(['e1', 'e2'], 'text')).rejects.toBeInstanceOf(ApiError);
+    expect(h.stdout.join('')).toContain('Run e1 — not found');
+    expect(h.stdout.join('')).toContain('Run e2 — CONFLICT from server');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Dry-run
-// ---------------------------------------------------------------------------
-
-describe('runTestCancel — dry-run', () => {
-  it('single id: prints the dry-run banner and a canned cancelled envelope, no real network', async () => {
-    resetDryRunBannerForTesting();
-    const stderrLines: string[] = [];
-    const result = (await runTestCancel(
-      { profile: 'default', output: 'json', debug: false, dryRun: true, runIds: ['run_dry'] },
-      { stdout: () => {}, stderr: line => stderrLines.push(line) },
-    )) as CancelRunResponse;
-    expect(stderrLines.some(l => l.includes(DRY_RUN_BANNER))).toBe(true);
-    expect(result.status).toBe('cancelled');
-    expect(result.alreadyCancelled).toBe(false);
+describe('run cancel: interrupts', () => {
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'preserves %s and reports completed/current/unattempted requests',
+    async signal => {
+      const h = harness(id => {
+        if (id === 'e2') throw new InterruptError(signal);
+        return json(response(id));
+      });
+      await expect(h.cancel(['e1', 'e2', 'e3'])).rejects.toMatchObject({
+        exitCode: signal === 'SIGINT' ? 130 : 143,
+      });
+      expect(h.calls).toHaveLength(2);
+      expect(h.doc().cancelled).toEqual(['e1']);
+      expect(h.doc().interrupted).toBe('e2');
+      expect(h.doc().notAttempted).toEqual(['e3']);
+    },
+  );
+  it('interrupt outranks an earlier missing run', async () => {
+    const h = harness(id => {
+      if (id === 'e2') throw new InterruptError('SIGINT');
+      return failure('NOT_FOUND', 404);
+    });
+    await expect(h.cancel(['e1', 'e2'])).rejects.toMatchObject({ exitCode: 130 });
+    expect(h.doc().notFound).toEqual(['e1']);
+  });
+  it('dry-run uses the native canned cancel envelope offline', async () => {
+    const h = harness(() => {
+      throw new Error('network called');
+    });
+    await runTestCancel(
+      { profile: 'default', debug: false, output: 'json', runIds: ['sample'], dryRun: true },
+      {
+        ...h.deps,
+        fetchImpl: undefined,
+        env: {},
+        credentialsPath: '/tmp/no-credentials-for-cancel-contract',
+      },
+    );
+    expect(h.calls).toHaveLength(0);
+    expect(h.doc().runs[0].results[0]).toHaveProperty('resultId');
   });
 });

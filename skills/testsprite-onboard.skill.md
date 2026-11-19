@@ -11,8 +11,8 @@ Seed a repo with no tests into a coherent suite and 2–3 passing smoke tests.
 
 This skill only uses shipped CLI commands. Do **not** call backend APIs directly.
 
-For deployed targets, try generation first (V3 required), then author by hand.
-Local projects use authored plans directly; exploration is unavailable.
+The tests are written by the project's agent (`testsprite plan` → `testsprite apply`);
+you give it what it needs, review what it proposes, and smoke-run the result.
 
 ## When to use
 
@@ -45,41 +45,41 @@ Read the source to identify:
 
 Use code-derived routes/handlers; do not guess.
 
-### 2. Create the project
-
-Deployed frontend:
+### 2. Create the project and its environment
 
 ```bash
-testsprite project create --type frontend --name "<repo name>" --url <app-url> \
+testsprite project create --type frontend --name "<repo name>"   # or --type backend
+```
+
+Capture the returned `projectId`, then say where the app runs.
+
+Deployed:
+
+```bash
+testsprite project env create <projectId> --name default --url <app-url> \
   [--username <user> --password-file <path-to-secret>]
 ```
 
-Local frontend (start the app first; V3 required):
+Local frontend (start the app first):
 
 ```bash
-testsprite project create --type frontend --name "<repo name>" --local <port> --local-host <host>
+testsprite project env create <projectId> --name local --local <port>
 ```
 
-`--local` stores `http://<host>:<port>`; `--local-host` sets both probe and URL host:
-`localhost`, `127.0.0.1` (default), or `::1` (`http://[::1]:<port>`).
-Reuse the host on runs; omit for default IPv4.
-`project get/list`: JSON `originMode: 'local'`, text `(Local)`.
-No `--url`. Dead port: exit 5 (`--skip-preflight` bypasses).
-V2-only: exit 7 (`local-origin-requires-v3`). Local runs work on Free and need
-`run:tunnel` (mint a new key if missing).
+`--local` stores `http://localhost:<port>`; `--url http://127.0.0.1:<port>` or
+`http://[::1]:<port>` keeps another loopback host. Reuse that host on runs with
+`--local-host`; omit it for `localhost`. Dead port: exit 5 (`--skip-preflight` bypasses).
+Local runs work on Free and need `run:tunnel` (mint a new key if missing).
 
-Backend:
+With a frontend test account, the cloud agent logs in through the tunnel using the
+environment's username/password. OTP environments are refused before charge (exit 6).
 
-```bash
-testsprite project create --type backend --name "<repo name>"
-```
-
-Capture the returned `projectId`.
-
-For frontend, configure login with
-`--username/--password-file` if needed; the cloud agent logs in through the tunnel
-using the project environment's username/password. OTP environments are refused
-before charge (exit 6).
+Backend: configure the API credential once on its environment (ask the user for the value —
+never invent it or reuse a key you happened to see). The agent's tests read it from the
+injected `__AUTH_HEADERS__`; they never hardcode it. A static credential:
+`testsprite project env update <projectId> <env> --auth bearer|basic|apikey --credential-file <f>`
+(extra headers: `--header "Name: value"`, secret ones in `--header-file <f>`); a sign-in that
+refreshes the credential: `--auto-auth-file <f>`.
 
 #### 2b. FE: register the app's test-hook attribute
 
@@ -87,157 +87,75 @@ If the source tags elements with something other than `data-testid` (e.g. `data-
 run `testsprite project update <projectId> --test-id-attributes data-element,data-testid`
 once; exported locators then use the tag (check: `project get` → `testIdAttrs:`).
 
-### 3. Get the tests
+### 3. Ask the project's agent for the tests
 
-**Local project: go directly to 3b.** Creation does no exploration/generation;
-`test plan generate` is refused before charge (exit 6). Author a plan, then use:
-
-```bash
-testsprite test create --plan-from plan.json --project <projectId>
-testsprite test run <testId> --local <port> --local-host <host>
-```
-
-Portal runs are blocked for free until `project update <id> --url https://…` sets
-a public URL. For deployed projects, try 3a first.
-
-#### 3a. Preferred: generate → review → accept
-
-Proposals stage on the server for review; no files are written locally.
-
-API projects require an API spec (`no_processed_inputs` without one). An optional
-PRD supplements it (`--role prd`, 0.5 credits); a PRD alone can charge strategy and
-then fail for missing endpoints. Deployed frontend exploration supplies its inputs.
+Name the flows from step 1 in the request, so the suite covers them rather than one page.
+Attach what the agent can't see: an API spec (backend projects need one), a PRD, your
+change.
 
 ```bash
-testsprite project docs upload ./openapi.yaml --project <projectId> --role api-doc
-testsprite project docs upload ./prd.md --project <projectId> --role prd   # optional, with the spec
+testsprite plan "Seed a first suite: <the 4–8 flows from step 1>" --project <projectId> \
+  [--file ./openapi.yaml] [--file ./prd.md] [--diff] --output json
 ```
+
+- Frontend: the agent explores the deployed app in a real browser. A local project's app
+  can't be opened from the cloud: attach your change (`--diff`) and the agent works from it.
+- `"state": "replied"` → read `reply`; answer from the code what you can with
+  `testsprite reply "..."`, ask the user only what only they know.
+- Exit 7: still working; `testsprite status --wait` follows it.
+- Exit 13: the agent isn't enabled for this account. Tell the user and stop — the CLI
+  has no other way to write tests.
+
+`"state": "proposed"` → review the plan against the source before applying it:
+
+- Drop flows that don't exist and duplicates.
+- Every assertion names an observable element, text, URL, count, or status; vague
+  ones like "verify it works" create false passes.
+- Aim for ~8–15 tests covering the core flows. Don't pad.
 
 ```bash
-testsprite test plan generate --project <projectId>
+testsprite apply                                   # all of it
+testsprite apply --exclude <ref>,<ref>             # without some tests
+testsprite apply --answer 1=b --answer 2=a,c       # a card that asks questions: answer by letter
+testsprite reject "<what to change>"               # the agent revises and proposes again
 ```
 
-Only missing stages run. Frontend exploration can take minutes. If cut off, the
-running stage finishes; re-run to continue. If inputs are processing, wait and re-run.
+`apply` prints the saved test ids (`applied.tests` in JSON).
 
-Review titles and steps against the source. Drop nonexistent flows, duplicates,
-and vague assertions before accepting.
-
-```bash
-testsprite test plan accept --project <projectId>                       # all of them
-testsprite test plan accept --project <projectId> --only prop_2 prop_5  # or a subset
-```
-
-A subset accept **discards the rest**, so name every proposal you want in that one call.
-Then `testsprite test list --project <projectId>` for the ids, and go to step 5
-(**skip step 4** — that's the hand-authoring path).
-
-If generation is unavailable (older CLI, non-V3 account/exit 6, or missing inputs),
-report the reason and author tests using 3b. Local-project creation itself still
-requires V3.
-
-#### 3b. Author the tests by hand
-
-**Frontend** — one JSON plan file per flow, in a directory (e.g. `./testsprite-plans/`).
-Each file is a COMPLETE plan and must include `projectId` (from step 2), `type: "frontend"`,
-`name`, and `planSteps` — `create-batch` reads the project from each file, not from a flag:
-
-```json
-{
-  "projectId": "<projectId from step 2>",
-  "type": "frontend",
-  "name": "Checkout — guest can complete a purchase",
-  "planSteps": [
-    { "type": "action", "description": "Navigate to /products and open the first product" },
-    { "type": "action", "description": "Click 'Add to cart', then go to /cart" },
-    {
-      "type": "assertion",
-      "description": "The cart shows exactly 1 line item with the product's name and price"
-    },
-    { "type": "action", "description": "Proceed to checkout as guest and submit the test payment" },
-    { "type": "assertion", "description": "A confirmation page appears showing an order number" }
-  ]
-}
-```
-
-**Backend** — one `.py` file per endpoint, using `requests` with concrete assertions on
-status code and response body.
-
-**Backend auth:** read injected `__AUTH_HEADERS__`; never hardcode Bearer/JWT tokens,
-API keys, basic-auth blobs, or cookies. TestSprite injects `__AUTH_CREDENTIAL__`,
-`__AUTH_TYPE__`, and `__AUTH_HEADERS__` from project Authentication settings.
-The headers already match the configured type (Authorization for Bearer/basic,
-X-API-Key for API keys). Spread them into each request:
-
-```python
-r = requests.get(f"{TARGET_URL}/orders", headers={**__AUTH_HEADERS__})
-```
-
-Configure the credential once on the project (ask the user for the value — never invent it or
-reuse a key you happened to see): a static credential with
-`testsprite project credential <projectId> --type "Bearer token"|"API key"|"basic token" --credential <value>`,
-or an auto-refreshing login with `testsprite project auto-auth <projectId> …` so scheduled/repeat
-runs keep working after the token expires. A hardcoded token expires within hours and a hardcoded
-key can't be rotated centrally — `test create` emits a `[warn]` on an inlined credential; treat it
-as a must-fix.
-
-Each assertion must name an observable element, text, URL, count, or status;
-vague ones like "verify it works" create false passes.
-
-Aim for ~8–15 tests covering the core flows. Don't pad.
-
-### 4. Batch-create (hand-authored path only — skip if you accepted generated proposals)
-
-Frontend (one call, up to 50 plans from the directory — `create-batch` is FE-only and has
-**no `--project` flag**; the project comes from each plan file's `projectId`):
-
-```bash
-testsprite test create-batch --plan-from-dir ./testsprite-plans
-```
-
-Backend (one call per file — `create-batch` is FE-only; `--name` is required):
-
-```bash
-testsprite test create --type backend --name "<behavior being tested>" \
-  --code-file ./tests/<endpoint>.py --project <projectId>
-```
-
-Capture the created `testId`s from the output.
-
-### 5. Smoke-run a few — NOT all (protect credits)
+### 4. Smoke-run a few — NOT all (protect credits)
 
 Pick the **2–3 highest-value happy-path** tests (prefer ones you're most confident are green)
 and run only those:
 
 ```bash
-testsprite test run <testId> --wait                     # deployed target
-testsprite test run <testId> --local <port> --local-host <host>  # local frontend
+testsprite run <test-id> --wait                     # deployed target
+testsprite run <test-id> --local <port> --local-host <host>  # local frontend
 ```
 
-Do **not** run the whole suite automatically. V3 frontend runs, including local runs,
+Do **not** run the whole suite automatically. Frontend runs, including local runs,
 cost 0.5 credit each; check `testsprite usage` before sizing the suite.
-Local runs wait (1200 s per run). Put several in ONE `test run <id> <id> --local <port>`
-(one tunnel, 5 at a time); each process holds 1 of 5 tunnel slots. Keep the stderr
-`Run <runId>` receipt. An owned local timeout cancels by default: start a new run with
-`--local <port> --local-host <host> --timeout 1800` (same host), not `test wait`. A run cancelled before it finished is refunded.
+Local runs wait (1200 s each). Put several in ONE `run <id> <id> --local <port>`
+(one tunnel, 5 at a time; each process holds 1 of 5 tunnel slots). Keep the stderr
+`Run <run-id>` receipt. An owned local timeout cancels by default: start a new run with
+`--local <port> --local-host <host> --timeout 1800` (same host), not `run wait`. For a frontend test cancelled before a terminal verdict the server attempts a refund; read the reported `refund`.
 
-### 6. Report
+### 5. Report
 
 Tell the user, plainly:
 
 - "Your project now has **N** tests covering: <list the flows>."
 - "I smoke-ran **M** — here's the result: <pass/fail + the dashboard link from the run output>."
-- "To run the rest (≈X credits — state the cost so they choose knowingly):
-  - frontend — use `test run <testId> --wait` for deployed targets or
-    `test run --all --project <id> --local <port> --local-host <host>` for local targets;
-  - backend — `testsprite test run --all --project <id>` (wave-ordered, runs every BE test)."
+- "To run the rest (≈X credits, so they choose knowingly):
+  - frontend — use `run <test-id> --wait` for deployed targets or
+    `run --project <id> --local <port> --local-host <host>` for local targets;
+  - backend — `testsprite run --project <id>` (wave-ordered, runs every BE test)."
 
 ## Quality checklist (self-check before reporting done)
 
 - [ ] FE project has a public `--url` or uses `--local`; login configured if needed.
-- [ ] API project: an API spec uploaded before generating (a PRD is optional, alongside it) — or you used path 3b.
-- [ ] If you generated: you **read the proposals** and dropped the ones that don't fit,
-      rather than accepting the batch unseen.
+- [ ] API project: the API spec attached to the request (a PRD is optional, alongside it).
+- [ ] You **read the plan** and rejected or excluded the tests that don't fit,
+      rather than applying it unseen.
 - [ ] Every FE assertion names a concrete, observable outcome (no "verify it works").
 - [ ] Tests cover the core flows you found in the code, not just one page.
 - [ ] Smoke-ran 2–3 happy-path tests, not the whole suite.
@@ -246,14 +164,11 @@ Tell the user, plainly:
 ## Don'ts
 
 - Don't auto-run the full suite (credit wall / surprise 402).
-- Don't write narrative assertions an AI judge can't fail.
+- Don't apply narrative assertions an AI judge can't fail.
 - Don't call backend endpoints directly — only the `testsprite` CLI.
 - Don't create a FE project without public `--url` or `--local <port>`.
-- Don't re-seed a project that already has tests — that's not this skill's job.
-- Don't accept a generated batch unread — reviewing it is the point of the staging step.
-- Don't stall when generation isn't available — say so and hand-author instead.
-- Don't re-run `test plan generate` hoping for a different batch: with proposals already
-  staged it starts nothing, and regenerating is a Portal action today.
+- Don't apply a plan unread — reviewing it is the point of the proposal.
+- Don't write or edit tests yourself — ask the agent (`reply`, `reject`, or a new `plan`).
 
 ## Hand off to verify
 

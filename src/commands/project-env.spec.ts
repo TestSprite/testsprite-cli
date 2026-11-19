@@ -24,6 +24,7 @@ import {
   runEnvUpdate,
   type CliProjectEnvironment,
 } from './project-env.js';
+import { onFakeTimers } from '../../test/helpers/fake-timers.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 
@@ -241,6 +242,121 @@ describe('project env — command surface', () => {
     expect(update.options.map(o => o.long)).not.toContain('--clear-url');
     const del = envCmd.commands.find(c => c.name() === 'delete')!;
     expect(del.options.map(o => o.long)).toContain('--confirm');
+  });
+});
+
+const PORTAL_URL =
+  'https://portal.example.com/dashboard-v3/o/org-1/projects/proj/settings/environments?env=env-1';
+
+function manual(
+  session: string,
+  expiresAt: string | null = '2026-11-14T23:45:05.000Z',
+  ttl = 120,
+): Partial<CliProjectEnvironment> {
+  return {
+    authMode: 'manual',
+    hasCredentials: false,
+    username: null,
+    portalUrl: PORTAL_URL,
+    manualLogin: {
+      session,
+      capturedAt: session === 'never' ? null : '2026-11-14T23:43:05.000Z',
+      expiresAt,
+      sessionReuseTtlSeconds: ttl,
+    },
+  };
+}
+
+describe('manual login state and the Portal link', () => {
+  async function getText(environment: CliProjectEnvironment): Promise<string> {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch([], () => ({ body: { environment } })),
+      stdout: line => output.push(line),
+      stderr: () => {},
+    });
+    await command.parseAsync(['get', PROJECT_ID, 'demo'], { from: 'user' });
+    return output.join('\n');
+  }
+
+  it.each([
+    [manual('never', null), 'not logged in yet', '120s'],
+    [manual('valid'), 'signed in until 2026-11-14T23:45:05.000Z', '120s'],
+    [manual('expired'), 'expired at 2026-11-14T23:45:05.000Z', '120s'],
+    [manual('valid', null, -1), 'signed in (never expires)', 'never expires'],
+  ])('get shows the manual login %#, its TTL and the link', async (fields, login, ttl) => {
+    const text = await getText(env(fields));
+    expect(text).toContain(`login:       ${login}`);
+    expect(text).toContain(`session-ttl: ${ttl}`);
+    expect(text).toContain(`portal:      ${PORTAL_URL}`);
+    expect(text).not.toContain('managed in Portal');
+  });
+
+  it('get from an older server without the fields reads as before', async () => {
+    const text = await getText(env({ authMode: 'manual', hasCredentials: false, username: null }));
+    expect(text).toContain('login:       managed in Portal');
+    expect(text).not.toContain('session-ttl:');
+    expect(text).not.toContain('portal:');
+  });
+
+  it('list adds the manual login state to the AUTH column', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    await runEnvList(
+      { ...COMMON, output: 'text', projectId: PROJECT_ID },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({
+          body: {
+            environments: [
+              env(),
+              env({ name: 'sso', isDefault: false, ...manual('expired') }),
+              env({ name: 'sso-new', isDefault: false, ...manual('never', null) }),
+            ],
+          },
+        })),
+        stdout: l => out.push(l),
+      },
+    );
+    const text = out.join('\n');
+    expect(text).toContain('account (credentials set)');
+    expect(text).toMatch(/sso\s.*manual \(expired\)/);
+    expect(text).toMatch(/sso-new\s.*manual \(not logged in\)/);
+  });
+
+  it.each([
+    [
+      'manual',
+      `SSO selected: runs will NOT be signed in until someone logs in once in the Portal: ${PORTAL_URL} → Log in.`,
+    ],
+    ['otp', `OTP selected: see the provisioned inbox/phone in the Portal: ${PORTAL_URL}.`],
+  ])('create %s points at the environment in the Portal', async (signIn, hint) => {
+    const { credentialsPath } = makeCreds();
+    const stderr: string[] = [];
+    await runEnvCreate(
+      {
+        ...COMMON,
+        output: 'text',
+        projectId: PROJECT_ID,
+        name: 'staging',
+        url: 'https://staging.example.com',
+        signIn,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({
+          body: {
+            environment: env({ name: 'staging', authMode: signIn, portalUrl: PORTAL_URL }),
+            created: true,
+          },
+        })),
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+      },
+    );
+    expect(stderr).toContain(hint);
   });
 });
 
@@ -772,14 +888,16 @@ describe('runEnvCreate', () => {
   it('retries a persistent create conflict once', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
-    const error = await runEnvCreate(
-      { ...COMMON, projectId: PROJECT_ID, name: 'demo', url: env().url },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(calls, () => errorEnvelope('CONFLICT', 409)),
-        stdout: () => {},
-        stderr: () => {},
-      },
+    const error = await onFakeTimers(() =>
+      runEnvCreate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo', url: env().url },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => errorEnvelope('CONFLICT', 409)),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
     ).catch(e => e as ApiError);
     expect(calls).toHaveLength(2);
     expect(error).toMatchObject({ code: 'CONFLICT', exitCode: 6, nextAction: 'x' });
@@ -929,15 +1047,11 @@ describe('runEnvCreate', () => {
   it.each([
     [
       'manual',
-      'SSO selected: runs will NOT be signed in until someone logs in once in the Portal (project → Settings → Environments → staging → Log in). Check with: testsprite project sign-in get ' +
-        PROJECT_ID +
-        ' --env staging',
+      'SSO selected: runs will NOT be signed in until someone logs in once in the Portal (project → Settings → Environments → staging → Log in).',
     ],
     [
       'otp',
-      'OTP selected: see the provisioned inbox/phone with: testsprite project sign-in get ' +
-        PROJECT_ID +
-        ' --env staging',
+      'OTP selected: see the provisioned inbox/phone in the Portal (project → Settings → Environments → staging).',
     ],
   ])('shows a text hint after creating %s', async (signIn, hint) => {
     const { credentialsPath } = makeCreds();
@@ -1092,8 +1206,7 @@ describe('runEnvCreate', () => {
   });
 
   it('--local <port> builds the loopback URL, probes the port once, and sends the marker', async () => {
-    // The same spelling as `project create --local`: an app on your own machine
-    // is named by its port. The CLI builds `http://127.0.0.1:<port>` and sends
+    // An app on your own machine is named by its port. The CLI builds `http://127.0.0.1:<port>` and sends
     // `originMode: 'local'` — the marker is what authorizes storing a loopback
     // address, and it lives on the environment the server creates.
     const { credentialsPath } = makeCreds();
@@ -1653,29 +1766,31 @@ describe('runEnvUpdate', () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
     const nextAction = 'Open https://portal.example.com/settings/environments';
-    const error = await runEnvUpdate(
-      { ...COMMON, projectId: PROJECT_ID, name: 'demo', clearCredentials: true },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(calls, call =>
-          call.method === 'GET'
-            ? { body: { environments: [env()] } }
-            : {
-                status: 409,
-                body: {
-                  error: {
-                    code: 'CONFLICT',
-                    message: 'Portal-only login mode',
-                    nextAction,
-                    requestId: 'req_conflict',
-                    details: { reason: 'portal-only-login-mode' },
+    const error = await onFakeTimers(() =>
+      runEnvUpdate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo', clearCredentials: true },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, call =>
+            call.method === 'GET'
+              ? { body: { environments: [env()] } }
+              : {
+                  status: 409,
+                  body: {
+                    error: {
+                      code: 'CONFLICT',
+                      message: 'Portal-only login mode',
+                      nextAction,
+                      requestId: 'req_conflict',
+                      details: { reason: 'portal-only-login-mode' },
+                    },
                   },
                 },
-              },
-        ),
-        stdout: () => {},
-        stderr: () => {},
-      },
+          ),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
     ).catch(e => e as ApiError);
     expect(calls).toHaveLength(3);
     expect(error).toMatchObject({
@@ -1876,14 +1991,16 @@ describe('runEnvDelete', () => {
   it('maps a server 409 (deleting the default) to exit 6', async () => {
     const { credentialsPath } = makeCreds();
     await expect(
-      runEnvDelete(
-        { ...COMMON, projectId: PROJECT_ID, name: 'demo', confirm: true },
-        {
-          credentialsPath,
-          fetchImpl: makeFetch([], () => errorEnvelope('CONFLICT', 409)),
-          stdout: () => {},
-          stderr: () => {},
-        },
+      onFakeTimers(() =>
+        runEnvDelete(
+          { ...COMMON, projectId: PROJECT_ID, name: 'demo', confirm: true },
+          {
+            credentialsPath,
+            fetchImpl: makeFetch([], () => errorEnvelope('CONFLICT', 409)),
+            stdout: () => {},
+            stderr: () => {},
+          },
+        ),
       ),
     ).rejects.toMatchObject({ code: 'CONFLICT', exitCode: 6 });
   });
@@ -1893,14 +2010,16 @@ describe('runEnvSetDefault', () => {
   it('retries a persistent set-default conflict once', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
-    const error = await runEnvSetDefault(
-      { ...COMMON, projectId: PROJECT_ID, name: 'demo' },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(calls, () => errorEnvelope('CONFLICT', 409)),
-        stdout: () => {},
-        stderr: () => {},
-      },
+    const error = await onFakeTimers(() =>
+      runEnvSetDefault(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo' },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => errorEnvelope('CONFLICT', 409)),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
     ).catch(e => e as ApiError);
     expect(calls).toHaveLength(2);
     expect(error).toMatchObject({ code: 'CONFLICT', exitCode: 6, nextAction: 'x' });
@@ -2039,9 +2158,11 @@ describe('environment compatibility contracts', () => {
       const opts = { ...COMMON, projectId: PROJECT_ID, name: 'demo' };
       let thrown: unknown;
       try {
-        if (operation === 'create') await runEnvCreate({ ...opts, url: env().url }, deps);
-        else if (operation === 'update') await runEnvUpdate({ ...opts, username: 'qa' }, deps);
-        else await runEnvSetDefault(opts, deps);
+        await onFakeTimers(async () => {
+          if (operation === 'create') await runEnvCreate({ ...opts, url: env().url }, deps);
+          else if (operation === 'update') await runEnvUpdate({ ...opts, username: 'qa' }, deps);
+          else await runEnvSetDefault(opts, deps);
+        });
       } catch (err) {
         thrown = err;
       }
@@ -2372,6 +2493,437 @@ describe('dot environment names are refused by every verb', () => {
         },
       );
       expect(calls).toHaveLength(1);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Backend sign-in flags
+// ---------------------------------------------------------------------------
+
+describe('API sign-in flags', () => {
+  const TOKEN = 'tok-DO-NOT-PRINT';
+  const HEADER_SECRET = 'hdr-DO-NOT-PRINT';
+  type Api = NonNullable<CliProjectEnvironment['api']>;
+  const api = (overrides: Partial<Api> = {}): Api => ({
+    url: 'https://api.example.com',
+    auth: 'none',
+    loginUrl: '',
+    loginMethod: 'POST',
+    loginContentType: 'json',
+    loginBody: '',
+    username: '',
+    tokenPath: '',
+    tokenUrl: '',
+    clientId: '',
+    scope: '',
+    region: '',
+    inject: 'bearer',
+    headers: {},
+    credentialSet: false,
+    passwordSet: false,
+    clientSecretSet: false,
+    refreshTokenSet: false,
+    authError: '',
+    ...overrides,
+  });
+  const backendEnv = (overrides: Partial<Api> = {}) =>
+    env({ authMode: 'public', hasCredentials: false, username: null, api: api(overrides) });
+
+  function writeFile(name: string, content: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-env-auth-'));
+    const path = join(dir, name);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes into this test's own mkdtempSync temp dir, never user input.
+    writeFileSync(path, content);
+    return path;
+  }
+
+  it('sends the static credential from a file and never prints it', async () => {
+    for (const output of ['text', 'json'] as const) {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const out: string[] = [];
+      await runEnvUpdate(
+        {
+          ...COMMON,
+          output,
+          projectId: PROJECT_ID,
+          name: 'demo',
+          auth: 'bearer',
+          credentialFile: writeFile('token.txt', `${TOKEN}\n`),
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => ({
+            body: { environment: backendEnv({ auth: 'bearer', credentialSet: true }) },
+          })),
+          stdout: l => out.push(l),
+          stderr: () => {},
+        },
+      );
+      expect(calls.at(-1)).toMatchObject({
+        method: 'PATCH',
+        body: { auth: 'bearer', credential: TOKEN },
+      });
+      const printed = out.join('\n');
+      expect(printed).not.toContain(TOKEN);
+      expect(printed).toContain('bearer');
+      if (output === 'text') expect(printed).toContain('credential:  set');
+    }
+  });
+
+  it('sends a single Basic token for inline pairs and encoded files without printing either form', async () => {
+    const raw = ' üser:pa:ss ';
+    const encoded = Buffer.from(raw).toString('base64');
+    for (const flags of [
+      { credential: raw },
+      { credentialFile: writeFile('basic.txt', raw + '\r\n') },
+      { credentialFile: writeFile('basic.txt', 'Basic ' + encoded + '\n') },
+    ]) {
+      const calls: Call[] = [];
+      const output: string[] = [];
+      await runEnvUpdate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo', auth: 'basic', ...flags },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch(calls, () => ({
+            body: { environment: backendEnv({ auth: 'basic', credentialSet: true }) },
+          })),
+          stdout: line => output.push(line),
+          stderr: line => output.push(line),
+        },
+      );
+      expect(calls.at(-1)?.body).toEqual({ auth: 'basic', credential: encoded });
+      expect(output.join('\n')).not.toContain(raw);
+      expect(output.join('\n')).not.toContain(encoded);
+    }
+  });
+
+  it('refuses malformed Basic credentials without echoing them, including on an inline dry run', async () => {
+    const invalid = 'not-a-secret-token';
+    const calls: Call[] = [];
+    for (const flags of [
+      { credential: invalid, dryRun: true },
+      { credentialFile: writeFile('bad', invalid) },
+    ]) {
+      const output: string[] = [];
+      const result = runEnvCreate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'demo',
+          url: 'https://api.example.com',
+          auth: 'basic',
+          ...flags,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch(calls, () => ({ body: {} })),
+          stdout: line => output.push(line),
+          stderr: line => output.push(line),
+        },
+      );
+      const error = await result.catch((err: unknown) => err);
+      expect(error).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        nextAction: expect.stringContaining('username:password'),
+      });
+      expect(JSON.stringify(error)).not.toContain(invalid);
+      expect(output.join('\n')).not.toContain(invalid);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('replaces the headers from --header and --header-file; a secret value is shown as set', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const out: string[] = [];
+    await runEnvUpdate(
+      {
+        ...COMMON,
+        output: 'text',
+        projectId: PROJECT_ID,
+        name: 'demo',
+        header: ['X-Org: 123'],
+        headerFile: writeFile('headers.txt', `X-Token: ${HEADER_SECRET}\n\n`),
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({
+          body: { environment: backendEnv({ headers: { 'X-Org': '123', 'X-Token': null } }) },
+        })),
+        stdout: l => out.push(l),
+        stderr: () => {},
+      },
+    );
+    expect(calls.at(-1)?.body).toEqual({
+      extraHeaders: { 'X-Org': '123', 'X-Token': HEADER_SECRET },
+    });
+    const printed = out.join('\n');
+    expect(printed).toContain('headers:     2');
+    expect(printed).toContain('  X-Org: 123');
+    expect(printed).toContain('  X-Token: <set>');
+    expect(printed).not.toContain(HEADER_SECRET);
+  });
+
+  it('sends the auto-auth file as it is, switched on, and says so when the trial login failed', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const err: string[] = [];
+    // `loginPath` is not a field; it goes to the server, which refuses it. The CLI keeps no list.
+    const config = {
+      method: 'password',
+      inject: 'bearer',
+      loginUrl: 'https://api.example.com/login',
+      loginPath: '/kept-for-the-server',
+    };
+    await runEnvUpdate(
+      {
+        ...COMMON,
+        output: 'text',
+        projectId: PROJECT_ID,
+        name: 'demo',
+        autoAuthFile: writeFile('login.json', JSON.stringify(config)),
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({
+          body: {
+            environment: backendEnv({
+              auth: 'login',
+              loginUrl: config.loginUrl,
+              authError: 'Login endpoint returned 401',
+            }),
+          },
+        })),
+        stdout: () => {},
+        stderr: l => err.push(l),
+      },
+    );
+    expect(calls.at(-1)?.body).toEqual({ autoAuth: { enabled: true, ...config } });
+    expect(err.join('\n')).toContain('trial login failed (Login endpoint returned 401)');
+
+    err.length = 0;
+    await runEnvUpdate(
+      {
+        ...COMMON,
+        output: 'text',
+        projectId: PROJECT_ID,
+        name: 'demo',
+        autoAuthFile: writeFile(
+          'login.json',
+          '{"enabled": false, "method": "password", "inject": "bearer"}',
+        ),
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({ body: { environment: backendEnv() } })),
+        stdout: () => {},
+        stderr: l => err.push(l),
+      },
+    );
+    expect(calls.at(-1)?.body).toEqual({
+      autoAuth: { enabled: false, method: 'password', inject: 'bearer' },
+    });
+    expect(err).toEqual([]);
+  });
+
+  it('refuses bad flags and bad files before any request; dry-run reads no file', async () => {
+    const missing = join(tmpdir(), 'cli-env-auth-missing', 'token.txt');
+    const cases: Array<Record<string, unknown>> = [
+      { auth: 'public' },
+      { auth: 'Bearer token' },
+      { credential: TOKEN, credentialFile: '/nope' },
+      { credentialFile: missing },
+      { auth: 'none', credential: TOKEN },
+      { credentialFile: writeFile('token.txt', '  \n') },
+      { auth: 'bearer', autoAuthFile: writeFile('login.json', '{"method": "password"}') },
+      { credential: TOKEN, autoAuthFile: writeFile('login.json', '{"method": "password"}') },
+      { autoAuthFile: writeFile('login.json', '{not json') },
+      { autoAuthFile: writeFile('login.json', '[]') },
+      { header: ['NoColon'] },
+      { header: ['X Bad: v'] },
+      { header: ['X-Org:   '] },
+      { header: ['X-Org: 1', 'x-org: 2'] },
+      { header: ['X-Test: ok\r\nX-Injected: yes'] },
+      { headerFile: writeFile('headers.txt', 'bad line\n') },
+    ];
+    for (const flags of cases) {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      await expect(
+        runEnvUpdate(
+          { ...COMMON, projectId: PROJECT_ID, name: 'demo', ...flags },
+          {
+            credentialsPath,
+            fetchImpl: makeFetch(calls, () => ({ body: { environment: backendEnv() } })),
+            stdout: () => {},
+            stderr: () => {},
+          },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      expect(calls).toEqual([]);
+    }
+
+    const { credentialsPath } = makeCreds();
+    const dry = await runEnvUpdate(
+      {
+        ...COMMON,
+        dryRun: true,
+        projectId: PROJECT_ID,
+        name: 'demo',
+        auth: 'bearer',
+        credentialFile: missing,
+        header: ['X-Org: 1', 'X-Token: s'],
+      },
+      { credentialsPath, stdout: () => {}, stderr: () => {} },
+    );
+    expect(dry.environment.api).toMatchObject({
+      auth: 'bearer',
+      credentialSet: true,
+      headers: { 'X-Org': null, 'X-Token': null },
+    });
+    expect(JSON.stringify(dry)).not.toContain("'s'");
+    await expect(
+      runEnvUpdate(
+        {
+          ...COMMON,
+          dryRun: true,
+          projectId: PROJECT_ID,
+          name: 'demo',
+          auth: 'none',
+          credential: TOKEN,
+        },
+        { credentialsPath, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('create needs a type for a credential, and sends the sign-in fields with the new environment', async () => {
+    for (const dryRun of [false, true]) {
+      for (const flags of [{ credential: TOKEN }, { auth: 'none', credential: TOKEN }]) {
+        const { credentialsPath } = makeCreds();
+        const calls: Call[] = [];
+        await expect(
+          runEnvCreate(
+            {
+              ...COMMON,
+              dryRun,
+              projectId: PROJECT_ID,
+              name: 'staging',
+              url: 'https://api.example.com',
+              ...flags,
+            },
+            {
+              credentialsPath,
+              fetchImpl: makeFetch(calls, () => ({ body: { environment: backendEnv() } })),
+              stdout: () => {},
+              stderr: () => {},
+            },
+          ),
+        ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+        expect(calls).toEqual([]);
+      }
+    }
+
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await runEnvCreate(
+      {
+        ...COMMON,
+        projectId: PROJECT_ID,
+        name: 'staging',
+        url: 'https://api.example.com',
+        auth: 'apikey',
+        credential: TOKEN,
+        header: ['X-Org: 1'],
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({
+          body: {
+            environment: backendEnv({
+              auth: 'apikey',
+              credentialSet: true,
+              headers: { 'X-Org': '1' },
+            }),
+            created: true,
+          },
+        })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(calls.at(-1)).toMatchObject({
+      method: 'POST',
+      body: { name: 'staging', auth: 'apikey', credential: TOKEN, extraHeaders: { 'X-Org': '1' } },
+    });
+  });
+
+  it('reports UNSUPPORTED when an older server answers without the API sign-in', async () => {
+    const { credentialsPath } = makeCreds();
+    const older = () => ({ body: { environment: env(), created: true } });
+    await expect(
+      runEnvUpdate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo', auth: 'none' },
+        { credentialsPath, fetchImpl: makeFetch([], older), stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED' });
+    await expect(
+      runEnvCreate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'staging',
+          url: 'https://api.example.com',
+          auth: 'bearer',
+          credential: TOKEN,
+        },
+        { credentialsPath, fetchImpl: makeFetch([], older), stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      message: expect.stringContaining("environment 'demo' was created without it"),
+    });
+  });
+
+  it("get renders the agent's lines for a backend environment", async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    await runEnvGet(
+      { ...COMMON, output: 'text', projectId: PROJECT_ID, name: 'demo' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({
+          body: {
+            environment: backendEnv({
+              auth: 'login',
+              loginUrl: 'https://api.example.com/login',
+              username: 'qa@example.com',
+              passwordSet: true,
+              tokenPath: '$.token',
+              headers: { 'X-Org': '1', 'X-Token': null },
+            }),
+          },
+        })),
+        stdout: l => out.push(l),
+        stderr: () => {},
+      },
+    );
+    const printed = out.join('\n');
+    for (const line of [
+      'auth:        login',
+      'login-url:   https://api.example.com/login',
+      'username:    qa@example.com',
+      'password:    set',
+      'token-path:  $.token',
+      'inject:      bearer',
+      'headers:     2',
+      '  X-Org: 1',
+      '  X-Token: <set>',
+    ]) {
+      expect(printed).toContain(line);
     }
   });
 });

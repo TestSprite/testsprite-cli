@@ -1,21 +1,26 @@
+import { projectRun, runListing } from '../../test/helpers/project-run.js';
+import { resultLine } from '../../test/helpers/result-list.js';
 import { Command } from 'commander';
 import { describe, expect, it, vi } from 'vitest';
 import { createCiCommand } from './ci.js';
-import { createTestCommand } from './test.js';
+import { createRunCommand } from './test.js';
 
 const projectTests = [
-  { id: 'test-alpha', name: 'Alpha checkout', type: 'backend', status: 'passed' },
-  { id: 'test-beta', name: 'Beta', type: 'backend', status: 'passed' },
+  { id: 'test-alpha', title: 'Alpha checkout', type: 'backend' },
+  { id: 'test-beta', title: 'Beta', type: 'backend' },
 ];
 
 const batchCommands = [
-  { name: 'test run', args: ['test', 'run', '--all', '--no-wait'], path: '/tests/batch/run' },
   {
-    name: 'test rerun',
-    args: ['test', 'rerun', '--all', '--no-wait'],
-    path: '/tests/batch/rerun',
+    name: 'run',
+    args: ['run', '--no-wait'],
+    path: '/projects/project-1/runs',
   },
-  { name: 'ci run', args: ['ci', 'run', '--no-execution-report'], path: '/tests/batch/run' },
+  {
+    name: 'ci run',
+    args: ['ci', 'run', '--no-execution-report'],
+    path: '/projects/project-1/runs',
+  },
 ];
 
 /** All reads and dispatches are fixtures; no request reaches a real server. */
@@ -45,42 +50,23 @@ function harness() {
           },
         ],
       };
-    } else if (method === 'POST' && ['/tests/batch/run', '/tests/batch/rerun'].includes(path)) {
+    } else if (method === 'POST' && path === '/projects/project-1/runs') {
       const ids = (body.testIds as string[] | undefined) ?? projectTests.map(test => test.id);
-      response = {
-        accepted: ids.map(testId => ({
-          testId,
-          runId: `run-${testId}`,
-          enqueuedAt: '2026-09-18T00:00:00Z',
-        })),
-        conflicts: [],
-        deferred: [],
-        skippedFrontend: [],
-        skippedIntegration: [],
-        closure: { byProject: [] },
-        ...(body.admission !== undefined ? { admission: body.admission } : {}),
-      };
-    } else if (path.startsWith('/runs/') && method === 'GET') {
-      const runId = path.slice('/runs/'.length);
-      response = {
-        runId,
-        testId: runId.slice('run-'.length),
-        projectId: 'project-1',
-        userId: 'user-1',
-        status: 'passed',
-        source: 'cli',
-        createdFrom: 'cli',
-        createdAt: '2026-09-18T00:00:00Z',
-        startedAt: '2026-09-18T00:00:01Z',
-        finishedAt: '2026-09-18T00:00:03Z',
-        codeVersion: 'v1',
-        targetUrl: 'https://app.example.com',
-        failedStepIndex: null,
-        failureKind: null,
-        error: null,
-        videoUrl: null,
-        stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-      };
+      response = projectRun({ runId: 'exec-filter', projectId: 'project-1', total: ids.length });
+    } else if (path === '/results' && method === 'GET') {
+      const dispatched = requests.find(request => request.method === 'POST')?.body.testIds as
+        string[] | undefined;
+      response = runListing(
+        { runId: 'exec-filter', status: 'finished', cancelled: false },
+        (dispatched ?? projectTests.map(test => test.id)).map(id =>
+          resultLine({
+            resultId: `result-${id}`,
+            runId: 'exec-filter',
+            caseKey: id,
+            testStatus: 'PASSED',
+          }),
+        ),
+      );
     } else {
       // A non-retryable fixture error also bounds pre-fix single-test failures.
       return new Response(
@@ -110,7 +96,7 @@ function harness() {
     sleep: async () => {},
   };
   const root = new Command('testsprite').option('--output <mode>', '', 'json').option('--dry-run');
-  root.addCommand(createTestCommand(deps));
+  root.addCommand(createRunCommand(deps));
   root.addCommand(createCiCommand(deps));
   return {
     fetchImpl,
@@ -126,15 +112,10 @@ describe('CLI name-filter validation', () => {
       name: `${command.name} project`,
       args: [...command.args, '--project', 'project-1'],
     })),
-    { name: 'test run single', args: ['test', 'run', 'test-alpha', '--no-wait'] },
+    { name: 'run single', args: ['run', 'test-alpha', '--no-wait'] },
     {
-      name: 'test run multiple',
-      args: ['test', 'run', 'test-alpha', 'test-beta', '--no-wait'],
-    },
-    { name: 'test rerun single', args: ['test', 'rerun', 'test-alpha', '--no-wait'] },
-    {
-      name: 'test rerun multiple',
-      args: ['test', 'rerun', 'test-alpha', 'test-beta', '--no-wait'],
+      name: 'run multiple',
+      args: ['run', 'test-alpha', 'test-beta', '--no-wait'],
     },
   ];
 
@@ -165,6 +146,36 @@ describe('CLI name-filter validation', () => {
       });
       expect(h.fetchImpl).not.toHaveBeenCalled();
     });
+  });
+
+  it('previews a project title filter without substituting dry-run sample tests', async () => {
+    const h = harness();
+    await h.run([
+      '--dry-run',
+      'run',
+      '--project',
+      'project-1',
+      '--filter',
+      'new checkout',
+      '--wait',
+    ]);
+    const output = JSON.parse(h.stdout.join(''));
+    expect(output).toMatchObject({
+      dryRun: true,
+      runs: [],
+      results: [],
+      summary: { total: 0 },
+      filter: 'new checkout',
+      requests: [
+        { method: 'GET', path: '/api/cli/v1/tests?projectId=project-1' },
+        {
+          method: 'POST',
+          path: '/api/cli/v1/projects/project-1/runs',
+          body: { testIds: ['<matching-test-id>'] },
+        },
+      ],
+    });
+    expect(h.requests.some(row => row.method === 'POST' || row.path === '/tests')).toBe(false);
   });
 
   describe.each(batchCommands)('$name selection controls', ({ args, path }) => {

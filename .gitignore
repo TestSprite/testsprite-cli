@@ -14,7 +14,7 @@ coverage/
 test/dev-e2e/fixtures.local.json
 test/dev-e2e/.env.local
 
-# CLI artifact downloads (default output dir for test artifact get)
+# CLI downloads (e.g. result get --out .testsprite/results/<result-id>)
 .testsprite/
 
 # Per-session Claude Code worktrees (parallel-session scratch space). Other

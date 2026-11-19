@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { FACADE_PATH, facadeBaseUrl, resolvePortalBase, resolvePortalUrl } from './facade.js';
+import { FACADE_PATH, facadeBaseUrl, resolvePortalBase } from './facade.js';
 
 describe('facadeBaseUrl', () => {
   it('appends the facade path to a bare host', () => {
@@ -23,66 +23,6 @@ describe('facadeBaseUrl', () => {
   });
 });
 
-describe('resolvePortalUrl', () => {
-  const PROJECT = 'proj_abc';
-  const TEST = 'test_xyz';
-
-  it('prod API URL → www.testsprite.com deep-link', () => {
-    expect(resolvePortalUrl('https://api.testsprite.com', PROJECT, TEST)).toBe(
-      `https://www.testsprite.com/dashboard/tests/${PROJECT}/test/${TEST}`,
-    );
-  });
-
-  it('custom-port API URL without override → undefined (no built-in non-prod mapping)', () => {
-    expect(resolvePortalUrl('https://api.example.com:8443', PROJECT, TEST)).toBeUndefined();
-  });
-
-  it('strips FACADE_PATH suffix before matching', () => {
-    expect(resolvePortalUrl(`https://api.testsprite.com${FACADE_PATH}`, PROJECT, TEST)).toBe(
-      `https://www.testsprite.com/dashboard/tests/${PROJECT}/test/${TEST}`,
-    );
-  });
-
-  it('unknown API URL → undefined (mapping not known)', () => {
-    expect(resolvePortalUrl('https://localhost:3001', PROJECT, TEST)).toBeUndefined();
-    expect(resolvePortalUrl('http://localhost:13503', PROJECT, TEST)).toBeUndefined();
-  });
-
-  // R2: URL-semantics normalisation cases
-  it('trailing slash on prod URL → normalised to prod portal', () => {
-    expect(resolvePortalUrl('https://api.testsprite.com/', PROJECT, TEST)).toBe(
-      `https://www.testsprite.com/dashboard/tests/${PROJECT}/test/${TEST}`,
-    );
-  });
-
-  it('uppercase scheme+host → case-normalised to prod portal', () => {
-    expect(resolvePortalUrl('HTTPS://API.testsprite.com', PROJECT, TEST)).toBe(
-      `https://www.testsprite.com/dashboard/tests/${PROJECT}/test/${TEST}`,
-    );
-  });
-
-  it('explicit :443 on https → treated as default port → prod portal', () => {
-    expect(resolvePortalUrl('https://api.testsprite.com:443', PROJECT, TEST)).toBe(
-      `https://www.testsprite.com/dashboard/tests/${PROJECT}/test/${TEST}`,
-    );
-  });
-
-  it('http scheme on prod hostname → undefined (non-https)', () => {
-    expect(resolvePortalUrl('http://api.testsprite.com', PROJECT, TEST)).toBeUndefined();
-  });
-
-  it('garbage string → undefined (URL parse failure, no crash)', () => {
-    expect(resolvePortalUrl('not-a-url', PROJECT, TEST)).toBeUndefined();
-    expect(resolvePortalUrl('', PROJECT, TEST)).toBeUndefined();
-  });
-
-  // R4: path segments are encodeURIComponent-encoded
-  it('encodes special characters in projectId and testId path segments', () => {
-    const result = resolvePortalUrl('https://api.testsprite.com', 'proj/a b', 'test#1');
-    expect(result).toBe('https://www.testsprite.com/dashboard/tests/proj%2Fa%20b/test/test%231');
-  });
-});
-
 describe('resolvePortalBase', () => {
   it('prod API URL → www origin (no path)', () => {
     expect(resolvePortalBase('https://api.testsprite.com')).toBe('https://www.testsprite.com');
@@ -103,6 +43,11 @@ describe('resolvePortalBase', () => {
     expect(resolvePortalBase('http://localhost:13502')).toBeUndefined();
     expect(resolvePortalBase('http://api.testsprite.com')).toBeUndefined();
     expect(resolvePortalBase('not-a-url')).toBeUndefined();
+    expect(resolvePortalBase('')).toBeUndefined();
+  });
+
+  it('uppercase scheme+host → case-normalised to prod portal', () => {
+    expect(resolvePortalBase('HTTPS://API.testsprite.com')).toBe('https://www.testsprite.com');
   });
 });
 
@@ -125,13 +70,6 @@ describe('TESTSPRITE_PORTAL_URL override', () => {
     vi.stubEnv('TESTSPRITE_PORTAL_URL', 'https://portal.internal.example.com/');
     expect(resolvePortalBase('https://api.example.com:8443')).toBe(
       'https://portal.internal.example.com',
-    );
-  });
-
-  it('override flows through resolvePortalUrl deep-links', () => {
-    vi.stubEnv('TESTSPRITE_PORTAL_URL', 'https://portal.internal.example.com');
-    expect(resolvePortalUrl('https://api.example.com:8443', 'proj_abc', 'test_xyz')).toBe(
-      'https://portal.internal.example.com/dashboard/tests/proj_abc/test/test_xyz',
     );
   });
 

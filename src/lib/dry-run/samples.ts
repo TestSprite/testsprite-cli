@@ -22,74 +22,55 @@ import type {
   CliUpdateProjectResponse,
   CliDeleteProjectResponse,
 } from '../../commands/project.js';
-import type {
-  CliBulkDeleteSummary,
-  CliFailureContext,
-  CliFailureSummary,
-  CliLatestResult,
-  CliTest,
-  CliTestCode,
-  CliTestStep,
-} from '../../commands/test.js';
+import type { CliTest } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
-import { ApiError } from '../errors.js';
-import type { CliSchedule, CliScheduleRun } from '../../commands/schedule.js';
+import type { CliSchedule } from '../../commands/schedule.js';
 import { buildJUnitReport } from '../junit-report.js';
 import type { Page } from '../pagination.js';
 import type {
   TriggerRunResponse,
   RunResponse,
-  RerunResponse,
-  BatchRerunResponse,
   BatchRunFreshResponse,
-  ListRunsResponse,
   CancelRunResponse,
   ExecutionReportResponse,
 } from '../runs.types.js';
-import type {
-  CliAcceptPlansResponse,
-  CliGeneratePlansResponse,
-  CliGetPlansResponse,
-} from '../plans.types.js';
 import type { TunnelListResponse, TunnelStatusResponse } from '../tunnel.types.js';
-import type {
-  CliProjectSignInResponse,
-  CliProjectSignInSetResponse,
-} from '../../commands/project-sign-in.js';
+import type { ResultDetail, ResultList, ResultStep } from '../result/types.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const SAMPLE_KEY_ID = 'key_dryrun_2026';
 
 const SAMPLE_PROJECT_ID = 'project_b3c91efa';
+const SAMPLE_CONVERSATION_ID = 'conv_dryrun_2026';
+const SAMPLE_CONVERSATION_URL = `https://portal.dry-run.invalid/dashboard-v3/projects/${SAMPLE_PROJECT_ID}/agent/${SAMPLE_CONVERSATION_ID}`;
 const SAMPLE_PROJECT_ID_BACKEND = 'project_a47b2c11';
 const SAMPLE_TEST_ID_FAILED = 'test_8f2a4d10';
 const SAMPLE_TEST_ID_PASSED = 'test_3a91bb02';
 const SAMPLE_TEST_ID_BLOCKED = 'test_blocked_4f7a';
-export const SAMPLE_RUN_ID = 'run_abc';
+const SAMPLE_TEST_ID_RUNNING = 'test_running_6c1e';
+/**
+ * The sample run (one launch) and its results, one per test. Result ids start
+ * `res_` and run ids `run_`, so a dry run never shows one under the other's
+ * name.
+ */
+const SAMPLE_RUN_ID = 'run_dryrun0001';
+const SAMPLE_RESULT_ID = 'res_dryrun0001';
+const SAMPLE_RESULT_ID_PASSED = 'res_dryrun0002';
+const SAMPLE_RESULT_ID_BLOCKED = 'res_dryrun0003';
+const SAMPLE_RESULT_ID_RUNNING = 'res_dryrun0004';
 const SAMPLE_SCHEDULE_ID = 'sch_7d21ac48';
-const SAMPLE_SCHEDULE_RUN_ID = 'exec_5c08f1b2';
+const SAMPLE_SCHEDULE_RUN_ID = 'run_dryrun0002';
 const SAMPLE_TUNNEL_ID_1 = '00000000-0000-4000-8000-000000000001';
 const SAMPLE_TUNNEL_ID_2 = '00000000-0000-4000-8000-000000000002';
-// Documented sentinel for `test steps --run-id run_failed_sample --dry-run`:
-// keeps wait flows on the default passed sample while still demonstrating a
-// run-scoped failed step offline.
-const SAMPLE_FAILED_RUN_ID = 'run_failed_sample';
-// M3.4 rerun dry-run sample IDs
-const SAMPLE_RERUN_ID_BE_NAMED = 'run_rerun_be_named';
-const SAMPLE_RERUN_ID_BE_PRODUCER = 'run_rerun_be_producer';
-const SAMPLE_TEST_ID_BE_CONSUMER = 'test_be_consumer_01';
-const SAMPLE_TEST_ID_BE_PRODUCER = 'test_be_producer_01';
-const SAMPLE_RERUN_BATCH_ID_1 = 'run_batch_rerun_001';
-const SAMPLE_RERUN_BATCH_ID_2 = 'run_batch_rerun_002';
-const SAMPLE_TEST_ID_BATCH_1 = 'test_batch_01';
-const SAMPLE_TEST_ID_BATCH_2 = 'test_batch_02';
-const SAMPLE_TEST_ID_DEFERRED = 'test_deferred_01';
-// M4 piece-2 — batch fresh run sample IDs
-const SAMPLE_BATCH_FRESH_RUN_ID_1 = 'run_fresh_batch_001';
-const SAMPLE_BATCH_FRESH_RUN_ID_2 = 'run_fresh_batch_002';
+// A result id `GET /runs/{id}` answers with the failed sample: keeps wait
+// flows on the default passed sample while still demonstrating a failed
+// result offline.
+const SAMPLE_FAILED_RESULT_ID = 'res_failed_sample';
+// The results a fresh batch run starts, in the sample run.
+const SAMPLE_BATCH_FRESH_RESULT_ID_1 = 'res_dryrun0005';
+const SAMPLE_BATCH_FRESH_RESULT_ID_2 = 'res_dryrun0006';
 const SAMPLE_TEST_ID_FRESH_1 = 'test_fresh_wave_01';
 const SAMPLE_TEST_ID_FRESH_2 = 'test_fresh_wave_02';
-const SAMPLE_SNAPSHOT_ID = 'snap_2026_05_05_b2f9a1c8';
 const SAMPLE_TARGET_URL = 'https://staging.example.com/checkout';
 const SAMPLE_REQUEST_ID = 'req_dry-run';
 
@@ -109,12 +90,14 @@ export function sampleJUnitReportXml(
     results: [
       {
         testId: SAMPLE_TEST_ID_FRESH_1,
-        runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
+        resultId: SAMPLE_BATCH_FRESH_RESULT_ID_1,
+        runId: SAMPLE_RUN_ID,
         status: 'passed',
       },
       {
         testId: SAMPLE_TEST_ID_FRESH_2,
-        runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
+        resultId: SAMPLE_BATCH_FRESH_RESULT_ID_2,
+        runId: SAMPLE_RUN_ID,
         status: 'failed',
         error: {
           code: 'ASSERTION',
@@ -131,7 +114,6 @@ const me: MeResponse = {
   keyId: SAMPLE_KEY_ID,
   scopes: ['read:projects', 'read:tests', 'write:tests', 'run:tests'],
   env: 'development',
-  v3Enabled: true,
   activeOrg: {
     id: '22222222-2222-4222-8222-222222222222',
     name: 'Dry Run Workspace',
@@ -183,277 +165,253 @@ const schedule: CliSchedule = {
   updatedAt: '2026-05-02T00:00:00.000Z',
 };
 
-// A finished run with one failure — more instructive for a dry-run learner than
-// an all-green one, since it shows how the per-status counts relate to `status`.
-const scheduleRun: CliScheduleRun = {
-  runId: SAMPLE_SCHEDULE_RUN_ID,
-  scheduleId: SAMPLE_SCHEDULE_ID,
-  status: 'failed',
-  projectId: SAMPLE_PROJECT_ID,
-  testListId: null,
-  stats: { total: 4, passed: 3, failed: 1, blocked: 0, running: 0, cancelled: 0 },
-  createdAt: '2026-05-02T03:00:00.000Z',
-  updatedAt: '2026-05-02T03:06:41.000Z',
-};
-
 const tests: CliTest[] = [
   {
     id: SAMPLE_TEST_ID_FAILED,
     projectId: SAMPLE_PROJECT_ID,
-    name: 'Checkout happy path',
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-001',
+    title: 'Checkout happy path',
+    description: 'Pays for a cart with a saved card and lands on the confirmation page.',
     type: 'frontend',
-    createdFrom: 'portal',
-    status: 'failed',
-    // G1a — priority label shown on one row so dry-run learners see the field.
+    isIntegration: false,
+    category: 'Checkout',
     priority: 'Medium',
+    version: { hash: 'a3f9c2e1d4b7', label: 'v1.2' },
+    stepCount: 8,
     createdAt: '2026-04-20T11:00:00.000Z',
     updatedAt: '2026-05-05T12:34:56.000Z',
-    details: {
-      processingStatus: 'Idle',
-      testStatus: 'Failed',
-      rawStatus: 'ps=Idle; ts=Failed',
-    },
   },
   {
     id: SAMPLE_TEST_ID_PASSED,
     projectId: SAMPLE_PROJECT_ID,
-    name: 'Checkout — declined card',
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-002',
+    title: 'Checkout — declined card',
+    description: null,
     type: 'frontend',
-    createdFrom: 'portal',
-    status: 'passed',
+    isIntegration: false,
+    category: 'Checkout',
     priority: null,
+    version: { hash: '7c1e0b9a5d22', label: 'v1.0' },
+    stepCount: 5,
     createdAt: '2026-04-20T11:00:00.000Z',
     updatedAt: '2026-05-05T08:00:00.000Z',
-    details: {
-      processingStatus: 'Idle',
-      testStatus: 'Passed',
-      rawStatus: 'ps=Idle; ts=Passed',
-    },
   },
   {
-    // M2.1 piece 1: distinct `blocked` status surfaces here so a
-    // dry-run learner sees how blocked rows render. Pre-M2.1 this
-    // would have shown up as `failed` and would have been
-    // indistinguishable from the row above.
     id: SAMPLE_TEST_ID_BLOCKED,
     projectId: SAMPLE_PROJECT_ID,
-    name: 'Checkout — coupon redemption',
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-003',
+    title: 'Checkout — coupon redemption',
+    description: null,
     type: 'frontend',
-    createdFrom: 'portal',
-    status: 'blocked',
+    isIntegration: false,
+    category: 'Checkout',
     priority: null,
+    version: { hash: 'e5d4c3b2a101', label: 'v1.0' },
+    stepCount: 6,
     createdAt: '2026-04-21T09:00:00.000Z',
     updatedAt: '2026-05-05T13:01:12.000Z',
-    details: {
-      processingStatus: 'Idle',
-      testStatus: 'Blocked',
-      rawStatus: 'ps=Idle; ts=Blocked',
-    },
+  },
+  {
+    // Still running in the sample run, so a dry run of `run wait` / `test
+    // cancel` on that run shows the poll and the cancel request it would send.
+    id: SAMPLE_TEST_ID_RUNNING,
+    projectId: SAMPLE_PROJECT_ID,
+    projectName: 'Checkout',
+    slug: 'CHECKOUT-004',
+    title: 'Checkout — saved address',
+    description: null,
+    type: 'frontend',
+    isIntegration: false,
+    category: 'Checkout',
+    priority: null,
+    version: { hash: '9b8a7f6e5d4c', label: 'v1.0' },
+    stepCount: 4,
+    createdAt: '2026-04-22T10:00:00.000Z',
+    updatedAt: '2026-05-05T12:34:03.000Z',
   },
 ];
 
-const testCode: CliTestCode = {
-  testId: SAMPLE_TEST_ID_FAILED,
-  language: 'python',
-  framework: 'playwright',
-  // TestSprite test code is Python: frontend tests are Playwright
-  // (`playwright.async_api`); backend tests use `requests` + assertions.
-  code: [
-    'import asyncio',
-    'from playwright.async_api import async_playwright, expect',
-    '',
-    '',
-    'async def run_test():',
-    '    async with async_playwright() as pw:',
-    '        browser = await pw.chromium.launch(headless=True)',
-    '        context = await browser.new_context()',
-    '        page = await context.new_page()',
-    '        try:',
-    '            await page.goto("https://example.com")  # target URL injected by the runner',
-    '            await page.click(\'[data-testid="cart"]\')',
-    '            await page.click(\'[data-testid="submit"]\')',
-    '            await expect(page.get_by_role("heading", name="Order placed")).to_be_visible()',
-    '        finally:',
-    '            await context.close()',
-    '            await browser.close()',
-    '',
-    '',
-    'asyncio.run(run_test())',
-    '',
-  ].join('\n'),
-  codeVersion: 'v3',
-  etag: 'sha256:c7c4a4f6c1b8c2e5',
-};
-
-// Sample step list. Includes both `outcomeContributesToFailure` per-step
-// flags (M2.1 piece 4) and the synthetic terminal "assertion" row
-// (piece-4 follow-up — also surfaced on `/steps`, not just `/failure`).
-// Step 5 is a real per-step failure → flag `true` only on that row;
-// step 7 is the synthesizer's fallback for assertion-level failures
-// where no per-step row caught the verdict, so dry-run learners see
-// both shapes in one fixture rather than only the per-step case.
-const testSteps: CliTestStep[] = [
-  {
-    testId: SAMPLE_TEST_ID_FAILED,
-    stepIndex: 4,
-    action: 'click',
-    description: 'Click the cart icon',
-    status: 'passed',
-    screenshotUrl: 'https://s3-presigned.example.com/snap/04.png?X-Amz-dryrun',
-    htmlSnapshotUrl: 'https://s3-presigned.example.com/snap/04.html?X-Amz-dryrun',
-    runIdIfAvailable: SAMPLE_RUN_ID,
-    codeVersion: 'v3',
-    capturedAt: '2026-05-05T12:34:55.000Z',
-    updatedAt: '2026-05-05T12:34:56.000Z',
-    outcomeContributesToFailure: false,
-  },
-  {
-    testId: SAMPLE_TEST_ID_FAILED,
-    stepIndex: 5,
-    action: 'click',
-    description: 'Click the submit button',
-    status: 'failed',
-    screenshotUrl: 'https://s3-presigned.example.com/snap/05.png?X-Amz-dryrun',
-    htmlSnapshotUrl: 'https://s3-presigned.example.com/snap/05.html?X-Amz-dryrun',
-    runIdIfAvailable: SAMPLE_RUN_ID,
-    codeVersion: 'v3',
-    capturedAt: '2026-05-05T12:34:56.000Z',
-    updatedAt: '2026-05-05T12:34:56.000Z',
-    outcomeContributesToFailure: true,
-  },
-  {
-    testId: SAMPLE_TEST_ID_FAILED,
-    stepIndex: 6,
-    action: 'expect',
-    description: 'Expect order confirmation heading',
-    status: null,
-    screenshotUrl: null,
-    htmlSnapshotUrl: null,
-    runIdIfAvailable: SAMPLE_RUN_ID,
-    codeVersion: 'v3',
-    capturedAt: null,
-    updatedAt: '2026-05-05T12:34:58.000Z',
-    outcomeContributesToFailure: false,
-  },
-];
-
-const latestResult: CliLatestResult = {
-  testId: SAMPLE_TEST_ID_FAILED,
-  status: 'failed',
-  startedAt: '2026-05-05T12:34:00.000Z',
-  finishedAt: '2026-05-05T12:34:58.000Z',
-  videoUrl: 'https://s3-presigned.example.com/video/run_abc.mp4?X-Amz-dryrun',
-  failureAnalysisUrl: 'https://s3-presigned.example.com/analysis/run_abc.json?X-Amz-dryrun',
-  snapshotId: SAMPLE_SNAPSHOT_ID,
-  runIdIfAvailable: SAMPLE_RUN_ID,
-  codeVersion: 'v3',
-  targetUrl: SAMPLE_TARGET_URL,
-  targetUrlSource: 'run',
-  failedStepIndex: 5,
-  failureKind: 'assertion',
-  verdict: 'failed',
-  executionStatus: 'completed',
-  summary: 'Failed (assertion) on step 5: expected cart badge to show 1 item, but it was empty.',
-};
-
-const failureContext: CliFailureContext = {
-  snapshotId: SAMPLE_SNAPSHOT_ID,
-  testId: SAMPLE_TEST_ID_FAILED,
-  projectId: SAMPLE_PROJECT_ID,
-  result: latestResult,
-  steps: testSteps,
-  code: testCode,
-  failure: {
-    rootCauseHypothesis:
-      'Submit button has `opacity: 0.4` and is rendered as disabled. The checkout ' +
-      "form's `isFormValid` predicate evaluates to false because the credit-card " +
-      'field is empty.',
-    recommendedFixTarget: {
-      kind: 'code',
-      reference: 'src/components/CheckoutForm.tsx:412',
-      rationale:
-        'The disabled state originates from `isFormValid()` in CheckoutForm.tsx; the ' +
-        'submit button only enables when `card.number.length === 16`. The test fixture ' +
-        'leaves the card field empty.',
-    },
-    evidence: [
-      {
-        kind: 'screenshot',
-        stepIndex: 5,
-        url: 'https://s3-presigned.example.com/evidence/run_abc/05.png?X-Amz-dryrun',
-        summary:
-          'Submit button has `opacity: 0.4` and is rendered as disabled. Credit-card ' +
-          'field is empty. No visible error message.',
-      },
-      {
-        kind: 'snapshot',
-        stepIndex: 5,
-        url: 'https://s3-presigned.example.com/evidence/run_abc/05.html?X-Amz-dryrun',
-        summary:
-          '`<button data-testid="submit" disabled aria-disabled="true" ' +
-          'style="pointer-events:none;opacity:0.4">`. DOM diff vs. step 4 shows the ' +
-          "`disabled` attribute being added by the form's onChange handler.",
-      },
-    ],
-  },
-};
+// The failed result of the sample run: the checkout happy path, failing
+// because the card field is empty.
+const SAMPLE_RESULT_ERROR = 'AssertionError: expected the order confirmation heading to be visible';
+const SAMPLE_RESULT_CAUSE =
+  "The submit button stays disabled: the checkout form's `isFormValid` is false because the card field is empty.";
+const SAMPLE_RESULT_FIX = 'Fill the card number before submitting the checkout form.';
 
 /**
- * §5.2 / M2.1 piece 3 — sample for `GET /tests/{testId}/failure/summary`.
- * Mirrors the analysis fields in `failureContext.failure` so a learner
- * comparing dry-run outputs sees the same hypothesis on both surfaces.
+ * The results of the sample run, newest first: one still running, the failed
+ * and the passed test of the report below, and the blocked test, which never
+ * got past sign-in.
+ * Each line names its test by the id and title `test list` prints for it, as
+ * a line from the backend does. The two history-window fields are sent for a
+ * test's history only, so a run's listing leaves them out.
  */
-const failureSummary: CliFailureSummary = {
-  testId: SAMPLE_TEST_ID_FAILED,
-  status: 'failed',
-  failureKind: 'assertion',
-  snapshotId: SAMPLE_SNAPSHOT_ID,
-  rootCauseHypothesis: failureContext.failure.rootCauseHypothesis,
-  recommendedFixTarget: failureContext.failure.recommendedFixTarget,
+const resultListSample: ResultList = {
+  results: [
+    {
+      resultId: SAMPLE_RESULT_ID_RUNNING,
+      runId: SAMPLE_RUN_ID,
+      caseKey: SAMPLE_TEST_ID_RUNNING,
+      title: 'Checkout — saved address',
+      testStatus: 'RUNNING',
+      processStatus: 'Executing',
+      error: null,
+      blockedReason: null,
+      environmentName: 'staging',
+      created: '2026-05-05T12:34:03.000Z',
+    },
+    {
+      resultId: SAMPLE_RESULT_ID_BLOCKED,
+      runId: SAMPLE_RUN_ID,
+      caseKey: SAMPLE_TEST_ID_BLOCKED,
+      title: 'Checkout — coupon redemption',
+      testStatus: 'BLOCKED',
+      processStatus: 'Idle',
+      error: null,
+      blockedReason: 'Sign-in failed, so the test never started.',
+      environmentName: 'staging',
+      created: '2026-05-05T12:34:02.000Z',
+    },
+    {
+      resultId: SAMPLE_RESULT_ID_PASSED,
+      runId: SAMPLE_RUN_ID,
+      caseKey: SAMPLE_TEST_ID_PASSED,
+      title: 'Checkout — declined card',
+      testStatus: 'PASSED',
+      processStatus: 'Idle',
+      error: null,
+      blockedReason: null,
+      environmentName: 'staging',
+      created: '2026-05-05T12:34:01.000Z',
+    },
+    {
+      resultId: SAMPLE_RESULT_ID,
+      runId: SAMPLE_RUN_ID,
+      caseKey: SAMPLE_TEST_ID_FAILED,
+      title: 'Checkout happy path',
+      testStatus: 'FAILED',
+      processStatus: 'Idle',
+      error: SAMPLE_RESULT_ERROR,
+      blockedReason: null,
+      environmentName: 'staging',
+      created: '2026-05-05T12:34:00.000Z',
+    },
+  ],
+  hiddenRunCount: 4,
+  retentionDays: 30,
 };
 
-const SAMPLE_EXECUTION_ID = 'exec_dryrun0001';
+const resultFailedStepSample: ResultStep = {
+  stepIndex: '3',
+  type: 'assertion',
+  action: 'visible',
+  description: 'Expect the order confirmation heading',
+  status: 'failed',
+  selector: '[data-testid="order-confirmation"]',
+  url: SAMPLE_TARGET_URL,
+  healed: false,
+  screenshotSignedUrl: 'https://s3-presigned.example.com/snap/03.png?X-Amz-dryrun',
+  htmlSignedUrl: 'https://s3-presigned.example.com/snap/03.html?X-Amz-dryrun',
+};
+
+/** The failed result of the sample run, with its steps. */
+const resultDetailSample: ResultDetail = {
+  resultId: SAMPLE_RESULT_ID,
+  runId: SAMPLE_RUN_ID,
+  caseKey: SAMPLE_TEST_ID_FAILED,
+  caseHash: 'case_dryrun0001',
+  title: 'Checkout happy path',
+  type: 'FRONTEND',
+  testStatus: 'FAILED',
+  processStatus: 'Idle',
+  processErrorMessage: null,
+  error: SAMPLE_RESULT_ERROR,
+  cause: SAMPLE_RESULT_CAUSE,
+  fix: SAMPLE_RESULT_FIX,
+  blockedReason: null,
+  // A frontend test has no traceback or captured output.
+  trace: null,
+  apiOutput: null,
+  videoUrl: 'https://s3-presigned.example.com/video/res_dryrun0001.mp4?X-Amz-dryrun',
+  envId: 'env_dryrun0001',
+  created: '2026-05-05T12:34:00.000Z',
+  modified: '2026-05-05T12:34:58.000Z',
+  failedStep: resultFailedStepSample,
+  steps: [
+    {
+      stepIndex: '1',
+      type: 'action',
+      action: 'click',
+      description: 'Click the cart icon',
+      status: 'passed',
+      selector: '[data-testid="cart"]',
+      url: SAMPLE_TARGET_URL,
+      healed: false,
+      screenshotSignedUrl: 'https://s3-presigned.example.com/snap/01.png?X-Amz-dryrun',
+      htmlSignedUrl: 'https://s3-presigned.example.com/snap/01.html?X-Amz-dryrun',
+    },
+    {
+      stepIndex: '2',
+      type: 'action',
+      action: 'fill',
+      description: 'Fill the shipping address',
+      status: 'passed',
+      selector: '#address',
+      url: SAMPLE_TARGET_URL,
+      healed: true,
+      screenshotSignedUrl: 'https://s3-presigned.example.com/snap/02.png?X-Amz-dryrun',
+      htmlSignedUrl: 'https://s3-presigned.example.com/snap/02.html?X-Amz-dryrun',
+    },
+    resultFailedStepSample,
+  ],
+  signIn: null,
+};
 
 /** A ready execution report: one failed and one passed row, the App's Markdown shape in miniature. */
 const executionReportSample: ExecutionReportResponse = {
   ready: true,
   report: {
     projectId: SAMPLE_PROJECT_ID,
-    executionId: SAMPLE_EXECUTION_ID,
+    runId: SAMPLE_RUN_ID,
     projectName: 'Sample project',
     orgId: null,
     stats: { passed: 1, failed: 1, blocked: 0, total: 2 },
     allPassed: false,
-    narrative: 'Dry-run sample: one regression in checkout, login passed.',
+    narrative: 'Dry-run sample: the checkout happy path regressed; the declined-card test passed.',
     whatCouldBeBetter: 'Add coverage for password reset.',
-    recommendedNextStep: 'Fix the checkout selector and rerun.',
+    recommendedNextStep: 'Fill the card number in the checkout test and rerun.',
     tests: [
       {
-        id: SAMPLE_RUN_ID,
-        title: 'Checkout applies a coupon',
-        slug: 'CHK-002',
+        id: SAMPLE_RESULT_ID,
+        title: 'Checkout happy path',
+        slug: 'CHK-001',
         status: 'FAILED',
         screenshotUrl: null,
-        error: 'AssertionError: expected the order total to drop',
-        fix: 'Apply the coupon before computing the total.',
+        error: SAMPLE_RESULT_ERROR,
+        fix: SAMPLE_RESULT_FIX,
       },
       {
-        id: `${SAMPLE_RUN_ID}-2`,
-        title: 'Login with a valid account',
-        slug: 'AUTH-001',
+        id: SAMPLE_RESULT_ID_PASSED,
+        title: 'Checkout — declined card',
+        slug: 'CHK-002',
         status: 'PASSED',
         screenshotUrl: null,
         error: null,
         fix: null,
       },
     ],
-    resultUrl: `https://www.testsprite.com/dashboard-v3/projects/${SAMPLE_PROJECT_ID}/execution/${SAMPLE_EXECUTION_ID}`,
+    resultUrl: `https://www.testsprite.com/dashboard-v3/projects/${SAMPLE_PROJECT_ID}/execution/${SAMPLE_RUN_ID}`,
   },
   markdown:
-    '> [!WARNING]\n> ### Ran into trouble — 1 failed\n>\n> Dry-run sample: one regression in checkout, login passed.\n',
+    '> [!WARNING]\n> ### Ran into trouble — 1 failed\n>\n> Dry-run sample: the checkout happy path regressed; the declined-card test passed.\n',
 };
 
+// Modern wire samples use native runId (execution) and resultId (result).
 const passedRunSample: RunResponse = {
+  resultId: SAMPLE_RESULT_ID,
   runId: SAMPLE_RUN_ID,
   testId: SAMPLE_TEST_ID_PASSED,
   projectId: SAMPLE_PROJECT_ID,
@@ -476,37 +434,11 @@ const passedRunSample: RunResponse = {
     passedCount: 2,
     failedCount: 0,
   },
-  // Representative per-run steps so `test steps --run-id <id> --dry-run`
-  // demonstrates real output instead of an empty list (the generic
-  // `/runs/{runId}` sample is also used by `test wait`, which ignores steps).
-  steps: [
-    {
-      stepIndex: '0001',
-      type: 'action',
-      action: 'navigate',
-      status: 'passed',
-      description: 'Open the target URL',
-      error: null,
-      screenshotUrl: null,
-      htmlSnapshotUrl: null,
-      createdAt: '2026-05-15T19:32:10.000Z',
-    },
-    {
-      stepIndex: '0002',
-      type: 'assertion',
-      action: 'assert_visible',
-      status: 'passed',
-      description: 'Dashboard heading is visible',
-      error: null,
-      screenshotUrl: null,
-      htmlSnapshotUrl: null,
-      createdAt: '2026-05-15T19:32:20.000Z',
-    },
-  ],
 };
 
 const failedRunSample: RunResponse = {
-  runId: SAMPLE_FAILED_RUN_ID,
+  resultId: SAMPLE_FAILED_RESULT_ID,
+  runId: SAMPLE_RUN_ID,
   testId: SAMPLE_TEST_ID_FAILED,
   projectId: SAMPLE_PROJECT_ID,
   userId: SAMPLE_USER_ID,
@@ -528,56 +460,15 @@ const failedRunSample: RunResponse = {
     passedCount: 2,
     failedCount: 1,
   },
-  steps: [
-    {
-      stepIndex: '0001',
-      type: 'action',
-      action: 'navigate',
-      status: 'passed',
-      description: 'Open the target URL',
-      error: null,
-      screenshotUrl: null,
-      htmlSnapshotUrl: null,
-      createdAt: '2026-05-15T19:32:10.000Z',
-    },
-    {
-      stepIndex: '0002',
-      type: 'assertion',
-      action: 'assert_visible',
-      status: 'passed',
-      description: 'Dashboard heading is visible',
-      error: null,
-      screenshotUrl: null,
-      htmlSnapshotUrl: null,
-      createdAt: '2026-05-15T19:32:20.000Z',
-    },
-    {
-      stepIndex: '0003',
-      type: 'assertion',
-      action: 'assert_visible',
-      status: 'failed',
-      description: 'Billing status badge is visible',
-      error: 'Expected billing status badge to be visible, but it was not found.',
-      screenshotUrl: null,
-      htmlSnapshotUrl: null,
-      createdAt: '2026-05-15T19:32:30.000Z',
-    },
-  ],
 };
 
 /**
  * Dry-run sample lookup keyed by OpenAPI operationId. Order matters in
  * {@link findSample}: more specific patterns must precede their generic
- * siblings (e.g. `/tests/{id}/code` before `/tests/{id}`).
+ * siblings (e.g. `/projects/{id}/env` before `/projects/{id}`).
  */
 /**
- * HTTP methods accepted by the dry-run registry. GET covered the M2
- * read surface; POST landed with M3.2 piece-2 (`POST /api/cli/v1/tests`)
- * and gained `/tests/batch` with M3.2 piece-5; PUT + DELETE landed with
- * M3.2 piece-3 (`PUT/DELETE /api/cli/v1/tests/{id}`); piece-4 added
- * `PUT /api/cli/v1/tests/{id}/code`; piece-6 added
- * `PUT /api/cli/v1/tests/{id}/plan-steps`. The list grows as new
- * mutation routes ship.
+ * HTTP methods accepted by the dry-run registry.
  */
 export type DryRunMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
@@ -594,9 +485,10 @@ export interface DryRunSampleEntry {
    * receives the parsed request body so the sample can echo back the
    * user's actual field values instead of a static canned placeholder.
    * Simple read-only endpoints use a zero-arity factory that ignores the
-   * argument.
+   * argument. A read whose answer depends on its query (`GET /results`)
+   * receives the query too; the query never takes part in matching.
    */
-  body: (requestBody?: unknown) => unknown;
+  body: (requestBody?: unknown, query?: URLSearchParams) => unknown;
 }
 
 const PATH_PREFIX = '/api/cli/v1';
@@ -611,7 +503,7 @@ function escapeRegExpLiteral(literal: string): string {
 
 /**
  * Build the matcher RegExp for a route template, e.g.
- * `/tests/{testId}/code` → /^\/tests\/[^/]+\/code$/. Splits on the
+ * `/results/{resultId}` → /^\/results\/[^/]+$/. Splits on the
  * `{param}` placeholders first, then regex-escapes every literal segment in
  * between (including any literal backslash) so a route literal containing a
  * regex metacharacter is matched literally instead of being reinterpreted as
@@ -628,158 +520,155 @@ function buildPathPattern(pathTemplate: string): RegExp {
 const ENTRIES: DryRunSampleEntry[] = [
   entry('whoami', 'GET', '/me', me),
   entry('listProjects', 'GET', '/projects', pageOf(projects)),
-  entry('getProjectSignIn', 'GET', '/projects/{projectId}/sign-in', {
-    projectId: SAMPLE_PROJECT_ID,
-    environment: {
-      id: 'env_dryrun',
-      name: 'default',
-      url: 'https://app.example.com',
-      isDefault: true,
-      authMode: 'public',
-      hasCredentials: false,
-      username: null,
-      enableOtp: false,
-      updatedAt: '2026-09-25T00:00:00.000Z',
-    },
-    signIn: { mode: 'public', account: null, otp: null, manual: null },
-    nextAction: null,
-  } satisfies CliProjectSignInResponse),
-  entry('setProjectSignIn', 'PUT', '/projects/{projectId}/sign-in', (request?: unknown) => {
-    const body = request as { mode?: string } | undefined;
-    const mode = body?.mode ?? 'manual';
-    return {
-      projectId: SAMPLE_PROJECT_ID,
-      environment: {
-        id: 'env_dryrun',
-        name: 'default',
-        url: 'https://app.example.com',
-        isDefault: true,
-        authMode: mode,
-        hasCredentials: mode === 'account',
-        username: mode === 'account' ? 'qa@example.com' : null,
-        enableOtp: mode === 'otp',
-        updatedAt: '2026-09-25T00:00:00.000Z',
-      },
-      signIn: {
-        mode,
-        account: mode === 'account' ? { username: 'qa@example.com', passwordSet: true } : null,
-        otp:
-          mode === 'otp'
-            ? { channels: ['email'], email: 'dryrun@inbox.example', phone: null }
-            : null,
-        manual:
-          mode === 'manual'
-            ? {
-                sessionReuseTtlSeconds: 3600,
-                hasValidSession: false,
-                needsReauth: true,
-                reason: 'never',
-                capturedAt: null,
-                expiresAt: null,
-              }
-            : null,
-      },
-      changed: mode !== 'otp',
-      nextAction: mode === 'manual' ? 'Log in once in the Portal.' : null,
-    } satisfies CliProjectSignInSetResponse;
+  entry('startConversation', 'POST', '/projects/{projectId}/conversations', {
+    id: SAMPLE_CONVERSATION_ID,
+    url: SAMPLE_CONVERSATION_URL,
+    model: 'claude-opus-5-5',
   }),
-  // Plan-generation surface. All three MUST be registered
-  // BEFORE `getProject`: findSample is first-match-wins and the projects/*
-  // family shares the `/projects/…` prefix, so the more specific plans
-  // paths are listed first (same defensive convention as `/tests/{id}/runs`
-  // before the `/tests/{id}` catch-all; `samples.test.ts` proves the
-  // ordering with shadowing tests).
-  //
-  // The trigger sample reports the PROPOSALS rung starting
-  // (`stagesRemaining: []`) and the plans sample shows the settled result
-  // (idle + two staged proposals), so a dry-run learner sees a coherent
-  // story: trigger → stage runs → staged batch with stable proposalIds.
-  entry('generatePlans', 'POST', '/projects/{projectId}/plans/generate', {
-    status: 'accepted',
-    projectId: SAMPLE_PROJECT_ID,
-    stage: 'proposals',
-    stagesRemaining: [],
-    enqueuedAt: '2026-07-28T09:00:00.000Z',
-  } satisfies CliGeneratePlansResponse),
-  // One frontend proposal (with action/assertion steps) and one backend
-  // proposal (with endpointPath/captures/consumes) so both wire shapes are
-  // learnable offline. `credits` shows the charged-actions breakdown the
-  // real facade fills best-effort.
-  entry('getPlans', 'GET', '/projects/{projectId}/plans', {
-    generation: { status: 'idle', errorCode: null, errorMessage: null },
-    proposals: [
+  entry('listConversations', 'GET', '/projects/{projectId}/conversations', {
+    conversations: [
       {
-        proposalId: 'prop_1',
-        title: 'Login happy path',
-        description: 'Sign in with valid credentials and land on the dashboard.',
-        priority: 'p1',
-        category: 'auth',
-        feature: 'login',
-        type: 'frontend',
-        steps: [
-          { type: 'action', description: 'Enter valid credentials and submit the login form' },
-          { type: 'assertion', description: 'Dashboard heading is visible' },
-        ],
-      },
-      {
-        proposalId: 'prop_2',
-        title: 'Create order — success',
-        description: 'POST a valid order and capture its id for downstream tests.',
-        priority: 'p2',
-        category: 'orders',
-        feature: 'create-order',
-        type: 'backend',
-        endpointPath: '/v1/orders',
-        captures: ['orderId'],
-        consumes: ['authToken'],
+        id: SAMPLE_CONVERSATION_ID,
+        title: 'Cover the new coupon rules',
+        state: 'proposed',
+        lastMessageAt: '2026-01-01T00:12:00.000Z',
+        url: SAMPLE_CONVERSATION_URL,
       },
     ],
-    credits: {
-      charged: [
-        { action: 'strategy', amount: 1 },
-        { action: 'proposals', amount: 2 },
-      ],
-      balance: 147,
+  }),
+  entry('getConversation', 'GET', '/projects/{projectId}/conversations/{conversationId}', {
+    id: SAMPLE_CONVERSATION_ID,
+    projectId: SAMPLE_PROJECT_ID,
+    title: 'Cover the new coupon rules',
+    url: SAMPLE_CONVERSATION_URL,
+    state: 'proposed',
+    model: 'claude-opus-5-5',
+    lastSeq: 42,
+    events: [
+      {
+        seq: 40,
+        at: '2026-01-01T00:11:00.000Z',
+        kind: 'activity',
+        text: 'Opening staging.example.com/cart',
+      },
+      {
+        seq: 41,
+        at: '2026-01-01T00:11:30.000Z',
+        kind: 'activity',
+        text: 'Saving test cases to TestSprite',
+      },
+      {
+        seq: 42,
+        at: '2026-01-01T00:12:00.000Z',
+        kind: 'message',
+        from: 'agent',
+        text: 'Two new tests for the coupon rules and one fix. The second-coupon limit comes from the PRD; whether coupons apply to sale items is only what the app does today.',
+      },
+    ],
+    proposal: {
+      id: '00000000-0000-4000-8000-0000000000c1',
+      kind: 'plan',
+      summary: '2 new tests, 1 changed',
+      plan: {
+        added: [
+          {
+            ref: '1',
+            useCase: 'Checkout',
+            title: 'A second percent-off coupon replaces the first',
+            priority: 'High',
+            description:
+              'Expected from the PRD (docs/coupons-prd.md): one percent-off coupon per order.',
+            steps: [
+              { type: 'action', description: 'Add the Desk Lamp to the cart and open the cart' },
+              { type: 'action', description: 'Apply SAVE10, then WELCOME15' },
+              {
+                type: 'assertion',
+                description: 'Only WELCOME15 is listed and the total is $35.70',
+              },
+            ],
+          },
+          {
+            ref: '2',
+            useCase: 'Checkout',
+            title: 'An expired coupon is refused',
+            priority: 'Medium',
+            description: 'Expected from what the app does today; not confirmed.',
+            steps: [
+              { type: 'action', description: 'Apply OLD20 in the cart' },
+              {
+                type: 'assertion',
+                description: 'The message "This code has expired" shows and the total is unchanged',
+              },
+            ],
+          },
+        ],
+        changed: [{ ref: 'CHK-002', title: 'Pay by card', priority: 'High' }],
+        removed: [],
+      },
     },
-  } satisfies CliGetPlansResponse),
-  // Input-derived: echoes the explicit id list the CLI always sends (never
-  // the omitted or empty forms — §3.3 safety rules), so `accept --only
-  // prop_2 --dry-run` shows acceptedCount: 1 rather than a canned 2.
-  entry('acceptPlans', 'POST', '/projects/{projectId}/plans/accept', (req?: unknown) => {
-    const body = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
-    const only = Array.isArray(body.only)
-      ? body.only.filter((id): id is string => typeof id === 'string')
-      : null;
-    const ids = only !== null && only.length > 0 ? only : ['prop_1', 'prop_2'];
-    return {
-      acceptedCount: ids.length,
-      caseKeys: ids.map(id => `case_dryrun_${id}`),
-    } satisfies CliAcceptPlansResponse;
+    reply:
+      'Two new tests for the coupon rules and one fix. The second-coupon limit comes from the PRD; whether coupons apply to sale items is only what the app does today.',
   }),
-  // `project docs upload` two-step facade routes.
-  // Registered BEFORE the broader project patterns (design doc §7 ordering
-  // rule; findSample is first-match-wins) and with `/docs/upload-url` before
-  // `/docs`. NOT consumed by the command's dry-run path: `project docs
-  // upload --dry-run` is an inline early-exit (zero network, stat only —
-  // the presigned S3 PUT leg cannot be expressed as a canned fetch sample).
-  // These are documentation/shape-guards, same family as `deleteBatch`.
-  entry('docsUploadUrl', 'POST', '/projects/{projectId}/docs/upload-url', {
-    uploadUrl:
-      'https://s3.dry-run.invalid/testsprite-usercontent/u_dryrun/p_dryrun_2026/openapi.yaml?X-Amz-Signature=dryrun',
-    s3Key: 'u_dryrun/p_dryrun_2026/openapi.yaml',
-    expiresInSeconds: 3600,
+  entry(
+    'conversationFileUrl',
+    'POST',
+    '/projects/{projectId}/conversations/{conversationId}/files',
+    {
+      uploadUrl:
+        'https://s3.dry-run.invalid/testsprite-usercontent/u_dryrun/chat/change.patch?X-Amz-Signature=dryrun',
+      name: 'change.patch',
+    },
+  ),
+  entry(
+    'sendConversationMessage',
+    'POST',
+    '/projects/{projectId}/conversations/{conversationId}/messages',
+    {
+      seq: 1,
+    },
+  ),
+  entry(
+    'applyConversationProposal',
+    'POST',
+    '/projects/{projectId}/conversations/{conversationId}/apply',
+    {
+      applied: '2 new tests, 1 changed',
+      ok: true,
+      saved: [
+        { path: '/test-cases/coupon-replace.md', detail: 'created CHK-011' },
+        { path: '/test-cases/coupon-expired.md', detail: 'created CHK-012' },
+        { path: '/test-cases/CHK-002.md', detail: 'updated CHK-002' },
+      ],
+      failed: [],
+      tests: ['tc_dryrun_011', 'tc_dryrun_012', 'tc_dryrun_002'],
+    },
+  ),
+  entry(
+    'rejectConversationProposal',
+    'POST',
+    '/projects/{projectId}/conversations/{conversationId}/reject',
+    {
+      rejected: '2 new tests, 1 changed',
+    },
+  ),
+  entry('stopConversation', 'POST', '/projects/{projectId}/conversations/{conversationId}/stop', {
+    ok: true,
   }),
-  entry('docsRegister', 'POST', '/projects/{projectId}/docs', {
-    resourceId: 'res_dryrun_2026',
-    displayName: 'openapi.yaml',
-    docRole: 'API_DOC',
-    processStatus: 'Pending',
-  }),
+  entry(
+    'discardConversation',
+    'POST',
+    '/projects/{projectId}/conversations/{conversationId}/discard',
+    {
+      discarded: '00000000-0000-4000-8000-0000000000a1',
+      released: ['/test-cases/CHK-002.md'],
+    },
+  ),
   // The single-project read carries the project-level test-id attribute list
   // (present-and-null contract, see `CliProject.testIdAttributes`); the list
-  // row above deliberately omits it, like `targetUrl`.
+  // row above deliberately omits it.
   entry('getProject', 'GET', '/projects/{projectId}', {
     ...checkoutProject,
+    instruction: 'Use the staging account for checkout tests.',
     testIdAttributes: ['data-element', 'data-testid'],
   } satisfies CliProject),
   // P6 — POST /projects (create project). The id uses a stable dry-run
@@ -809,221 +698,18 @@ const ENTRIES: DryRunSampleEntry[] = [
     deletedAt: '2026-05-16T00:00:00.000Z',
   } satisfies CliDeleteProjectResponse),
   entry('listTests', 'GET', '/tests', pageOf(tests)),
-  entry('getTestCode', 'GET', '/tests/{testId}/code', testCode),
-  entry('listTestSteps', 'GET', '/tests/{testId}/steps', pageOf(testSteps)),
-  entry('getTestResult', 'GET', '/tests/{testId}/result', latestResult),
   // Execution report — static `executions/` prefix, four segments, so no
   // `/tests/{testId}/…` pattern can shadow it; kept beside the other reads.
-  entry(
-    'getExecutionReport',
-    'GET',
-    '/tests/executions/{executionId}/report',
-    executionReportSample,
-  ),
-  // `/failure/summary` MUST come before `/failure` so the regex matcher
-  // doesn't shadow it with the bundle endpoint.
-  entry('getTestFailureSummary', 'GET', '/tests/{testId}/failure/summary', failureSummary),
-  entry('getTestFailure', 'GET', '/tests/{testId}/failure', failureContext),
-  // M3.4 piece-5 — GET /tests/{testId}/runs (run-history list).
-  // **MUST appear BEFORE the `/tests/{testId}` catch-all** so the more
-  // specific `/runs` suffix wins the regex match. Shows two rows
-  // (fresh + rerun) so dry-run learners see both `isRerun: false` and
-  // `isRerun: true` shapes in one fixture.
-  entry('listTestRuns', 'GET', '/tests/{testId}/runs', {
-    runs: [
-      {
-        // G1b — fresh run with a real targetUrl stamped at trigger time.
-        runId: SAMPLE_RUN_ID,
-        status: 'passed',
-        source: 'cli',
-        isRerun: false,
-        createdFrom: null,
-        createdAt: '2026-06-03T10:00:00.000Z',
-        startedAt: '2026-06-03T10:00:05.000Z',
-        finishedAt: '2026-06-03T10:02:00.000Z',
-        codeVersion: 'v1',
-        failureKind: null,
-        targetUrl: SAMPLE_TARGET_URL,
-        targetUrlSource: 'run',
-      },
-      {
-        // G1b — rerun row where the URL could not be resolved (shows null shape).
-        runId: 'run_rerun_history_01',
-        status: 'failed',
-        source: 'cli',
-        isRerun: true,
-        createdFrom: `rerun:${SAMPLE_RUN_ID}`,
-        createdAt: '2026-06-02T14:30:00.000Z',
-        startedAt: '2026-06-02T14:30:10.000Z',
-        finishedAt: '2026-06-02T14:32:45.000Z',
-        codeVersion: 'v1',
-        failureKind: 'assertion',
-        targetUrl: null,
-        targetUrlSource: 'unresolved',
-      },
-    ],
-    nextCursor: null,
-    meta: { testKind: 'frontend' },
-  } satisfies ListRunsResponse),
+  entry('getExecutionReport', 'GET', '/tests/executions/{runId}/report', executionReportSample),
   // `getTest` is the catch-all for `/tests/{id}` — must appear AFTER the
   // `/tests/{id}/{...}` siblings so the more specific patterns win.
   entry('getTest', 'GET', '/tests/{testId}', tests[0]),
-  // M3.3 piece-4 — GET /runs/{runId}/failure (run-scoped artifact bundle).
-  // Must appear BEFORE the /runs/{runId} catch-all so the more specific
-  // /failure path wins the regex match.
-  entry('getRunFailure', 'GET', '/runs/{runId}/failure', failureContext),
-  // M3.2 piece-5 — POST /tests/batch (FE-only plan-steps batch create).
-  // **MUST appear before `/tests`** so the more-specific path wins the
-  // regex match. Input-derived response: one result per supplied spec so
-  // the caller can verify their JSONL file was parsed as the right count.
-  // FE specs are echoed as `created`; backend specs (which the live route
-  // rejects per `runCreateBatch`'s stderr advisory) are echoed as
-  // `validation_error` so a mixed-batch dry-run doesn't teach a
-  // false-positive contract (codex-review P2, 2026-05-28).
-  entry('createTestBatch', 'POST', '/tests/batch', (req?: unknown) => {
-    const body = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
-    const tests = Array.isArray(body.tests) ? body.tests : [];
-    const count = tests.length;
-    if (count === 0) {
-      // No input detected — fall back to the illustrative 3-entry sample
-      // (2 created + 1 validation_error) so dry-run learners still see
-      // the mixed-status shape when run without body context.
-      return {
-        results: [
-          { specIndex: 0, testId: 'test_dryrun_batch_0', status: 'created' as const },
-          { specIndex: 1, testId: 'test_dryrun_batch_1', status: 'created' as const },
-          {
-            specIndex: 2,
-            status: 'validation_error' as const,
-            error: {
-              code: 'VALIDATION_ERROR',
-              message: 'planSteps[0].type must be one of: "action", "assertion"',
-              field: 'planSteps[0].type',
-            },
-          },
-        ],
-        summary: { total: 3, created: 2, failed: 1 },
-      };
-    }
-    // Mirror runCreateBatch's real behavior — backend specs are rejected
-    // with `validation_error`, FE specs are created. A mixed-batch dry-run
-    // that marks BE specs as `created` would teach agents a false-positive
-    // contract (codex-review P2, 2026-05-28).
-    const results = tests.map((spec, i) => {
-      if (spec && typeof spec === 'object' && (spec as { type?: unknown }).type === 'backend') {
-        return {
-          specIndex: i,
-          testId: null,
-          status: 'validation_error' as const,
-          error: {
-            code: 'VALIDATION_ERROR',
-            message: `spec[${i}]: backend specs are not supported on POST /tests/batch — use 'test create --type backend --code-file' instead.`,
-            field: 'type',
-          },
-        };
-      }
-      return {
-        specIndex: i,
-        testId: `test_dryrun_batch_${i}`,
-        status: 'created' as const,
-      };
-    });
-    const created = results.filter(r => r.status === 'created').length;
-    const failed = results.filter(r => r.status === 'validation_error').length;
-    return {
-      results,
-      summary: { total: count, created, failed },
-    };
-  }),
-  // M3.2 piece-2 — POST /tests (code-based create). Input-derived response
-  // so the `type` field reflects what the caller actually passed (P3-12 fix:
-  // previously hardcoded to `"frontend"`, hiding BE test dry-run behaviour).
-  // The `planSteps` echo a real plan-from response would carry is omitted —
-  // agents see testId/codeVersion/createdAt which is enough to confirm shape.
-  entry('createTestFromCode', 'POST', '/tests', (req?: unknown) => {
-    const body = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
-    const type = body.type === 'backend' ? 'backend' : 'frontend';
-    return {
-      testId: 'test_dryrun_create_2026',
-      type,
-      codeVersion: 'v1',
-      createdAt: '2026-05-13T00:00:00.000Z',
-    };
-  }),
-  // M3.2 piece-6 — PUT /tests/{id}/plan-steps (FE plan replace).
-  // Input-derived response: `stepCount` reflects the actual number of
-  // steps the caller supplied so they can verify their file was parsed
-  // correctly. `planStepsHash` stays canned (sha256 is not worth
-  // recomputing in dry-run).
-  entry('putPlanSteps', 'PUT', '/tests/{testId}/plan-steps', (req?: unknown) => {
-    const body = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
-    const planSteps = Array.isArray(body.planSteps) ? body.planSteps : [];
-    return {
-      testId: 'test_dryrun_plan_put_2026',
-      planStepsHash: 'sha256:dryrun-plan-steps-hash',
-      stepCount: planSteps.length > 0 ? planSteps.length : 3,
-      updatedAt: '2026-05-14T00:00:00.000Z',
-    };
-  }),
-  // M3.2 piece-4 — PUT /tests/{id}/code (etag-guarded replace). Canned
-  // response shape per the code-put design spec. The
-  // `codeVersion` here is the bumped value (v3 → v4) so an agent
-  // dry-running the chain sees a coherent progression: the sample
-  // testCode.codeVersion is `v3`, so `put` advances to `v4`.
-  entry('putTestCode', 'PUT', '/tests/{testId}/code', {
-    testId: 'test_dryrun_code_put_2026',
-    codeVersion: 'v4',
-    updatedAt: '2026-05-13T00:00:00.000Z',
-  }),
-  // PUT /tests/{id} (metadata update). Input-derived response: `updatedFields`
-  // echoes the keys the caller actually passed so an agent can confirm their
-  // flags landed in the right fields. OpenAPI spec does not define either PATCH
-  // or PUT for this path; the wire truth is whatever the backend implements
-  // (currently PUT).
-  entry('updateTest', 'PUT', '/tests/{testId}', (req?: unknown) => {
-    const body = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
-    const updatedFields = Object.keys(body).filter(k => body[k] !== undefined);
-    return {
-      testId: 'test_dryrun_update_2026',
-      updatedFields: updatedFields.length > 0 ? updatedFields : ['name', 'description'],
-      updatedAt: '2026-05-13T00:00:00.000Z',
-    };
-  }),
-  // delete-batch (DELETE /tests/<id> × N). The batch sub-command dispatches
-  // one DELETE /tests/{testId} per test (no batch endpoint) and aggregates
-  // results into CliBulkDeleteSummary. Under --dry-run the function has an
-  // inline early-exit (no network calls), so this sample is not consumed by
-  // the dry-run runner itself. It is registered here as documentation of the
-  // wire shape for agents learning the surface via `--dry-run --output json`,
-  // and it participates in the samples.test.ts shape-guard so drift against
-  // CliBulkDeleteSummary fails the build.
-  //
-  // **MUST appear before deleteTest** — `/tests/batch` is a literal path that
-  // would otherwise match the `/tests/{testId}` wildcard (first-match-wins).
-  entry('deleteBatch', 'DELETE', '/tests/batch', {
-    results: [
-      {
-        testId: 'test_dryrun_delete_2026',
-        status: 'deleted',
-        deletedAt: '2026-05-13T00:00:00.000Z',
-      },
-      { testId: 'test_dryrun_skip_2026', status: 'skipped', error: 'not found (already deleted?)' },
-    ],
-    summary: { total: 2, deleted: 1, skipped: 1, failed: 0 },
-  } satisfies CliBulkDeleteSummary),
-  // M3.2 piece-3 — DELETE /tests/{id} (permanent hard-delete). Canned
-  // response shape per the update/delete design spec.
-  // `deletedAt` is the delete-time ack (no restore window). Stable
-  // strings here so a `--dry-run` capture stays diff-able across runs.
-  entry('deleteTest', 'DELETE', '/tests/{testId}', {
-    testId: 'test_dryrun_delete_2026',
-    deletedAt: '2026-05-13T00:00:00.000Z',
-  }),
   // M3.3 piece-3 — POST /tests/{testId}/runs (trigger run).
   // **MUST appear before `/tests` and `/tests/{testId}` generic matchers**
   // so the more-specific runs path wins. Canned response shape per the
   // runs-trigger design spec.
   entry('triggerRun', 'POST', '/tests/{testId}/runs', (req?: unknown): TriggerRunResponse => ({
+    resultId: SAMPLE_RESULT_ID,
     runId: SAMPLE_RUN_ID,
     status: 'queued',
     enqueuedAt: '2026-05-15T19:32:00.000Z',
@@ -1031,36 +717,9 @@ const ENTRIES: DryRunSampleEntry[] = [
     targetUrl: SAMPLE_TARGET_URL,
     ...echoSkipDependencies(req),
   })),
-  // M3.4 piece-3 — POST /tests/{testId}/runs/rerun (single rerun).
-  // **MUST appear before `/tests/{testId}/runs` and `/tests/{testId}`** so the
-  // more-specific `/runs/rerun` path wins over the generic runs trigger.
-  // Two shapes are possible (FE / BE). The sample shows a BE shape (with
-  // closure) so dry-run learners see the richer response; FE callers get the
-  // same response minus `closure`.
-  entry('triggerRerun', 'POST', '/tests/{testId}/runs/rerun', {
-    runId: SAMPLE_RERUN_ID_BE_NAMED,
-    status: 'queued',
-    enqueuedAt: '2026-06-03T10:00:00.000Z',
-    codeVersion: 'v1',
-    autoHeal: true,
-    closure: {
-      members: [
-        { testId: SAMPLE_TEST_ID_BE_CONSUMER, runId: SAMPLE_RERUN_ID_BE_NAMED, role: 'selected' },
-        {
-          testId: SAMPLE_TEST_ID_BE_PRODUCER,
-          runId: SAMPLE_RERUN_ID_BE_PRODUCER,
-          role: 'producer',
-        },
-      ],
-      addedProducers: [SAMPLE_TEST_ID_BE_PRODUCER],
-      addedTeardowns: [],
-      clearedCaptured: 0,
-    },
-  } satisfies RerunResponse),
   // M4 piece-2 — POST /tests/batch/run (fresh wave-ordered batch run).
-  // **MUST appear before `/tests/batch/rerun` and `/tests/batch` (create)**
-  // so the more-specific `/batch/run` path wins. Shows `accepted[]` with
-  // per-test runIds + `skippedFrontend[]` so dry-run learners see both shapes.
+  // Shows `accepted[]` with per-test runIds + `skippedFrontend[]` so dry-run
+  // learners see both shapes.
   entry(
     'triggerBatchRunFresh',
     'POST',
@@ -1069,13 +728,15 @@ const ENTRIES: DryRunSampleEntry[] = [
       ({
         accepted: [
           {
+            runId: SAMPLE_RUN_ID,
             testId: SAMPLE_TEST_ID_FRESH_1,
-            runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
+            resultId: SAMPLE_BATCH_FRESH_RESULT_ID_1,
             enqueuedAt: '2026-06-09T10:00:00.000Z',
           },
           {
+            runId: SAMPLE_RUN_ID,
             testId: SAMPLE_TEST_ID_FRESH_2,
-            runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
+            resultId: SAMPLE_BATCH_FRESH_RESULT_ID_2,
             enqueuedAt: '2026-06-09T10:00:00.000Z',
           },
         ],
@@ -1086,44 +747,33 @@ const ENTRIES: DryRunSampleEntry[] = [
         ...echoSkipDependencies(req),
       }) satisfies BatchRunFreshResponse,
   ),
-  // M3.4 piece-3 — POST /tests/batch/rerun (batch rerun).
-  // **MUST appear before `/tests/batch` (create)** so the more-specific
-  // `/batch/rerun` path wins. Shows `accepted[]` with per-test runIds (C2)
-  // plus a `deferred[]` example (C1) so dry-run learners see both shapes.
-  entry('triggerBatchRerun', 'POST', '/tests/batch/rerun', {
-    accepted: [
-      {
-        testId: SAMPLE_TEST_ID_BATCH_1,
-        runId: SAMPLE_RERUN_BATCH_ID_1,
-        enqueuedAt: '2026-06-03T10:00:00.000Z',
-      },
-      {
-        testId: SAMPLE_TEST_ID_BATCH_2,
-        runId: SAMPLE_RERUN_BATCH_ID_2,
-        enqueuedAt: '2026-06-03T10:00:00.000Z',
-      },
-    ],
-    deferred: [{ testId: SAMPLE_TEST_ID_DEFERRED, reason: 'rate_limited' }],
-    conflicts: [],
-    closure: {
-      byProject: [
-        {
-          projectId: SAMPLE_PROJECT_ID_BACKEND,
-          testIds: [SAMPLE_TEST_ID_BATCH_2],
-          addedProducers: [],
-          addedTeardowns: [],
-          clearedCaptured: 0,
-        },
-      ],
-    },
-  } satisfies BatchRerunResponse),
+  // One entry answers `?run=` and `?test=`; only a test's history carries the
+  // plan's history window.
+  entry('listResults', 'GET', '/results', (_req?: unknown, query?: URLSearchParams) =>
+    query?.has('run')
+      ? {
+          run: {
+            runId: query.get('run')!,
+            projectId: SAMPLE_PROJECT_ID,
+            status: 'finished',
+            cancelled: false,
+            created: '2026-11-15T00:00:00Z',
+            modified: '2026-11-15T00:00:00Z',
+            targetUrl: SAMPLE_TARGET_URL,
+            dashboardUrl: null,
+          },
+          results: resultListSample.results,
+        }
+      : resultListSample,
+  ),
+  entry('getResult', 'GET', '/results/{resultId}', resultDetailSample),
   // M3.3 piece-3 — GET /runs/{runId} (live status / long-poll).
   // A terminal `passed` row is the most useful dry-run shape: agents see
   // what a completed run looks like, and `--wait` terminates immediately.
   // fix(2026-05-21): a duplicate failed-shape entry that appeared before
   // this entry was removed; findSample first-match-wins was always
-  // returning status: "failed" for `test wait --dry-run`.
-  entry('getRun', 'GET', `/runs/${SAMPLE_FAILED_RUN_ID}`, failedRunSample),
+  // returning status: "failed" for `run wait --dry-run`.
+  entry('getRun', 'GET', `/runs/${SAMPLE_FAILED_RESULT_ID}`, failedRunSample),
   entry('getRun', 'GET', '/runs/{runId}', passedRunSample),
   // POST /runs/{runId}/cancel. Method-guarded in
   // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
@@ -1132,35 +782,20 @@ const ENTRIES: DryRunSampleEntry[] = [
   // for a dry-run learner than the idempotent no-op.
   entry('cancelRun', 'POST', '/runs/{runId}/cancel', {
     runId: SAMPLE_RUN_ID,
-    testId: SAMPLE_TEST_ID_PASSED,
-    projectId: SAMPLE_PROJECT_ID,
-    userId: SAMPLE_USER_ID,
-    status: 'cancelled',
-    source: 'cli',
-    createdAt: '2026-05-15T19:32:00.000Z',
-    startedAt: '2026-05-15T19:32:05.000Z',
-    finishedAt: '2026-05-15T19:33:12.000Z',
-    codeVersion: 'v1',
-    targetUrl: SAMPLE_TARGET_URL,
-    createdFrom: null,
-    failedStepIndex: null,
-    failureKind: null,
-    error: null,
-    videoUrl: null,
-    stepSummary: {
-      total: 8,
-      completed: 3,
-      passedCount: 3,
-      failedCount: 0,
-    },
     alreadyCancelled: false,
+    alreadyFinished: false,
+    results: [
+      {
+        resultId: SAMPLE_RESULT_ID,
+        runId: SAMPLE_RUN_ID,
+        testId: SAMPLE_TEST_ID_PASSED,
+        title: 'Sample test',
+        status: 'cancelled',
+        alreadyCancelled: false,
+        alreadyFinished: false,
+      },
+    ],
   } satisfies CancelRunResponse),
-  // Schedules. The `/schedules/{id}/runs` entry MUST come before the
-  // `/schedules/{id}` entries so the more specific path wins the regex match
-  // (first-match-wins).
-  entry('listScheduleRuns', 'GET', '/schedules/{scheduleId}/runs', {
-    runs: [scheduleRun],
-  }),
   entry('listSchedules', 'GET', '/schedules', { schedules: [schedule] }),
   // `schedule create --dry-run` exits before the HTTP client is built, so this
   // sample is not fetched. Registered as a shape-guard only, same as
@@ -1233,10 +868,9 @@ function entry(
   operationId: string,
   method: DryRunMethod,
   pathTemplate: string,
-  body: unknown | ((requestBody?: unknown) => unknown),
+  body: unknown | DryRunSampleEntry['body'],
 ): DryRunSampleEntry {
-  const bodyFn =
-    typeof body === 'function' ? (body as (requestBody?: unknown) => unknown) : () => body;
+  const bodyFn = typeof body === 'function' ? (body as DryRunSampleEntry['body']) : () => body;
   return {
     operationId,
     method,
@@ -1254,49 +888,6 @@ function pageOf<T>(items: T[]): Page<T> {
   return { items, nextToken: null };
 }
 
-/**
- * Resolve a fetch URL to its canned sample. Matches against the path
- * portion only (query string is ignored — auto-pagination's `cursor`
- * query is intentionally a no-op in M2 dry-run; see {@link pageOf}).
- *
- * Returns `undefined` when no pattern matches; the caller (the dry-run
- * fetch impl) surfaces this as a 500 INTERNAL envelope so a missing
- * sample is loud, not silent.
- *
- * `requestBody` is forwarded to input-derived entries (`updateTest`,
- * `putPlanSteps`, `createTestBatch`) so their responses reflect the
- * user's actual flags rather than static canned values.
- */
-/**
- * Like {@link findSample}, but a missing sample throws instead of returning
- * `undefined`. For dry-run paths that resolve samples DIRECTLY (bypassing the
- * dry-run fetch impl, which has its own loud INTERNAL envelope for this):
- * without the throw, a lost registry entry surfaces as a raw TypeError deep
- * in a renderer (`samples.ts` is a real merge-conflict
- * hotspot, so a silently dropped entry is a live hazard, not a hypothetical).
- */
-export function findSampleOrThrow(
-  method: string,
-  url: string,
-  requestBody?: unknown,
-): DryRunSampleEntry {
-  const entry = findSample(method, url, requestBody);
-  if (entry === undefined) {
-    throw ApiError.fromEnvelope({
-      error: {
-        code: 'INTERNAL',
-        message:
-          `dry-run sample registry has no entry for ${method.toUpperCase()} ${extractPath(url)} — ` +
-          'a sample was removed or shadowed in src/lib/dry-run/samples.ts (internal CLI bug).',
-        nextAction: 'Please report this to support@testsprite.com.',
-        requestId: SAMPLE_DRY_RUN_REQUEST_ID,
-        details: { method: method.toUpperCase(), path: extractPath(url) },
-      },
-    });
-  }
-  return entry;
-}
-
 export function findSample(
   method: string,
   url: string,
@@ -1308,10 +899,16 @@ export function findSample(
     if (e.method === upper && e.pattern.test(pathOnly)) {
       // Rebind body so downstream code can call `e.body` as before while
       // still preserving the original lazy factory semantics.
-      return { ...e, body: () => e.body(requestBody) };
+      return { ...e, body: () => e.body(requestBody, queryOf(url)) };
     }
   }
   return undefined;
+}
+
+/** The query of `url`, absolute or not. */
+function queryOf(url: string): URLSearchParams {
+  const queryIdx = url.indexOf('?');
+  return new URLSearchParams(queryIdx >= 0 ? url.slice(queryIdx + 1) : '');
 }
 
 function extractPath(url: string): string {

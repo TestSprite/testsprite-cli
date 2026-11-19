@@ -17,8 +17,7 @@ export const ERROR_CODES = [
   // `nextAction` points the operator at the Portal upload flow.
   'PAYLOAD_TOO_LARGE',
   'CONFLICT',
-  // M3.2 piece-1 / piece-4 — `If-Match: <codeVersion>` etag mismatch on
-  // `test code put`. Exit 6, same family as CONFLICT (the caller should
+  // HTTP 412 precondition failure. Exit 6, same family as CONFLICT (the caller should
   // re-fetch and retry); kept distinct so machine consumers can route on
   // it without parsing message strings.
   'PRECONDITION_FAILED',
@@ -562,7 +561,7 @@ function isInsufficientCredits(
  * prod portals live on different domains); an unknown host gets the route only —
  * a hardcoded domain would point at the wrong environment.
  *
- * V3 API keys are membership-bound: a key minted for a team org spends THAT
+ * API keys are membership-bound: a key minted for a team org spends THAT
  * org's wallet, not the holder's personal one, and there is no request-scoped
  * signal at this layer to tell which kind of key just failed. So the hint
  * deliberately does NOT assert "top up your (personal) credits" as the only
@@ -575,8 +574,8 @@ export function insufficientCreditsNextAction(apiUrl?: string): string {
   const portalBase = apiUrl === undefined ? undefined : resolvePortalBase(apiUrl);
   return (
     (portalBase !== undefined
-      ? `Top up credits at ${portalBase}/dashboard/settings/billing (personal keys) — ask an org admin if this key is organization-bound — or upgrade your plan at ${portalBase}/pricing.`
-      : 'Top up credits on the portal Billing page (/dashboard/settings/billing) if this is a personal key — ask an org admin if it is organization-bound — or upgrade your plan (/pricing).') +
+      ? `Top up credits at ${portalBase}/dashboard-v3/settings/billing (personal keys) — ask an org admin if this key is organization-bound — or upgrade your plan at ${portalBase}/pricing.`
+      : 'Top up credits on the portal Billing page (/dashboard-v3/settings/billing) if this is a personal key — ask an org admin if it is organization-bound — or upgrade your plan (/pricing).') +
     ' Run `testsprite usage` to check your current balance before the next run.'
   );
 }
@@ -723,7 +722,7 @@ function parseEnvelopeBody(raw: unknown, httpStatus?: number, apiUrl?: string): 
     // prod portals live on different domains); unknown hosts get the route
     // only — a hardcoded domain would point at the wrong environment.
     //
-    // V3 API keys are membership-bound: a key minted for a team org spends
+    // API keys are membership-bound: a key minted for a team org spends
     // THAT org's wallet, not the holder's personal one, and there is no
     // request-scoped signal here (this branch fires client-side, purely
     // from the HTTP status/body) to tell which kind of key just failed. So

@@ -1,66 +1,55 @@
 import { describe, expect, it, vi } from 'vitest';
 import { HttpClient } from './http.js';
 
-describe('HttpClient.cancelRun transport retry', () => {
-  it('retries naturally-idempotent cancellation after ECONNRESET', async () => {
-    const cancelResponse = {
+// A replayed cancel answers 200 with alreadyCancelled, so the retry's answer is
+// the one the caller sees.
+const cancelResponse = {
+  runId: 'r1',
+  alreadyCancelled: true,
+  alreadyFinished: false,
+  results: [
+    {
+      resultId: 'res1',
       runId: 'r1',
       testId: 't1',
-      projectId: 'p1',
-      userId: 'u1',
+      title: 'Checkout',
       status: 'cancelled',
-      source: 'cli',
-      createdAt: '2026-10-09T12:00:00.000Z',
-      stepSummary: {
-        total: 0,
-        completed: 0,
-        passedCount: 0,
-        failedCount: 0,
-      },
       alreadyCancelled: true,
-    };
+      alreadyFinished: false,
+    },
+  ],
+};
 
+function cancelled(): Response {
+  return new Response(JSON.stringify(cancelResponse), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function clientWith(fetchImpl: typeof fetch): HttpClient {
+  return new HttpClient({
+    baseUrl: 'https://api.example.com/api/cli/v1',
+    apiKey: 'sk-test',
+    fetchImpl,
+    sleep: () => Promise.resolve(),
+    random: () => 0,
+  });
+}
+
+describe('HttpClient.cancelRun transport retry', () => {
+  it('retries naturally-idempotent cancellation after ECONNRESET', async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
       .mockRejectedValueOnce(new Error('ECONNRESET'))
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(cancelResponse), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-      );
+      .mockResolvedValueOnce(cancelled());
 
-    const client = new HttpClient({
-      baseUrl: 'https://api.example.com/api/cli/v1',
-      apiKey: 'sk-test',
-      fetchImpl,
-      sleep: () => Promise.resolve(),
-      random: () => 0,
-    });
-
-    const result = await client.cancelRun('r1');
+    const result = await clientWith(fetchImpl).cancelRun('r1');
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(result.alreadyCancelled).toBe(true);
   });
 
   it('retries cancellation after bare HTTP 502', async () => {
-    const cancelResponse = {
-      runId: 'r1',
-      testId: 't1',
-      projectId: 'p1',
-      userId: 'u1',
-      status: 'cancelled',
-      source: 'cli',
-      createdAt: '2026-10-09T12:00:00.000Z',
-      stepSummary: {
-        total: 0,
-        completed: 0,
-        passedCount: 0,
-        failedCount: 0,
-      },
-      alreadyCancelled: true,
-    };
-
     const fetchImpl = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -69,22 +58,9 @@ describe('HttpClient.cancelRun transport retry', () => {
           headers: { 'content-type': 'text/plain' },
         }),
       )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify(cancelResponse), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-      );
+      .mockResolvedValueOnce(cancelled());
 
-    const client = new HttpClient({
-      baseUrl: 'https://api.example.com/api/cli/v1',
-      apiKey: 'sk-test',
-      fetchImpl,
-      sleep: () => Promise.resolve(),
-      random: () => 0,
-    });
-
-    const result = await client.cancelRun('r1');
+    const result = await clientWith(fetchImpl).cancelRun('r1');
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(result.alreadyCancelled).toBe(true);
   });

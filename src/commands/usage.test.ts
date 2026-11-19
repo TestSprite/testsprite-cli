@@ -1,7 +1,5 @@
 /**
  * Unit tests for `testsprite usage` / `testsprite credits`.
- *
- * Backend follow-up: the `/me` endpoint must add `credits` + `subPlan` projection.
  */
 
 import { mkdtempSync } from 'node:fs';
@@ -31,7 +29,7 @@ function makeCapture(): {
   };
 }
 
-/** Minimal MeResponse without credits/subPlan (backend current state) */
+/** `/me` identity core with no wallet (the `activeOrg` enrichment failed). */
 const meWithoutCredits = {
   userId: 'u-abc',
   keyId: 'k-abc',
@@ -39,12 +37,30 @@ const meWithoutCredits = {
   env: 'development' as const,
 };
 
-/** Extended MeResponse WITH credits + subPlan (backend future state) */
-const meWithCredits: UsageResponse = {
+const meWithOrg: UsageResponse = {
   ...meWithoutCredits,
-  credits: 100,
+  activeOrg: {
+    id: 'org-1',
+    name: 'Acme QA',
+    plan: 'Standard',
+    role: 'admin',
+    remaining: 1650,
+    includedCredits: 1600,
+    seats: 3,
+  },
+};
+
+/**
+ * What the backend actually sends: the wallet plus its flattened copy
+ * (`credits`/`subPlan`/`creditsPerRun`) and `v3Enabled: true`, both kept on the
+ * wire for older CLIs. This CLI renders the wallet from `activeOrg` only.
+ */
+const meWire = {
+  ...meWithOrg,
+  credits: 1650,
   subPlan: 'Standard',
   creditsPerRun: 2,
+  v3Enabled: true,
 };
 
 function makeFetch(body: unknown, status = 200): UsageDeps['fetchImpl'] {
@@ -79,26 +95,24 @@ describe('runUsage — dry-run', () => {
     expect(result).toEqual(DRY_RUN_USAGE_SAMPLE);
   });
 
-  it('dry-run sample contains credits, subPlan, and creditsPerRun', () => {
-    expect(DRY_RUN_USAGE_SAMPLE.credits).toBeGreaterThan(0);
-    expect(DRY_RUN_USAGE_SAMPLE.subPlan).toBeTruthy();
-    expect(DRY_RUN_USAGE_SAMPLE.creditsPerRun).toBeGreaterThan(0);
+  it('dry-run sample carries an org wallet and renders it', async () => {
+    expect(DRY_RUN_USAGE_SAMPLE.activeOrg?.remaining).toBeGreaterThan(0);
+    const { capture, deps } = makeCapture();
+    await runUsage({ profile: 'default', output: 'text', debug: false, dryRun: true }, deps);
+    expect(capture.stdout.join('\n')).toContain('--- organization ---');
   });
 
-  it('dry-run JSON output contains the sample fields', async () => {
+  it('dry-run JSON output contains the sample wallet', async () => {
     const { capture, deps } = makeCapture();
     await runUsage({ profile: 'default', output: 'json', debug: false, dryRun: true }, deps);
     const parsed = JSON.parse(capture.stdout.join('')) as UsageResponse;
-    expect(parsed.credits).toBe(DRY_RUN_USAGE_SAMPLE.credits);
-    expect(parsed.subPlan).toBe(DRY_RUN_USAGE_SAMPLE.subPlan);
-    expect(parsed.creditsPerRun).toBe(DRY_RUN_USAGE_SAMPLE.creditsPerRun);
+    expect(parsed.activeOrg).toEqual(DRY_RUN_USAGE_SAMPLE.activeOrg);
   });
 });
 
-describe('runUsage — real path without credits (current backend)', () => {
+describe('runUsage — real path without a wallet', () => {
   // Confirms `usage` never sends X-CLI-Command — it must stay a plain,
-  // untagged /me call (only `runInit`'s configure-validate step and
-  // `test run --target-url`'s v3Enabled probe tag this header).
+  // untagged /me call (only `runInit`'s configure-validate step tags it).
   it('sends no X-CLI-Command header on its GET /me call', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { deps } = makeCapture();
@@ -120,7 +134,7 @@ describe('runUsage — real path without credits (current backend)', () => {
     expect(sentHeaders[0]?.['x-cli-command']).toBeUndefined();
   });
 
-  it('returns the /me response and emits a note about missing balance', async () => {
+  it('returns the /me response and points at the org-less Portal billing page', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const result = await runUsage(
@@ -132,17 +146,15 @@ describe('runUsage — real path without credits (current backend)', () => {
       },
     );
     expect(result.userId).toBe('u-abc');
-    expect(result.credits).toBeUndefined();
-    // Must emit the note pointing at the billing URL.
+    expect(result.activeOrg).toBeUndefined();
     const stderr = capture.stderr.join('\n');
-    expect(stderr).toContain('billing');
-    expect(stderr).toContain('testsprite.com');
+    expect(stderr).toContain('credit balance not returned');
+    expect(stderr).toContain('https://www.testsprite.com/dashboard-v3/settings/billing');
   });
 
   // Issue #277: the usage projection is validated at the client boundary, so a
-  // string balance surfaces as a typed envelope instead of silently reaching
-  // the `Math.floor(credits / creditsPerRun)` pre-flight arithmetic.
-  it('rejects a non-numeric credit balance with a typed INTERNAL envelope', async () => {
+  // drifted identity core surfaces as a typed envelope instead of a crash.
+  it('rejects a /me body without its identity core with a typed INTERNAL envelope', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const rejection = await runUsage(
@@ -150,13 +162,13 @@ describe('runUsage — real path without credits (current backend)', () => {
       {
         ...deps,
         credentialsPath,
-        fetchImpl: makeFetch({ ...meWithoutCredits, credits: '100', creditsPerRun: 2 }),
+        fetchImpl: makeFetch({ ...meWithoutCredits, keyId: 42 }),
       },
     ).catch((error: unknown) => error);
     expect(rejection).toMatchObject({ code: 'INTERNAL' });
   });
 
-  it('text output includes identity fields even without credits', async () => {
+  it('text output includes identity fields even without a wallet', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
@@ -170,9 +182,10 @@ describe('runUsage — real path without credits (current backend)', () => {
     const out = capture.stdout.join('\n');
     expect(out).toContain('userId:');
     expect(out).toContain('u-abc');
+    expect(out).not.toContain('--- organization ---');
   });
 
-  it('JSON output passes the raw /me response through (no credits key present)', async () => {
+  it('JSON output passes the raw /me response through (no activeOrg key present)', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
@@ -185,138 +198,39 @@ describe('runUsage — real path without credits (current backend)', () => {
     );
     const parsed = JSON.parse(capture.stdout.join('')) as UsageResponse;
     expect(parsed.userId).toBe('u-abc');
-    expect(parsed.credits).toBeUndefined();
-  });
-});
-
-describe('runUsage — real path with credits (future backend)', () => {
-  it('renders balance block when credits + subPlan are present', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      {
-        ...deps,
-        credentialsPath,
-        fetchImpl: makeFetch(meWithCredits),
-      },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).toContain('credits:');
-    expect(out).toContain('100');
-    expect(out).toContain('plan:');
-    expect(out).toContain('Standard');
-    expect(out).toContain('cost per frontend run:');
-    // Should show max runs estimate.
-    expect(out).toContain('can trigger:');
-    // 100 / 2 = 50 runs
-    expect(out).toContain('50');
-  });
-
-  it('does NOT emit the missing-balance note when credits are present', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      {
-        ...deps,
-        credentialsPath,
-        fetchImpl: makeFetch(meWithCredits),
-      },
-    );
-    const stderr = capture.stderr.join('\n');
-    // No missing-balance note when data is present.
-    expect(stderr).not.toContain('not available');
-  });
-
-  it('emits low-balance warning when credits < creditsPerRun', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const lowBalance: UsageResponse = { ...meWithCredits, credits: 1, creditsPerRun: 2 };
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      {
-        ...deps,
-        credentialsPath,
-        fetchImpl: makeFetch(lowBalance),
-      },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).toContain('warning');
-    expect(out).toContain('billing');
-  });
-
-  it('emits free-plan upgrade hint when subPlan is Free', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const freePlan: UsageResponse = { ...meWithCredits, subPlan: 'Free', credits: 10 };
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      {
-        ...deps,
-        credentialsPath,
-        fetchImpl: makeFetch(freePlan),
-      },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).toContain('Free plan');
-    expect(out).toContain('pricing');
-  });
-
-  it('JSON output passes credits and subPlan through verbatim', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    await runUsage(
-      { profile: 'default', output: 'json', debug: false },
-      {
-        ...deps,
-        credentialsPath,
-        fetchImpl: makeFetch(meWithCredits),
-      },
-    );
-    const parsed = JSON.parse(capture.stdout.join('')) as UsageResponse;
-    expect(parsed.credits).toBe(100);
-    expect(parsed.subPlan).toBe('Standard');
-    expect(parsed.creditsPerRun).toBe(2);
+    expect(parsed.activeOrg).toBeUndefined();
   });
 });
 
 describe('runUsage — org wallet (activeOrg)', () => {
-  const meWithOrg: UsageResponse = {
-    ...meWithCredits,
-    // The org block renders only for V3-routed callers: the renderer checks
-    // the authoritative `v3Enabled` routing bit alongside `activeOrg`,
-    // never field presence alone.
-    v3Enabled: true,
-    activeOrg: {
-      id: 'org-1',
-      name: 'Acme QA',
-      plan: 'Standard',
-      role: 'admin',
-      remaining: 1650,
-      includedCredits: 1600,
-      seats: 3,
-    },
-  };
-
-  it('renders the org block and suppresses the legacy balance block', async () => {
+  it('renders the org block from activeOrg and ignores the flattened wire copy', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(meWithOrg) },
+      { ...deps, credentialsPath, fetchImpl: makeFetch(meWire) },
     );
     const out = capture.stdout.join('\n');
-    expect(out).toContain('organization');
+    expect(out).toContain('--- organization ---');
     expect(out).toContain('Acme QA (admin)');
     expect(out).toContain('Standard');
-    // `balance:` (not `credits:`) — the legacy per-user number keeps the
-    // `credits` name in JSON output, so the org wallet must not reuse it.
     expect(out).toContain('balance:      1650 remaining');
     expect(out).toContain('seats:');
-    // Legacy per-user block is superseded — its lines must not render.
+    // The per-user block and its per-run estimate are gone.
+    expect(out).not.toContain('--- credits & plan ---');
     expect(out).not.toContain('cost per frontend run:');
     expect(out).not.toContain('can trigger:');
+    expect(capture.stderr.join('\n')).not.toContain('credit balance not returned');
+  });
+
+  it('does not read v3Enabled: the wallet renders whatever the field says', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    await runUsage(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, credentialsPath, fetchImpl: makeFetch({ ...meWire, v3Enabled: false }) },
+    );
+    expect(capture.stdout.join('\n')).toContain('balance:      1650 remaining');
   });
 
   it('renders a `state:` line for a paused workspace, with the notice and its billing link', async () => {
@@ -381,7 +295,10 @@ describe('runUsage — org wallet (activeOrg)', () => {
     expect(okCapture.stdout.join('\n')).not.toContain('state:');
   });
 
-  it('low org balance triggers the top-up warning', async () => {
+  // The Portal's org-less billing route re-anchors under the viewer's ACTIVE
+  // workspace, which need not be the org this key bills — so the low-balance
+  // warning names the organization's billing settings instead of a URL.
+  it('low org balance triggers the top-up warning without a billing URL', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const drained: UsageResponse = {
@@ -393,54 +310,18 @@ describe('runUsage — org wallet (activeOrg)', () => {
       { ...deps, credentialsPath, fetchImpl: makeFetch(drained) },
     );
     const out = capture.stdout.join('\n');
-    expect(out).toContain('warning');
+    expect(out).toContain('warning: organization balance is low');
     expect(out).toContain('billing');
-  });
-
-  // The org wallet is a DIFFERENT settings page than the personal
-  // `/dashboard/settings/billing` route (that page only manages the legacy
-  // per-user balance) — the low-balance warning must not point an org-bound
-  // caller at a page that can't actually top up their wallet.
-  it('low org balance warning does not point at the personal billing URL', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const drained: UsageResponse = {
-      ...meWithOrg,
-      activeOrg: { ...meWithOrg.activeOrg!, remaining: 1 },
-    };
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(drained) },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).not.toContain('/dashboard/settings/billing');
+    expect(out).not.toContain('/settings/billing');
     expect(out.toLowerCase()).toContain('org admin');
   });
 
-  // The non-org (legacy) low-balance path is unchanged: it still points at
-  // the real personal billing URL.
-  it('low personal balance warning still points at /dashboard/settings/billing', async () => {
+  it('Free org plan triggers the upgrade hint even when the flattened subPlan says otherwise', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
-    const drainedLegacy: UsageResponse = {
-      ...meWithCredits,
-      credits: 0,
-      creditsPerRun: 2,
-    };
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(drainedLegacy) },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).toContain('/dashboard/settings/billing');
-  });
-
-  it('Free org plan triggers the upgrade hint even when legacy subPlan is paid', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const freeOrg: UsageResponse = {
-      ...meWithOrg,
-      subPlan: 'Standard', // stale legacy value — org plan must win
+    const freeOrg = {
+      ...meWire,
+      subPlan: 'Standard',
       activeOrg: { ...meWithOrg.activeOrg!, plan: 'Free', remaining: 150 },
     };
     await runUsage(
@@ -452,97 +333,37 @@ describe('runUsage — org wallet (activeOrg)', () => {
     expect(out).toContain('pricing');
   });
 
-  it('JSON output passes activeOrg through verbatim', async () => {
+  it('JSON output passes the /me body through verbatim, wire extras included', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'json', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(meWithOrg) },
+      { ...deps, credentialsPath, fetchImpl: makeFetch(meWire) },
     );
-    const parsed = JSON.parse(capture.stdout.join('')) as UsageResponse;
+    const parsed = JSON.parse(capture.stdout.join('')) as Record<string, unknown>;
     expect(parsed.activeOrg).toEqual(meWithOrg.activeOrg);
-  });
-
-  it('absent activeOrg keeps the legacy rendering intact (older backends)', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(meWithCredits) },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).toContain('cost per frontend run:');
-    expect(out).not.toContain('organization');
-  });
-
-  it('org account without legacy credits → org block renders and NO missing-balance note', async () => {
-    // A V3-native org account has no DDB user row, so the legacy `credits`
-    // field is legitimately absent — but its balance already rendered in the
-    // organization block, so the stderr "balance not returned" note must not
-    // fire (it would contradict the output right above it).
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const orgOnly: UsageResponse = {
-      ...meWithOrg,
-      credits: undefined,
-      subPlan: undefined,
-      creditsPerRun: undefined,
-    };
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(orgOnly) },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).toContain('organization');
-    expect(out).toContain('1650 remaining');
-    expect(capture.stderr.join('\n')).not.toContain('credit balance not returned');
-  });
-
-  it('activeOrg present but v3Enabled false → legacy rendering (wallet selection follows routing, not field presence)', async () => {
-    // Defense-in-depth: a V2-routed caller's billable commands charge the
-    // legacy wallet, so an org block must never supersede the legacy lines
-    // for them — even if a backend regression ships activeOrg to such a
-    // caller again. The current backend never produces this combination.
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const v2Routed: UsageResponse = { ...meWithOrg, v3Enabled: false };
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(v2Routed) },
-    );
-    const out = capture.stdout.join('\n');
-    expect(out).not.toContain('organization');
-    expect(out).toContain('cost per frontend run:');
+    expect(parsed.credits).toBe(1650);
   });
 });
 
 describe('runUsage — org-bound key with degraded /me enrichment', () => {
   // A Postgres-backed membership key (`sk-member-…`) — `cli.guard.ts` only ever
-  // populates `/me`'s `org` field for THIS key family; a legacy `sk-user-…`
-  // key never carries an org binding at all. Using a legacy key here would
-  // model a `{apiKey: sk-user-…, me: {org: {...}}}` combination the real
-  // backend can never produce, which would silently stop protecting the
-  // behavior these tests exist for. (`runUsage` itself doesn't branch on the
-  // key's own shape — only on what `/me` returns — so this only matters for
-  // fixture realism, not for making the assertions below pass.)
+  // populates `/me`'s `org` field for THIS key family. (`runUsage` itself
+  // doesn't branch on the key's own shape — only on what `/me` returns — so
+  // this only matters for fixture realism.)
   const MEMBERSHIP_KEY = `tsp_u_${'A'.repeat(43)}`;
 
   // `me.controller.ts` keeps `org` (no I/O — the key's own binding) even when
-  // the best-effort `activeOrg` Postgres enrichment throws and is swallowed.
-  // A V3-native org member has no legacy DynamoDB user row either, so
-  // `credits`/`subPlan` are absent too. This is the exact reachable state the
-  // backend's own tests cover (PG down + no DDB row → both `activeOrg` and
-  // `credits` missing) — org-boundedness must be read from `org`, never from
-  // `activeOrg`/`v3Enabled` alone, or this state falls through to the
-  // personal-billing branches.
+  // the best-effort `activeOrg` Postgres enrichment throws and is swallowed,
+  // and it then omits the flattened billing fields too. Org-boundedness must
+  // be read from `org`, never from `activeOrg`, or this state falls through
+  // to the generic billing note.
   const degradedOrgBound: UsageResponse = {
     ...meWithoutCredits,
-    v3Enabled: true,
     org: { id: 'org-1', name: 'Acme QA', role: 'admin' },
-    // activeOrg, credits, subPlan all absent — enrichment degraded.
   };
 
-  it('does not point the caller at the personal billing page', async () => {
+  it('does not point the caller at the generic billing page', async () => {
     writeProfile('default', { apiKey: MEMBERSHIP_KEY }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
@@ -551,8 +372,8 @@ describe('runUsage — org-bound key with degraded /me enrichment', () => {
     );
     const out = capture.stdout.join('\n');
     const err = capture.stderr.join('\n');
-    expect(out).not.toContain('/dashboard/settings/billing');
-    expect(err).not.toContain('/dashboard/settings/billing');
+    expect(out).not.toContain('/settings/billing');
+    expect(err).not.toContain('/settings/billing');
   });
 
   it('says the org balance could not be loaded, and asks for an org admin — not a fabricated org URL', async () => {
@@ -567,63 +388,31 @@ describe('runUsage — org-bound key with degraded /me enrichment', () => {
     const combined = `${out}\n${err}`;
     expect(combined.toLowerCase()).toContain('could not be loaded');
     expect(combined.toLowerCase()).toContain('org admin');
-    // No fabricated org-scoped settings URL — the CLI has no confirmed route.
     expect(combined).not.toMatch(/https?:\/\/\S+\/dashboard/);
   });
 
-  it('never falls back to rendering a legacy credits/plan block', async () => {
+  // Flattened billing fields without `activeOrg` are never rendered: the
+  // low-balance and Free-plan hints read the wallet only.
+  it('stray flattened credits/subPlan without activeOrg render no low-balance or Free-plan hints', async () => {
     writeProfile('default', { apiKey: MEMBERSHIP_KEY }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(degradedOrgBound) },
+      {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeFetch({
+          ...degradedOrgBound,
+          credits: 0,
+          subPlan: 'Free',
+          creditsPerRun: 2,
+        }),
+      },
     );
     const out = capture.stdout.join('\n');
     expect(out).not.toContain('--- credits & plan ---');
-    expect(out).not.toContain('cost per frontend run:');
-  });
-
-  // A user who signed up before V3 (and so still carries a legacy DynamoDB
-  // `credits`/`subPlan` row) can LATER be issued a membership key — `/me`'s
-  // billing enrichment GetItems `UserEntity` independently of the org read,
-  // so both can coexist. This is the fixture that actually exercises the
-  // `!isOrgBound` guards on the legacy block / low-balance / free-plan
-  // branches: `degradedOrgBound` above has no legacy fields at all, so those
-  // branches were already false before the guard existed and the assertions
-  // above passed vacuously. Here `credits`/`subPlan` are deliberately set to
-  // values that WOULD trip both the low-balance warning and the Free-plan
-  // upgrade hint on the personal branch if the org binding weren't checked
-  // first.
-  const migratedOrgBound: UsageResponse = {
-    ...meWithoutCredits,
-    v3Enabled: true,
-    org: { id: 'org-1', name: 'Acme QA', role: 'admin' },
-    credits: 0,
-    subPlan: 'Free',
-    creditsPerRun: 2,
-    // activeOrg absent — degraded enrichment, same as above.
-  };
-
-  it('migrated user (stale legacy credits/subPlan + org binding): renders neither the legacy block nor its low-balance/Free-plan hints', async () => {
-    writeProfile('default', { apiKey: MEMBERSHIP_KEY }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    await runUsage(
-      { profile: 'default', output: 'text', debug: false },
-      { ...deps, credentialsPath, fetchImpl: makeFetch(migratedOrgBound) },
-    );
-    const out = capture.stdout.join('\n');
-    const err = capture.stderr.join('\n');
-    expect(out).not.toContain('--- credits & plan ---');
-    // Would have fired from the personal low-balance branch (credits:0 <
-    // creditsPerRun:2) had `!isOrgBound` not gated it.
-    expect(out).not.toContain('credit balance is below the per-run cost');
-    // Would have fired from the personal Free-plan branch (subPlan:'Free')
-    // had `!isOrgBound` not gated it.
+    expect(out).not.toContain('warning:');
     expect(out).not.toContain('Free plan');
-    expect(out).not.toContain('pricing');
-    expect(out).not.toContain('/dashboard/settings/billing');
-    expect(err).not.toContain('/dashboard/settings/billing');
-    // The honest degraded-org line still renders instead.
     expect(out.toLowerCase()).toContain('could not be loaded');
   });
 });

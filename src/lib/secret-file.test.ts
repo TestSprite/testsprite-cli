@@ -93,6 +93,17 @@ describe('readSecretFileGuarded', () => {
     }
   });
 
+  it('keeps edge spaces of a UTF-16LE --credential-file and drops only its BOM and line ending', () => {
+    const path = join(tmpRoot, 'cred-utf16le.txt');
+    const bytes = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from(' user:pa ss \r\n', 'utf16le'),
+    ]);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
+    writeFileSync(path, bytes);
+    expect(readSecretFileGuarded('credential-file', path)).toBe(' user:pa ss ');
+  });
+
   it('preserves interior whitespace', () => {
     const path = join(tmpRoot, 'pw-spaces.txt');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.

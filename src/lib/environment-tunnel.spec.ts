@@ -1,18 +1,16 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { resultLine } from '../../test/helpers/result-list.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, RequestTimeoutError } from './errors.js';
 import { HttpClient } from './http.js';
 import { ShutdownController } from './interrupt.js';
 import { assertLocalPortListening, parseLoopbackTargetUrl } from './local-target.js';
-import { UnreachableAtDeadlineError } from './poll.js';
 import {
   ENVIRONMENT_PREFLIGHT_TIMEOUT_MS,
   readEnvironmentPreflight,
   resolveEnvironmentRunTarget,
   withEnvironmentTunnel,
 } from './environment-tunnel.js';
+import { terminalSafeWriter } from './terminal-text.js';
 
 function resolver(environments: unknown) {
   const get = vi.fn(async () => ({ environments }));
@@ -27,6 +25,42 @@ function resolver(environments: unknown) {
     },
   };
 }
+
+describe('a line that names an environment', () => {
+  // A server name with a line break: printed as it came, the text after the
+  // break would start a line that reads like one of the CLI's own.
+  const name = 'stg\nforged: line';
+  const announced = async (
+    environment: { name: string; url: string },
+    more: Record<string, unknown>,
+  ): Promise<string[]> => {
+    const f = resolver([{ ...environment, isDefault: true }]);
+    const lines: string[] = [];
+    await resolveEnvironmentRunTarget({
+      ...f.args,
+      stderr: terminalSafeWriter(line => lines.push(line)),
+      ...more,
+    });
+    return lines.flatMap(line => line.split('\n'));
+  };
+
+  it('keeps the name on the line that opens a tunnel', async () => {
+    const local = { name, url: 'http://localhost:3000' };
+    expect(await announced(local, {})).toEqual([
+      'Environment "stg forged: line" is on this machine (http://localhost:3000) — opening a tunnel.',
+    ]);
+    expect(await announced(local, { dryRun: true })).toEqual([
+      'Would open a tunnel to http://localhost:3000 (environment "stg forged: line").',
+    ]);
+  });
+
+  it('keeps the name on the line that uses its sign-in through a tunnel', async () => {
+    const public_ = { name, url: 'https://shop.example' };
+    expect(await announced(public_, { environment: name, localPort: 3000 })).toEqual([
+      'Using environment "stg forged: line" sign-in against http://localhost:3000 through a tunnel.',
+    ]);
+  });
+});
 
 describe('environment preflight and diagnostics', () => {
   it('bounds advisory reads to five seconds without retries', async () => {
@@ -188,106 +222,192 @@ describe('environment preflight and diagnostics', () => {
   });
 });
 
-describe('withEnvironmentTunnel: waiting for batch capacity', () => {
+describe('withEnvironmentTunnel: execution ownership', () => {
   afterEach(() => {
     vi.useRealTimers();
   });
-
-  it('exits 10 with the owned-tunnel hint when the API stays unreachable until the deadline', async () => {
-    vi.useFakeTimers();
-    const tunnelClientId = '11111111-2222-3333-4444-555555555555';
-    const credentialsPath = join(
-      mkdtempSync(join(tmpdir(), 'env-tunnel-capacity-')),
-      'credentials',
-    );
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary file.
-    writeFileSync(
-      credentialsPath,
-      '[default]\napi_url = https://api.example.com\napi_key = sk-user-test\n',
-    );
+  const clientId = '11111111-2222-3333-4444-555555555555';
+  function harness(options: { adopted?: boolean; cancelledRefund?: boolean } = {}) {
+    const calls: string[] = [];
+    const stderr: string[] = [];
     const json = (body: unknown, status = 200) =>
       new Response(JSON.stringify(body), {
         status,
         headers: { 'content-type': 'application/json' },
       });
-    const requests: string[] = [];
-    const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
-      const parsed = new URL(
-        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
-      );
-      const path = parsed.pathname.replace('/api/cli/v1', '');
-      const method = init.method ?? 'GET';
-      requests.push(`${method} ${path}`);
-      if (method === 'POST' && path === '/tunnel')
-        return json(
-          {
-            clientId: tunnelClientId,
-            secret: 'fixture-secret',
-            controlUrl: 'ws://tunnel.example/ws',
-            tunnelAddr: 'tunnel.example:7400',
-            expiresAt: '2026-10-02T00:00:00Z',
-          },
-          201,
+    const deps = {
+      env: { TESTSPRITE_API_KEY: 'sk-user-test', TESTSPRITE_API_URL: 'https://api.example.com' },
+      stderr: (line: string) => {
+        stderr.push(line);
+      },
+      shutdown: new ShutdownController(),
+      createTunnelClient: () => ({ start: async () => {}, stop: async () => {} }),
+      fetchImpl: async (input: string | URL | Request, init: RequestInit = {}) => {
+        const url = new URL(
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
         );
-      if (method === 'DELETE' && path === `/tunnel/${tunnelClientId}`)
-        return new Response(null, { status: 204 });
-      if (method === 'POST' && path === '/runs/run_a/cancel')
-        return json({ runId: 'run_a', status: 'cancelled', alreadyCancelled: false });
-      // Every read of the run that holds the slot fails: the API is unreachable.
-      if (method === 'GET' && path === '/runs/run_a')
-        return json(
-          {
-            error: {
-              code: 'UNAVAILABLE',
-              message: 'poll backend unavailable',
-              nextAction: 'retry',
-              requestId: 'r-unavailable',
-              details: {},
+        const path = url.pathname.replace('/api/cli/v1', '');
+        calls.push(`${init.method ?? 'GET'} ${path}`);
+        if (init.method === 'POST' && path === '/tunnel')
+          return json(
+            {
+              clientId,
+              secret: 'fixture-secret',
+              controlUrl: 'ws://tunnel.example/ws',
+              tunnelAddr: 'tunnel.example:7400',
+              expiresAt: '2026-11-15T00:00:00Z',
             },
+            201,
+          );
+        if (init.method === 'DELETE') return new Response(null, { status: 204 });
+        if (init.method === 'POST' && path === '/runs/exec_a/cancel')
+          return json({
+            runId: 'exec_a',
+            alreadyCancelled: false,
+            alreadyFinished: false,
+            results: [
+              {
+                runId: 'exec_a',
+                resultId: 'result_a',
+                testId: 'test_a',
+                title: 'Test',
+                status: 'cancelled',
+                alreadyCancelled: false,
+                alreadyFinished: false,
+                refund: { status: options.cancelledRefund ? 'failed' : 'refunded' },
+              },
+            ],
+          });
+        if (path === `/tunnel/${clientId}`)
+          return json({ clientId, status: 'online', expiresAt: '2026-11-15T00:00:00Z' });
+        throw new Error(`Unexpected request: ${init.method ?? 'GET'} ${path}`);
+      },
+    };
+    const opts = {
+      profile: 'default',
+      output: 'json' as const,
+      debug: false,
+      maxConcurrency: 1,
+      timeoutSeconds: 30,
+      ...(options.adopted ? { tunnelClientId: clientId } : {}),
+    };
+    return { calls, stderr, deps, opts };
+  }
+  it.each(['UNAVAILABLE', 'UNSUPPORTED'] as const)(
+    'cleans up the owned execution once after %s without rewriting its error',
+    async code => {
+      const h = harness();
+      const failure = new ApiError(
+        {
+          code,
+          message: 'Original backend message.',
+          nextAction: 'Original backend next action.',
+          requestId: 'req-original',
+          details: { opaque: 'value' },
+        },
+        code === 'UNAVAILABLE' ? 503 : undefined,
+      );
+      await expect(
+        withEnvironmentTunnel(h.opts, h.deps, [], 'run', async context => {
+          await context.confirm({ tunnelClientId: clientId }, ['exec_a']);
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+      expect(failure).toMatchObject({
+        message: 'Original backend message.',
+        nextAction: 'Original backend next action.',
+        details: { opaque: 'value' },
+      });
+      expect(h.calls.filter(call => call.endsWith('/cancel'))).toEqual([
+        'POST /runs/exec_a/cancel',
+      ]);
+      expect(h.calls.at(-1)).toBe(`DELETE /tunnel/${clientId}`);
+    },
+  );
+  it('does not release ownership just because the current results have all passed', async () => {
+    const h = harness();
+    await withEnvironmentTunnel(h.opts, h.deps, [], 'run', async context => {
+      await context.confirm({ tunnelClientId: clientId }, ['exec_a']);
+      await context.onRead(
+        {
+          run: {
+            runId: 'exec_a',
+            projectId: 'P',
+            status: 'running',
+            cancelled: false,
+            created: null,
+            modified: null,
+            targetUrl: null,
+            dashboardUrl: null,
           },
-          503,
-        );
-      throw new Error(`unexpected request: ${method} ${path}`);
+          results: [resultLine({ runId: 'exec_a', resultId: 'result_a', testStatus: 'PASSED' })],
+        },
+        new AbortController().signal,
+      );
     });
-
-    const pending = withEnvironmentTunnel(
-      { profile: 'default', output: 'json', debug: false, maxConcurrency: 1, timeoutSeconds: 30 },
-      {
-        credentialsPath,
-        fetchImpl,
-        stderr: () => {},
-        shutdown: new ShutdownController(),
-        createTunnelClient: () => ({ start: async () => {}, stop: async () => {} }),
-      },
+    expect(h.calls.filter(call => call.endsWith('/cancel'))).toEqual(['POST /runs/exec_a/cancel']);
+  });
+  it('releases ownership only when the execution is finished', async () => {
+    const h = harness();
+    await withEnvironmentTunnel(h.opts, h.deps, [], 'run', async context => {
+      await context.confirm({ tunnelClientId: clientId }, ['exec_a']);
+      await context.onRead(
+        {
+          run: {
+            runId: 'exec_a',
+            projectId: 'P',
+            status: 'finished',
+            cancelled: false,
+            created: null,
+            modified: null,
+            targetUrl: null,
+            dashboardUrl: null,
+          },
+          results: [],
+        },
+        new AbortController().signal,
+      );
+    });
+    expect(h.calls.some(call => call.endsWith('/cancel'))).toBe(false);
+  });
+  it('never cancels or deletes a live adopted tunnel on detach', async () => {
+    const h = harness({ adopted: true });
+    await withEnvironmentTunnel(h.opts, h.deps, [], 'run', async context => {
+      await context.confirm({ tunnelClientId: clientId }, ['exec_a']);
+    });
+    expect(h.calls).toEqual([]);
+  });
+  it('cancels an unconfirmed started execution before closing the owned tunnel', async () => {
+    const h = harness();
+    await expect(
+      withEnvironmentTunnel(h.opts, h.deps, [], 'run', context => context.confirm({}, ['exec_a'])),
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
+    expect(h.calls.filter(call => call.endsWith('/cancel'))).toEqual(['POST /runs/exec_a/cancel']);
+  });
+  it('keeps cancellation cleanup independent from the interrupted process signal', async () => {
+    const h = harness();
+    await expect(
+      withEnvironmentTunnel(h.opts, h.deps, [], 'run', async context => {
+        await context.confirm({ tunnelClientId: clientId }, ['exec_a']);
+        h.deps.shutdown.interrupt('SIGINT');
+        throw h.deps.shutdown.signal.reason;
+      }),
+    ).rejects.toMatchObject({ exitCode: 130 });
+    expect(h.calls.filter(call => call.endsWith('/cancel'))).toEqual(['POST /runs/exec_a/cancel']);
+    expect(h.calls.at(-1)).toBe(`DELETE /tunnel/${clientId}`);
+  });
+  it('respects the explicit cancellation opt-out while closing its owned tunnel', async () => {
+    const h = harness();
+    await withEnvironmentTunnel(
+      { ...h.opts, cancelOnInterrupt: false },
+      h.deps,
       [],
-      'test run',
+      'run',
       async context => {
-        await context.confirm({ tunnelClientId: context.clientId }, ['run_a']);
-        // One slot, held by run_a: the next dispatch waits for it to finish.
-        await context.waitForCapacity(1);
+        await context.confirm({ tunnelClientId: clientId }, ['exec_a']);
       },
-    ).then(
-      () => ({ error: undefined }),
-      (error: unknown) => ({ error }),
     );
-    await vi.advanceTimersByTimeAsync(60_000);
-    const { error } = await pending;
-
-    expect(error).toBeInstanceOf(ApiError);
-    expect(error).not.toBeInstanceOf(UnreachableAtDeadlineError);
-    expect(error).toMatchObject({
-      code: 'UNAVAILABLE',
-      exitCode: 10,
-      requestId: 'r-unavailable',
-      details: { runId: 'run_a' },
-    });
-    const thrown = error as ApiError;
-    expect(thrown.message).toContain('poll backend unavailable');
-    // The tunnel closes with this process, so the hint is the owned-tunnel one,
-    // never a re-attach with `test wait`.
-    expect(thrown.nextAction).toBe(
-      'The owned tunnel is closing; inspect cancellation with testsprite test cancel run_a.',
-    );
-    expect(requests).toContain('POST /runs/run_a/cancel');
+    expect(h.calls.some(call => call.endsWith('/cancel'))).toBe(false);
+    expect(h.calls.at(-1)).toBe(`DELETE /tunnel/${clientId}`);
   });
 });

@@ -1,9 +1,8 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { projectRun, runListing } from '../test/helpers/project-run.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as InterruptModule from './lib/interrupt.js';
 import type * as TunnelClientModule from './vendor/tunnel-client/index.js';
+import { resultLine } from '../test/helpers/result-list.js';
 
 // Keep the real parser, command, HTTP client, error renderer, and telemetry.
 // Process-wide handlers are outside these in-process invocation tests.
@@ -75,7 +74,7 @@ it('gives disarmed requests generic recovery guidance', async () => {
       throw new InterruptError('SIGINT');
     }),
   );
-  process.argv = ['node', 'testsprite', 'auth', 'whoami', '--output', 'json'];
+  process.argv = ['node', 'testsprite', 'auth', 'status', '--output', 'json'];
   await import('./index.js');
   expect(process.exitCode).toBe(130);
   const error = (
@@ -104,7 +103,7 @@ it('bounds a stranded interrupt after rendering its error', async () => {
       throw new InterruptError('SIGINT');
     }),
   );
-  process.argv = ['node', 'testsprite', 'auth', 'whoami'];
+  process.argv = ['node', 'testsprite', 'auth', 'status'];
   await import('./index.js');
 
   expect(stderr).toContain('Error: Interrupted by SIGINT.');
@@ -130,7 +129,7 @@ it('disarms a pending hard-exit timer when the test scope ends', async () => {
       throw new InterruptError('SIGINT');
     }),
   );
-  process.argv = ['node', 'testsprite', 'auth', 'whoami'];
+  process.argv = ['node', 'testsprite', 'auth', 'status'];
   await import('./index.js');
 
   expect(process.exitCode).toBe(130);
@@ -141,111 +140,17 @@ it('disarms a pending hard-exit timer when the test scope ends', async () => {
   expect(exit).not.toHaveBeenCalled();
 });
 
-it.each(['create-batch', 'rerun'] as const)(
-  'renders run recovery guidance for an interrupted %s fan-out',
-  async command => {
-    const { InterruptError } = await import('./lib/errors.js');
-    const interruption = new InterruptError('SIGINT');
-    const plansFile = join(mkdtempSync(join(tmpdir(), 'cli-index-interrupt-')), 'plans.jsonl');
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture path built from this test's own mkdtempSync() dir, never user input
-    writeFileSync(
-      plansFile,
-      JSON.stringify({
-        projectId: 'project_alice',
-        type: 'frontend',
-        name: 'spec-one',
-        planSteps: [{ type: 'action', description: 'navigate to home' }],
-      }) + '\n',
-    );
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (input: Parameters<typeof fetch>[0]) => {
-        const url = String(input);
-        if (url.endsWith('/tests/batch/rerun')) {
-          return new Response(
-            JSON.stringify({
-              accepted: [
-                { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-                { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-              ],
-              deferred: [],
-              conflicts: [],
-              closure: { byProject: [] },
-            }),
-            { status: 202 },
-          );
-        }
-        if (url.endsWith('/tests/batch')) {
-          return new Response(
-            JSON.stringify({
-              results: [{ specIndex: 0, testId: 'test_1', status: 'created' }],
-              summary: { total: 1, created: 1, failed: 0 },
-            }),
-          );
-        }
-        if (url.endsWith('/tests/test_1/runs')) {
-          return new Response(
-            JSON.stringify({
-              runId: 'run_b1',
-              status: 'queued',
-              enqueuedAt: '2026-06-03T10:00:00.000Z',
-              codeVersion: 'v1',
-              targetUrl: '',
-            }),
-          );
-        }
-        if (/\/tests\/[^/]+$/.test(url))
-          return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_alice' }));
-        if (url.endsWith('/projects/project_alice/env'))
-          return new Response(JSON.stringify({ environments: [] }));
-        throw interruption;
-      }),
-    );
-    process.argv =
-      command === 'create-batch'
-        ? [
-            'node',
-            'testsprite',
-            'test',
-            'create-batch',
-            '--plans',
-            plansFile,
-            '--run',
-            '--wait',
-            '--output',
-            'json',
-          ]
-        : ['node', 'testsprite', 'test', 'rerun', 'test_1', 'test_2', '--wait', '--output', 'json'];
-    await import('./index.js');
-
-    expect(process.exitCode).toBe(130);
-    expect(stdout).toContain('run_b1');
-    const envelope = JSON.parse(stderr.slice(stderr.lastIndexOf('{\n  "error"'))) as {
-      error: { code: string; nextAction: string };
-    };
-    expect(envelope.error.code).toBe('INTERRUPTED');
-    expect(envelope.error.nextAction).toBe(
-      'The server-side run (if any) keeps executing and billing. ' +
-        'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
-        '(runId is in the partial JSON on stdout).',
-    );
-  },
-);
-
-const LOCAL_UNSUPPORTED_MESSAGE =
-  '--local only supports frontend tests today. Re-run without --local, or point the test at a reachable base URL.';
-
 describe('backend local unsupported rendering', () => {
   it.each([
     {
       output: 'text',
       reason: 'tunnel-unsupported-for-backend-test',
-      message: LOCAL_UNSUPPORTED_MESSAGE,
+      message: 'Original backend message',
     },
     {
       output: 'json',
       reason: 'tunnel-unsupported-for-backend-test',
-      message: LOCAL_UNSUPPORTED_MESSAGE,
+      message: 'Original backend message',
     },
     { output: 'text', reason: 'another-unsupported-feature', message: 'Original backend message' },
     { output: 'json', reason: 'another-unsupported-feature', message: 'Original backend message' },
@@ -274,7 +179,6 @@ describe('backend local unsupported rendering', () => {
       process.argv = [
         'node',
         'testsprite',
-        'test',
         'run',
         'test_backend',
         '--local',
@@ -308,198 +212,102 @@ describe('backend local unsupported rendering', () => {
   );
 });
 
-describe('wait timeout telemetry through the entry point', () => {
+describe('whole-run timeout telemetry through the entry point', () => {
   it.each([
-    { args: ['run', 'test_abc', '--wait'], local: false, timeout: true },
-    {
-      args: [
-        'run',
-        'test_abc',
-        '--local',
-        '5173',
-        '--tunnel-client',
-        'borrowed-client',
-        '--skip-preflight',
-      ],
-      // Explicit --local remains a local invocation with a borrowed tunnel.
-      local: true,
-      timeout: true,
-    },
-    { args: ['wait', 'run_abc'], local: false, timeout: true },
-    // Multi-run `test wait <a> <b>` aggregates each member's own poll outcome
-    // and, when one or more members time out, throws a plain summary
-    // `CLIError` (see runMultiWait in commands/test.ts) — NOT the
-    // ApiError/UNSUPPORTED conversion the single-run/rerun/batch paths use.
-    // That's pre-existing, unrelated-to-this-patch behavior; the correct
-    // classification for it is `errorCode: 'CLI_ERROR'` (the CLIError base
-    // default) with no `timeoutSeconds` (a plain CLIError carries no details).
-    {
-      args: ['wait', 'run_abc', 'run_other'],
-      local: false,
-      timeout: true,
-      errorCode: 'CLI_ERROR',
-      expectTimeoutSeconds: false,
-    },
-    { args: ['rerun', 'test_abc', '--wait'], local: false, timeout: true },
-    { args: ['run', '--all', '--project', 'project_abc', '--wait'], local: false, timeout: true },
-    // The batch-rerun "deferred/timed-out" summary throw (commands/test.ts,
-    // the combined `deferred.length > 0 || timedOut > 0` gate) builds its
-    // `details` from `deferredTestIds`/`timedOutRunIds` only — it does not
-    // (today) also echo `opts.timeoutSeconds`. Still a client-fabricated
-    // UNSUPPORTED (requestId: 'local', no httpStatus), just without that one
-    // optional detail.
-    {
-      args: ['rerun', '--all', '--project', 'project_abc', '--wait'],
-      local: false,
-      timeout: true,
-      expectTimeoutSeconds: false,
-    },
-    {
-      args: ['run', '--all', '--project', 'project_abc', '--wait'],
-      local: false,
-      timeout: true,
-      lateConflict: true,
-    },
-    {
-      args: ['wait', 'run_abc', 'run_other'],
-      local: false,
-      timeout: true,
-      rateDeadline: true,
-      errorCode: 'CLI_ERROR',
-      expectTimeoutSeconds: false,
-    },
-    { args: ['run', 'test_abc', '--wait'], local: false, timeout: false },
-  ])('reports a poll deadline for $args (timeout=$timeout)', async scenario => {
-    const { args, local, timeout } = scenario;
-    const errorCode = 'errorCode' in scenario ? scenario.errorCode : 'UNSUPPORTED';
-    const expectTimeoutSeconds =
-      'expectTimeoutSeconds' in scenario ? scenario.expectTimeoutSeconds : true;
-    const lateConflict = 'lateConflict' in scenario;
-    const rateDeadline = 'rateDeadline' in scenario;
+    { args: ['run', 'test_abc', '--wait'], timeout: true },
+    { args: ['run', 'wait', 'exec_abc'], timeout: true },
+    { args: ['run', 'wait', 'exec_abc', 'exec_other'], timeout: true },
+    { args: ['run', '--project', 'project_abc', '--wait'], timeout: true },
+    { args: ['run', 'wait', 'exec_abc'], timeout: true, rate: true },
+    { args: ['run', 'test_abc', '--wait'], timeout: false },
+  ])('reports the authoritative deadline for $args timeout=$timeout rate=$rate', async scenario => {
     vi.useFakeTimers();
     vi.stubEnv('TESTSPRITE_NO_TELEMETRY', '0');
     vi.stubEnv('DO_NOT_TRACK', '0');
     const events: unknown[] = [];
-    let pollEntered = () => {};
+    let entered = () => {};
     const polling = new Promise<void>(resolve => {
-      pollEntered = resolve;
+      entered = resolve;
     });
-    const run = {
-      runId: 'run_abc',
-      testId: 'test_abc',
-      projectId: 'project_abc',
-      userId: 'user_abc',
-      status: timeout ? 'running' : 'passed',
-      source: 'cli',
-      createdAt: '2026-09-09T00:00:00.000Z',
-      startedAt: null,
-      finishedAt: null,
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
-      createdFrom: null,
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
-      retryAfterSeconds: 1,
-    };
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: unknown, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith('/telemetry')) {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith('/telemetry')) {
           events.push(JSON.parse(String(init?.body)));
           return new Response(null, { status: 204 });
         }
-        if (url.includes('/batch/'))
-          return new Response(
-            JSON.stringify({
-              accepted: lateConflict
-                ? []
-                : [{ testId: 'test_abc', runId: 'run_abc', enqueuedAt: run.createdAt }],
-              conflicts: lateConflict ? [{ testId: 'test_abc', currentRunId: 'run_abc' }] : [],
-              deferred: [],
-              skippedFrontend: [],
-              skippedIntegration: [],
-              closure: { byProject: [] },
-            }),
-          );
         if (init?.method === 'POST')
           return new Response(
-            JSON.stringify({
-              runId: 'run_abc',
-              status: 'queued',
-              enqueuedAt: run.createdAt,
-              codeVersion: 'v1',
-              targetUrl: 'https://example.com',
-              autoHeal: true,
-            }),
+            JSON.stringify(projectRun({ runId: 'exec_abc', projectId: 'project_abc' })),
           );
-        if (url.includes('/runs/')) {
-          if (lateConflict && !new URL(url).searchParams.has('waitSeconds'))
-            vi.setSystemTime(Date.now() + 2000);
-          pollEntered();
-          if (rateDeadline)
+        if (url.pathname.endsWith('/results')) {
+          entered();
+          if ('rate' in scenario)
             return new Response(
               JSON.stringify({
-                error: {
-                  code: 'RATE_LIMITED',
-                  message: 'per-minute limit exceeded',
-                  details: { retryAfterSeconds: 1 },
-                },
+                code: 'RATE_LIMITED',
+                message: 'per-minute limit exceeded',
+                nextAction: 'retry later',
+                requestId: 'rate',
+                details: {},
               }),
               { status: 429, headers: { 'retry-after': '1' } },
             );
-          return new Response(JSON.stringify(run));
+          return new Response(
+            JSON.stringify(
+              runListing(
+                {
+                  runId: url.searchParams.get('run')!,
+                  status: scenario.timeout ? 'running' : 'finished',
+                  cancelled: false,
+                },
+                [
+                  resultLine({
+                    resultId: 'result-a',
+                    runId: url.searchParams.get('run')!,
+                    testStatus: scenario.timeout ? 'RUNNING' : 'PASSED',
+                  }),
+                ],
+              ),
+            ),
+          );
         }
-        if (url.includes('/tunnel/')) return new Response(JSON.stringify({ status: 'online' }));
-        if (new URL(url).pathname.endsWith('/tests'))
+        if (url.pathname.endsWith('/env'))
           return new Response(
             JSON.stringify({
-              items: [{ testId: 'test_abc', type: 'frontend', name: 'Example' }],
-              nextToken: null,
+              environments: [
+                { id: 'env', name: 'default', url: 'https://example.com', isDefault: true },
+              ],
             }),
           );
-        return new Response(JSON.stringify({ type: 'frontend' }));
+        return new Response(
+          JSON.stringify({ id: 'test_abc', type: 'frontend', projectId: 'project_abc' }),
+        );
       }),
     );
-    process.argv = ['node', 'testsprite', 'test', ...args, '--timeout', '1', '--output', 'json'];
+    process.argv = ['node', 'testsprite', ...scenario.args, '--timeout', '1', '--output', 'json'];
     const pending = import('./index.js');
     await Promise.race([
       polling,
       pending.then(() => {
-        throw new Error(`Command ended before polling: ${stderr}`);
+        throw new Error(`Ended before wait: ${stderr}`);
       }),
     ]);
-    await vi.advanceTimersByTimeAsync(rateDeadline ? 3000 : 1000);
+    await vi.advanceTimersByTimeAsync(3100);
     await pending;
     expect(events).toHaveLength(1);
-    if (timeout) {
-      expect(events[0]).toMatchObject({
-        outcome: 'error',
-        exitCode: 7,
-        reason: 'wait_timeout',
-        // This is the headline proof for the UNSUPPORTED client/server fix
-        // — every one of these scenarios is a CLI-side --wait deadline
-        // (never a genuine backend 501), so errorOrigin must ALWAYS read
-        // 'client' regardless of which throw site produced the error
-        // (UNSUPPORTED for the single-run/rerun/batch paths, or a plain
-        // CLIError for multi-run `test wait`) — that's exactly the signal
-        // that resolves the client/server over-count in prod telemetry.
-        errorCode,
-        errorOrigin: 'client',
-        ...(expectTimeoutSeconds ? { timeoutSeconds: 1 } : {}),
-        ...(local ? { local: true, cancelOutcome: 'skipped' } : {}),
-      });
-      if (!expectTimeoutSeconds) expect(events[0]).not.toHaveProperty('timeoutSeconds');
-      if (!local) expect(events[0]).not.toHaveProperty('cancelOutcome');
-      expect(process.exitCode).toBe(7);
-    } else {
-      expect(events[0]).toMatchObject({ outcome: 'success', exitCode: 0 });
-      expect(events[0]).not.toHaveProperty('reason');
-      expect(events[0]).not.toHaveProperty('cancelOutcome');
-    }
+    expect(events[0]).toMatchObject(
+      scenario.timeout
+        ? {
+            outcome: 'error',
+            exitCode: 7,
+            reason: 'wait_timeout',
+            errorOrigin: 'client',
+            timeoutSeconds: 1,
+          }
+        : { outcome: 'success', exitCode: 0 },
+    );
     expect(JSON.parse(stdout)).toBeTruthy();
   });
 });
@@ -507,24 +315,24 @@ describe('wait timeout telemetry through the entry point', () => {
 describe('local telemetry through the entry point', () => {
   it.each([
     {
-      args: ['test', 'run', 'test_abc', '--local', '5173', '--target-url', 'https://example.com'],
-      command: 'test run',
+      args: ['run', 'test_abc', '--local', '5173', '--target-url', 'https://example.com'],
+      command: 'run',
       outcome: 'error',
       exitCode: 5,
     },
     {
       args: [
         'project',
+        'env',
         'create',
-        '--type',
-        'frontend',
+        'project_local',
         '--name',
-        'local-app',
+        'local',
         '--local',
         '5173',
         '--skip-preflight',
       ],
-      command: 'project create',
+      command: 'project env create',
       outcome: 'success',
       exitCode: 0,
     },
@@ -542,17 +350,21 @@ describe('local telemetry through the entry point', () => {
           events.push(JSON.parse(String(init?.body)));
           return new Response(null, { status: 204 });
         }
-        if (path.endsWith('/projects') && init?.method === 'POST')
+        if (path.endsWith('/projects/project_local/env') && init?.method === 'POST')
           return new Response(
             JSON.stringify({
-              projectId: 'project_local',
-              type: 'frontend',
-              name: 'local-app',
-              targetUrl: 'http://localhost:5173',
-              originMode: 'local',
-              createdFrom: 'cli',
-              createdAt: '2026-10-01T00:00:00Z',
-              updatedAt: '2026-10-01T00:00:00Z',
+              environment: {
+                id: 'env_local',
+                name: 'local',
+                url: 'http://localhost:5173',
+                isDefault: true,
+                authMode: 'public',
+                hasCredentials: false,
+                username: null,
+                enableOtp: false,
+                updatedAt: '2026-10-01T00:00:00Z',
+              },
+              created: true,
             }),
             { status: 201 },
           );
@@ -572,7 +384,7 @@ describe('local telemetry through the entry point', () => {
     ]);
     expect(requests).toEqual(
       scenario.exitCode === 0
-        ? ['POST /api/cli/v1/projects', 'POST /api/cli/v1/telemetry']
+        ? ['POST /api/cli/v1/projects/project_local/env', 'POST /api/cli/v1/telemetry']
         : ['POST /api/cli/v1/telemetry'],
     );
   });
@@ -634,10 +446,16 @@ describe('local telemetry through the entry point', () => {
           );
         if (method === 'DELETE' && path.endsWith('/tunnel/client_auto'))
           return new Response(null, { status: 204 });
-        if (method === 'POST' && path.endsWith('/tests/test_auto/runs'))
+        if (method === 'POST' && path.endsWith('/projects/project_auto/runs'))
           return new Response(
             JSON.stringify({
-              runId: 'run_auto',
+              projectId: 'project_auto',
+              total: 1,
+              autoHeal: true,
+              blocked: [],
+              held: [],
+              environment: { id: 'env_auto', name: 'local-app' },
+              runId: 'exec_auto',
               status: 'queued',
               enqueuedAt: '2026-10-01T00:00:00Z',
               codeVersion: 'v1',
@@ -645,27 +463,18 @@ describe('local telemetry through the entry point', () => {
               tunnelClientId: 'client_auto',
             }),
           );
-        if (path.endsWith('/runs/run_auto'))
+        if (path.endsWith('/results'))
           return new Response(
-            JSON.stringify({
-              runId: 'run_auto',
-              testId: 'test_auto',
-              projectId: 'project_auto',
-              userId: 'user_auto',
-              status: 'passed',
-              source: 'cli',
-              createdAt: '2026-10-01T00:00:00Z',
-              startedAt: null,
-              finishedAt: '2026-10-01T00:00:01Z',
-              codeVersion: 'v1',
-              targetUrl: 'http://localhost:5173',
-              createdFrom: 'cli',
-              failedStepIndex: null,
-              failureKind: null,
-              error: null,
-              videoUrl: null,
-              stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-            }),
+            JSON.stringify(
+              runListing({ runId: 'exec_auto', status: 'finished', cancelled: false }, [
+                resultLine({
+                  resultId: 'run_auto',
+                  runId: 'exec_auto',
+                  caseKey: 'test_auto',
+                  testStatus: 'PASSED',
+                }),
+              ]),
+            ),
           );
         throw new Error(`Unexpected request: ${method} ${path}`);
       }),
@@ -673,7 +482,6 @@ describe('local telemetry through the entry point', () => {
     process.argv = [
       'node',
       'testsprite',
-      'test',
       'run',
       'test_auto',
       '--skip-preflight',
@@ -684,11 +492,15 @@ describe('local telemetry through the entry point', () => {
       await import('./index.js');
       expect(process.exitCode ?? 0).toBe(0);
       expect(events).toEqual([
-        expect.objectContaining({ command: 'test run', outcome: 'success', local: true }),
+        expect.objectContaining({ command: 'run', outcome: 'success', local: true }),
       ]);
       expect(requests).toContain('POST /api/cli/v1/tunnel');
       expect(requests).toContain('DELETE /api/cli/v1/tunnel/client_auto');
-      expect(JSON.parse(stdout)).toMatchObject({ runId: 'run_auto', status: 'passed' });
+      expect(JSON.parse(stdout)).toMatchObject({
+        runs: [{ runId: 'exec_auto' }],
+        results: [{ resultId: 'run_auto', testId: 'test_auto', status: 'passed' }],
+      });
+      expect(stdout).not.toContain('executionId');
     } finally {
       vi.doUnmock('./vendor/tunnel-client/index.js');
     }
@@ -700,15 +512,25 @@ describe('local telemetry through the entry point', () => {
 // as the ApiError/InterruptError/RequestTimeoutError branches, instead of the
 // bare `{"error":"<message>"}` string `output.error()` used to produce.
 describe('CLIError branch renders a structured --output json envelope', () => {
-  it('`test wait` resolving to a failed run exits 1 with a full 5-key error envelope', async () => {
+  it('`run wait` resolving to a failed run exits 1 with a full 5-key error envelope', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: unknown) => {
         const url = String(input);
+        if (new URL(url).pathname.endsWith('/results')) {
+          return new Response(
+            JSON.stringify(
+              runListing({ runId: 'exec_abc', status: 'finished', cancelled: false }, [
+                resultLine({ resultId: 'run_abc', runId: 'exec_abc', testStatus: 'FAILED' }),
+              ]),
+            ),
+          );
+        }
         if (url.includes('/runs/')) {
           return new Response(
             JSON.stringify({
-              runId: 'run_abc',
+              resultId: 'run_abc',
+              runId: 'exec_abc',
               testId: 'test_abc',
               projectId: 'project_abc',
               userId: 'user_abc',
@@ -731,14 +553,14 @@ describe('CLIError branch renders a structured --output json envelope', () => {
         return new Response(JSON.stringify({ type: 'frontend' }));
       }),
     );
-    process.argv = ['node', 'testsprite', 'test', 'wait', 'run_abc', '--output', 'json'];
+    process.argv = ['node', 'testsprite', 'run', 'wait', 'exec_abc', '--output', 'json'];
     await import('./index.js');
     expect(process.exitCode).toBe(1);
     const envelope = JSON.parse(stderr.slice(stderr.indexOf('{')));
     expect(envelope).toEqual({
       error: {
         code: 'CLI_ERROR',
-        message: 'Run run_abc finished with status: failed',
+        message: '1 result failed.',
         nextAction: '',
         requestId: 'local',
         details: {},
@@ -747,10 +569,46 @@ describe('CLIError branch renders a structured --output json envelope', () => {
   });
 });
 
-// Proves the discriminator's OTHER half — a genuine backend 501
-// UNSUPPORTED response (real HTTP round trip, httpStatus set) must report
-// errorOrigin: 'server', so it stays distinguishable from the client-side
-// --wait-timeout→UNSUPPORTED conversions covered above.
+describe('native conflict envelopes through the entry point', () => {
+  it.each(['json', 'text'])(
+    'preserves backend message, hint and nested IDs in %s',
+    async output => {
+      const raw = {
+        code: 'CONFLICT',
+        message: 'Original run e1 conflict',
+        // Older backend guidance remains server-owned, even after the CLI path moves.
+        nextAction: 'Original action: testsprite test wait e1',
+        requestId: 'raw-conflict',
+        details: {
+          currentRunId: 'e1',
+          currentResultId: 'r1',
+          nested: { runId: 'e2', resultId: 'r2' },
+        },
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: unknown, init?: RequestInit) => {
+          const path = new URL(String(input)).pathname;
+          if (init?.method === 'POST') return new Response(JSON.stringify(raw), { status: 409 });
+          if (path.endsWith('/env')) return new Response(JSON.stringify({ environments: [] }));
+          return new Response(
+            JSON.stringify({ id: 'test_busy', projectId: 'project_busy', type: 'frontend' }),
+          );
+        }),
+      );
+      process.argv = ['node', 'testsprite', 'run', 'test_busy', '--no-wait', '--output', output];
+      await import('./index.js');
+      expect(process.exitCode).toBe(6);
+      if (output === 'json')
+        expect(JSON.parse(stderr.slice(stderr.indexOf('{')))).toEqual({ error: raw });
+      else {
+        expect(stderr).toContain(raw.message);
+        expect(stderr).toContain(raw.nextAction);
+      }
+    },
+  );
+});
+
 describe('errorOrigin telemetry — server counterpart', () => {
   it('a real backend 501 UNSUPPORTED response reports errorOrigin: server', async () => {
     vi.stubEnv('TESTSPRITE_NO_TELEMETRY', '0');
@@ -781,7 +639,6 @@ describe('errorOrigin telemetry — server counterpart', () => {
     process.argv = [
       'node',
       'testsprite',
-      'test',
       'run',
       'test_backend',
       '--local',
@@ -825,7 +682,7 @@ describe('ApiError branch redacts secrets in the JSON error envelope', () => {
           ),
       ),
     );
-    process.argv = ['node', 'testsprite', 'auth', 'whoami', '--output', 'json'];
+    process.argv = ['node', 'testsprite', 'auth', 'status', '--output', 'json'];
     await import('./index.js');
     expect(process.exitCode).toBe(5);
     expect(stderr).not.toContain('hunter2-DO-NOT-PRINT');

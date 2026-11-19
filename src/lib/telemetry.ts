@@ -27,8 +27,9 @@
  * Flag-derived values are limited to bounded numeric controls:
  * `timeoutSeconds` is the operator's timeout (not a URL or free text) and
  * distinguishes a wait deadline from a slow backend; `localConcurrencyLimit`
- * is an integer 1–10 and lets local batch outcomes be grouped by load.
- * `localPeakInFlight` is the observed count, also bounded by that limit.
+ * is the requested integer 1–15 cap for each local execution and lets local
+ * outcomes be grouped by the requested server limit. The CLI
+ * does not estimate a server-side peak from client dispatches.
  *
  * `errorOrigin` ('client' | 'server') and `timeoutSeconds` are sent by this
  * revision of the CLI. The telemetry endpoint validates against an allowlist
@@ -70,7 +71,7 @@ export interface WaitTimeoutTelemetry {
 }
 
 export interface TelemetryOutcomeInput extends Partial<WaitTimeoutTelemetry> {
-  /** Leaf command path that ran, e.g. `test run`. Empty → skip (no command). */
+  /** Leaf command path that ran, e.g. `run`. Empty → skip (no command). */
   command: string;
   outcome: TelemetryOutcome;
   exitCode: number;
@@ -225,7 +226,7 @@ export type TelemetryConflictReason =
  */
 export interface TelemetryExtras {
   local?: boolean;
-  /** Batch dispatch accounting (`test run --all`, `testlist run`). */
+  /** Batch dispatch accounting (`run --project`, `run --testlist`). */
   accepted?: number;
   conflicts?: number;
   deferred?: number;
@@ -235,9 +236,8 @@ export interface TelemetryExtras {
   failed?: number;
   blocked?: number;
   timedOut?: number;
-  /** Local tunnel pool limit (1–10) and observed peak, without ids or target details. */
+  /** The requested server cap (1–15) for each local execution. */
   localConcurrencyLimit?: number;
-  localPeakInFlight?: number;
   /** The most frequent conflict reason of the batch. */
   conflictReason?: TelemetryConflictReason;
   /** `ci init` facts. */
@@ -254,13 +254,20 @@ export interface TelemetryExtras {
 /**
  * What a `ci run` invocation ended up doing. `gated` = tests were dispatched
  * and the exit code is the verdict; `skipped_*` = nothing to gate (exit 0, no
- * summary); `refused_*` = refused before or at dispatch; `empty` = nothing
- * selected. The funnel step "`ci init` → first gated run" is computed from it.
+ * summary — `skipped_no_preview` is `--wait-for-status` learning the preview
+ * was never built); `refused_*` = refused before or at dispatch
+ * (`refused_url_template` = the pattern could not be filled for this run);
+ * `timeout_preview` = `--wait-for-status` saw nothing terminal in time;
+ * `empty` = nothing selected. The funnel step "`ci init` → first gated run" is
+ * computed from it.
  */
 export type CiRunTelemetryOutcome =
   | 'gated'
   | 'skipped_draft'
   | 'skipped_no_pr'
+  | 'skipped_no_preview'
+  | 'timeout_preview'
+  | 'refused_url_template'
   | 'refused_admission'
   | 'refused_env'
   | 'refused_preview_name'
@@ -303,7 +310,6 @@ const COUNT_KEYS = [
   'blocked',
   'timedOut',
   'localConcurrencyLimit',
-  'localPeakInFlight',
 ] as const;
 const BOOLEAN_KEYS = ['force', 'workflowExisted', 'local', 'reportReady'] as const;
 /** Opaque server ids the beacon accepts — a UUID, nothing free-form. */
@@ -330,6 +336,9 @@ const ENUM_KEYS: {
     'gated',
     'skipped_draft',
     'skipped_no_pr',
+    'skipped_no_preview',
+    'timeout_preview',
+    'refused_url_template',
     'refused_admission',
     'refused_env',
     'refused_preview_name',
@@ -396,8 +405,8 @@ export function takeTelemetryExtras(): TelemetryExtras {
 }
 
 /**
- * Disjoint verdict counts over a set of polled runs — `passed` + `failed` +
- * `blocked` + `timedOut` = total. Unlike the CI summary's `failed` (which folds
+ * Disjoint verdict counts over finished polls. A test still running when the
+ * wait ends has no verdict. Unlike the CI summary's `failed` (which folds
  * blocked in), `blocked` is split out here because it is the signal that
  * separates a broken target from a failing assertion.
  */
@@ -408,19 +417,21 @@ export function batchOutcomeCounts(results: ReadonlyArray<{ status: string }>): 
   timedOut: number;
 } {
   let passed = 0;
+  let failed = 0;
   let blocked = 0;
   let timedOut = 0;
   for (const r of results) {
     if (r.status === 'passed') passed++;
     else if (r.status === 'blocked') blocked++;
     else if (r.status === 'timeout') timedOut++;
+    else if (r.status !== 'running') failed++;
   }
-  return { passed, failed: results.length - passed - blocked - timedOut, blocked, timedOut };
+  return { passed, failed, blocked, timedOut };
 }
 
 /**
  * Record a batch command's dispatch accounting (and, under `--wait`, its
- * verdict counts) in one call, so `test run --all` and `testlist run` cannot
+ * verdict counts) in one call, so `run --project` and `run --testlist` cannot
  * drift in how they count. `conflictReason` is the dominant reason of the
  * batch; `results` are the polled runs (omit for a non-wait dispatch).
  */
@@ -471,7 +482,7 @@ export interface TelemetryEvent extends Partial<WaitTimeoutTelemetry>, Telemetry
  *
  * Every branch below now fills `errorCode` — the two fallback branches
  * (`CLIError`, and the final catch-all for a non-CLIError throw) previously
- * left it `undefined`, which is why a meaningful share of `test run`
+ * left it `undefined`, which is why a meaningful share of `run`
  * invocations and `setup` failures landed in telemetry with `errorCode=None`.
  *
  * `errorOrigin` ('client' | 'server') resolves a real UNSUPPORTED

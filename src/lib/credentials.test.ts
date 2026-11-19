@@ -26,6 +26,8 @@ import {
   readProfile,
   serializeCredentials,
   writeProfile,
+  type CredentialsFile,
+  type ProfileEntry,
 } from './credentials.js';
 import { ApiError } from './errors.js';
 
@@ -779,5 +781,271 @@ describe('assertValidProfileName / profile-name guard', () => {
   it('readProfile and deleteProfile reject a malformed name', () => {
     expect(() => readProfile('a\nb', { path: credentialsPath })).toThrow(ApiError);
     expect(() => deleteProfile('a\nb', { path: credentialsPath })).toThrow(ApiError);
+  });
+});
+
+describe('names that collide with built-in object members', () => {
+  // The shared built-ins an unguarded parser writes onto, one per section name
+  // used below.
+  const SHARED_BUILTINS: object[] = [
+    Object.prototype,
+    Object,
+    Object.prototype.toString,
+    Object.prototype.hasOwnProperty,
+  ];
+
+  afterEach(() => {
+    // Whatever a regression leaves on a shared built-in must not leak into the
+    // tests that follow, or one failure shows up as many.
+    for (const target of SHARED_BUILTINS) {
+      const bag = target as Record<string, unknown>;
+      delete bag.apiKey;
+      delete bag.apiUrl;
+    }
+  });
+
+  const plantFile = (content: string): void => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
+    writeFileSync(credentialsPath, content);
+  };
+  const fileOnDisk = (): string =>
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same temp path; reading back what the module wrote is the assertion
+    readFileSync(credentialsPath, 'utf-8');
+
+  describe('parseCredentials', () => {
+    it('keeps a [__proto__] section off Object.prototype', () => {
+      const ownKeysBefore = Reflect.ownKeys(Object.prototype);
+      const result = parseCredentials(
+        '[__proto__]\napi_key = sk-planted\napi_url = https://planted.example\n' +
+          '[ __proto__ ]\napi_key = sk-padded\n' +
+          '[default]\napi_key = sk-real\n',
+      );
+      const fresh: Record<string, unknown> = {};
+      expect(fresh.apiKey).toBeUndefined();
+      expect(fresh.apiUrl).toBeUndefined();
+      expect(Reflect.ownKeys(Object.prototype)).toEqual(ownKeysBefore);
+      expect(result).toEqual({ default: { apiKey: 'sk-real' } });
+    });
+
+    it('keeps a [constructor] section off the Object function', () => {
+      const result = parseCredentials(
+        '[constructor]\napi_key = sk-planted\napi_url = https://planted.example\n' +
+          '[default]\napi_key = sk-real\n',
+      );
+      expect(Object.hasOwn(Object, 'apiKey')).toBe(false);
+      expect(Object.hasOwn(Object, 'apiUrl')).toBe(false);
+      expect(result).toEqual({ default: { apiKey: 'sk-real' } });
+    });
+
+    it('drops a reserved section together with the lines under it', () => {
+      const result = parseCredentials(
+        '[default]\napi_key = sk-real\n' +
+          '[constructor]\napi_key = sk-planted\napi_url = https://planted.example\n' +
+          '[dev]\napi_key = sk-dev\n',
+      );
+      // Exact match: the section is not a profile, and its lines were skipped
+      // rather than applied to `[default]` above it.
+      expect(result).toEqual({ default: { apiKey: 'sk-real' }, dev: { apiKey: 'sk-dev' } });
+      expect(Object.keys(result)).toEqual(['default', 'dev']);
+    });
+
+    it('still reads a [prototype] section as an ordinary profile', () => {
+      const result = parseCredentials('[prototype]\napi_key = sk-p\n[default]\napi_key = sk-d\n');
+      expect(result).toEqual({ prototype: { apiKey: 'sk-p' }, default: { apiKey: 'sk-d' } });
+    });
+
+    it('reads a section named after an inherited member as an ordinary profile', () => {
+      const result = parseCredentials(
+        '[toString]\napi_key = sk-a\n[hasOwnProperty]\napi_url = https://b.example\n',
+      );
+      expect(Object.entries(result)).toEqual([
+        ['toString', { apiKey: 'sk-a' }],
+        ['hasOwnProperty', { apiUrl: 'https://b.example' }],
+      ]);
+      expect(Object.hasOwn(Object.prototype.toString, 'apiKey')).toBe(false);
+      expect(Object.hasOwn(Object.prototype.hasOwnProperty, 'apiUrl')).toBe(false);
+    });
+
+    it('ignores a key that only matches an inherited member', () => {
+      const result = parseCredentials(
+        '[default]\nconstructor = a\n__proto__ = b\ntoString = c\napi_key = sk-real\n',
+      );
+      expect(result).toEqual({ default: { apiKey: 'sk-real' } });
+      expect(Object.keys(result.default ?? {})).toEqual(['apiKey']);
+    });
+
+    it('parses an ordinary file exactly as before, onto ordinary objects', () => {
+      const result = parseCredentials(
+        [
+          '# comment',
+          'api_key = orphan',
+          '[default]',
+          'api_key = sk-default',
+          'api_url=https://example.com/path?a=b',
+          '',
+          '; another comment',
+          '[ dev ]\r',
+          'api_key   =   sk-dev  \r',
+          'unknown_key = ignored',
+          'no equals sign',
+          '[default]',
+          'api_url = https://override.example',
+          '[empty]',
+          '',
+        ].join('\n'),
+      );
+      expect(result).toEqual({
+        default: { apiKey: 'sk-default', apiUrl: 'https://override.example' },
+        dev: { apiKey: 'sk-dev' },
+        empty: {},
+      });
+      expect(Object.keys(result)).toEqual(['default', 'dev', 'empty']);
+      expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+      for (const entry of Object.values(result)) {
+        expect(Object.getPrototypeOf(entry)).toBe(Object.prototype);
+      }
+    });
+  });
+
+  describe('serializeCredentials', () => {
+    it('writes an ordinary file byte-for-byte as before and round-trips it', () => {
+      const file: CredentialsFile = {
+        zeta: { apiKey: 'sk-z' },
+        default: { apiUrl: 'https://example.com', apiKey: 'sk-d' },
+        alpha: { apiKey: 'sk-a', apiUrl: '' },
+      };
+      const text = serializeCredentials(file);
+      expect(text).toBe(
+        '[default]\napi_key = sk-d\napi_url = https://example.com\n\n' +
+          '[alpha]\napi_key = sk-a\n\n' +
+          '[zeta]\napi_key = sk-z\n',
+      );
+      expect(parseCredentials(text)).toEqual({
+        default: { apiKey: 'sk-d', apiUrl: 'https://example.com' },
+        alpha: { apiKey: 'sk-a' },
+        zeta: { apiKey: 'sk-z' },
+      });
+      expect(serializeCredentials(parseCredentials(text))).toBe(text);
+    });
+
+    it('never writes a reserved section name', () => {
+      // `Object.fromEntries` makes each name an own key, which is how such a
+      // name would have to reach the serialiser.
+      const file: CredentialsFile = Object.fromEntries([
+        ['__proto__', { apiKey: 'sk-a' }],
+        ['constructor', { apiKey: 'sk-b' }],
+        ['default', { apiKey: 'sk-real' }],
+      ]);
+      expect(serializeCredentials(file)).toBe('[default]\napi_key = sk-real\n');
+    });
+
+    it('writes only the fields the file format knows', () => {
+      const entry = {
+        apiKey: 'sk-real',
+        constructor: 'a',
+        toString: 'b',
+        extra: 'c',
+      } as unknown as ProfileEntry;
+      expect(serializeCredentials({ default: entry })).toBe('[default]\napi_key = sk-real\n');
+    });
+  });
+
+  describe('readProfile / writeProfile / deleteProfile', () => {
+    it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+      'readProfile reports %s as absent when no such profile is stored',
+      name => {
+        plantFile('[default]\napi_key = sk-real\n');
+        expect(readProfile(name, { path: credentialsPath })).toBeUndefined();
+      },
+    );
+
+    it.each(['__proto__', 'constructor'])(
+      'readProfile reports %s as absent even when the file carries such a section',
+      name => {
+        plantFile(`[${name}]\napi_key = sk-planted\n[default]\napi_key = sk-real\n`);
+        expect(readProfile(name, { path: credentialsPath })).toBeUndefined();
+      },
+    );
+
+    it.each(['__proto__', 'constructor'])(
+      'writeProfile refuses %s with a VALIDATION_ERROR before anything is created',
+      name => {
+        // A directory that does not exist yet shows the refusal comes before
+        // the directory, the lock and the file.
+        const nestedDir = join(tmpRoot, 'not-created');
+        let caught: unknown;
+        try {
+          writeProfile(name, { apiKey: 'sk-new' }, { path: join(nestedDir, 'credentials') });
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(ApiError);
+        const apiErr = caught as ApiError;
+        expect(apiErr.code).toBe('VALIDATION_ERROR');
+        expect(apiErr.exitCode).toBe(5);
+        expect(apiErr.nextAction).toContain('--profile');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- `nestedDir` is inside this suite's mkdtempSync temp dir, never user input
+        expect(existsSync(nestedDir)).toBe(false);
+      },
+    );
+
+    it('writeProfile with a reserved name leaves an existing file as it was', () => {
+      writeProfile('default', { apiKey: 'sk-real' }, { path: credentialsPath });
+      const before = fileOnDisk();
+      for (const name of ['__proto__', 'constructor']) {
+        expect(() => writeProfile(name, { apiKey: 'sk-new' }, { path: credentialsPath })).toThrow(
+          ApiError,
+        );
+      }
+      expect(fileOnDisk()).toBe(before);
+    });
+
+    it('still stores, reads and removes a profile named prototype', () => {
+      writeProfile('prototype', { apiKey: 'sk-p' }, { path: credentialsPath });
+      expect(readProfile('prototype', { path: credentialsPath })).toEqual({ apiKey: 'sk-p' });
+      expect(deleteProfile('prototype', { path: credentialsPath })).toBe(true);
+      expect(readProfile('prototype', { path: credentialsPath })).toBeUndefined();
+    });
+
+    it('stores, merges, keeps and removes a profile named after an inherited member', () => {
+      writeProfile('default', { apiKey: 'sk-real' }, { path: credentialsPath });
+      writeProfile('toString', { apiKey: 'sk-a' }, { path: credentialsPath });
+      writeProfile('toString', { apiUrl: 'https://a.example' }, { path: credentialsPath });
+      expect(readProfile('toString', { path: credentialsPath })).toEqual({
+        apiKey: 'sk-a',
+        apiUrl: 'https://a.example',
+      });
+      // Writing another profile rewrites the whole file and must carry the
+      // section along.
+      writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
+      expect(fileOnDisk()).toBe(
+        '[default]\napi_key = sk-real\n\n' +
+          '[dev]\napi_key = sk-dev\n\n' +
+          '[toString]\napi_key = sk-a\napi_url = https://a.example\n',
+      );
+      expect(Object.hasOwn(Object.prototype.toString, 'apiKey')).toBe(false);
+      expect(deleteProfile('toString', { path: credentialsPath })).toBe(true);
+      expect(readProfile('toString', { path: credentialsPath })).toBeUndefined();
+    });
+
+    it('does not merge an inherited member into a new profile of the same name', () => {
+      // Stands in for anything else in the process having decorated the
+      // built-in; the afterEach above removes it again.
+      (Object.prototype.toString as unknown as Record<string, unknown>).apiUrl =
+        'https://planted.example';
+      writeProfile('toString', { apiKey: 'sk-a' }, { path: credentialsPath });
+      expect(fileOnDisk()).toBe('[toString]\napi_key = sk-a\n');
+    });
+
+    it('deleteProfile reports a name that is not a stored profile as absent without rewriting the file', () => {
+      writeProfile('default', { apiKey: 'sk-real' }, { path: credentialsPath });
+      vi.mocked(renameSync).mockClear();
+      for (const name of ['__proto__', 'constructor', 'toString']) {
+        expect(deleteProfile(name, { path: credentialsPath })).toBe(false);
+      }
+      expect(
+        vi.mocked(renameSync).mock.calls.filter(call => call[1] === credentialsPath),
+      ).toHaveLength(0);
+    });
   });
 });

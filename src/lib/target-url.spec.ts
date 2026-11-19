@@ -496,14 +496,14 @@ describe('assertNotLocal — error details', () => {
       assertNotLocal('http://localhost:3000', {
         field: 'url',
         helpCommand: 'testsprite project create',
-        hintContext: 'bootstrap',
+        hintContext: 'local-project-create',
       });
       throw new Error('expected assertNotLocal to throw');
     } catch (err) {
       const apiErr = err as ApiError;
       expect(apiErr.message).toBe('Field `url` is invalid: localhost targets are not allowed.');
       expect(apiErr.nextAction).toContain('See `testsprite project create --help`');
-      expect(apiErr.nextAction).not.toContain('testsprite test run --help');
+      expect(apiErr.nextAction).not.toContain('testsprite run --help');
       expect(apiErr.details).toMatchObject({
         field: 'url',
         reason: 'localhost targets are not allowed',
@@ -584,7 +584,7 @@ describe('assertNotLocal — error details', () => {
       const details = apiErr.details as Record<string, unknown>;
       const hint = details.hint as string;
       expect(hint).toBeDefined();
-      expect(hint).not.toContain('test run <test-id> --local');
+      expect(hint).not.toContain('run <test-id> --local');
       expect(hint.toLowerCase()).toContain('cannot');
     }
   });
@@ -624,7 +624,7 @@ describe('assertNotLocal — error details', () => {
       const apiErr = err as ApiError;
       const details = apiErr.details as Record<string, unknown>;
       expect(details.reason).toContain('127.0.0.1');
-      expect(details.hint).toContain('test run <test-id> --env <name>');
+      expect(details.hint).toContain('run <test-id> --env <name>');
       expect(apiErr.nextAction).toContain('--env <name>');
     }
   });
@@ -775,7 +775,7 @@ describe('assertNotLocal — stored-URL wording', () => {
       assertNotLocal('http://10.0.0.5', {
         field: 'url',
         helpCommand: 'testsprite project create',
-        hintContext: 'bootstrap',
+        hintContext: 'local-project-create',
       });
       throw new Error('expected a rejection');
     } catch (err) {

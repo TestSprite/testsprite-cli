@@ -1,11 +1,11 @@
 /**
  * `testsprite tunnel start | list | status | stop`.
  *
- * The out-of-band primitive under `test run --local`, which is sugar over it.
+ * The out-of-band primitive under `run --local`, which is sugar over it.
  * Two things it buys that the sugar cannot:
  *
  *   - **One tunnel, many runs.** `tunnel start` in one terminal, then
- *     `test run <id> --local <port> --tunnel-client <id>` as many times as you
+ *     `run <id> --local <port> --tunnel-client <id>` as many times as you
  *     like in another. Each run would otherwise mint and tear down its own
  *     credential, and the per-principal live-binding cap is small.
  *   - **A place to look when a run says the tunnel is down.** `tunnel status`
@@ -48,6 +48,7 @@ import type {
   TunnelStatusResponse,
 } from '../lib/tunnel.types.js';
 import { TunnelClient, type TunnelClientOptions } from '../vendor/tunnel-client/index.js';
+import { terminalSafeLine, terminalSafeWriter } from '../lib/terminal-text.js';
 
 export interface TunnelDeps {
   env?: NodeJS.ProcessEnv;
@@ -107,7 +108,7 @@ function stdoutOf(deps: TunnelDeps): (line: string) => void {
 }
 
 function stderrOf(deps: TunnelDeps): (line: string) => void {
-  return deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  return terminalSafeWriter(deps.stderr);
 }
 
 function makeClient(
@@ -345,7 +346,7 @@ export async function runTunnelStart(
           ...(opts.ttlSeconds !== undefined ? { ttlSeconds: opts.ttlSeconds } : {}),
           onMinted: minted =>
             stderr(
-              `Minted tunnel client ${minted.clientId} (expires ${minted.expiresAt}); connecting…`,
+              `Minted tunnel client ${terminalSafeLine(minted.clientId)} (expires ${terminalSafeLine(minted.expiresAt)}); connecting…`,
             ),
           onFatal: (reason, message) => {
             fatal = true;
@@ -388,13 +389,14 @@ export async function runTunnelStart(
           expiresAt: string;
           transport: 'tls' | 'plaintext';
         };
+        const clientId = terminalSafeLine(d.clientId);
         return [
-          `clientId    ${d.clientId}`,
-          `expiresAt   ${d.expiresAt}`,
+          `clientId    ${clientId}`,
+          `expiresAt   ${terminalSafeLine(d.expiresAt)}`,
           `status      online`,
           `transport   ${d.transport}`,
-          `hint        Attach a run: testsprite test run <test-id> --env <name> --tunnel-client ${d.clientId}`,
-          `hint        Stop it: press Ctrl-C here, or run 'testsprite tunnel stop ${d.clientId}' from another terminal`,
+          `hint        Attach a run: testsprite run <test-id> --env <name> --tunnel-client ${clientId}`,
+          `hint        Stop it: press Ctrl-C here, or run 'testsprite tunnel stop ${clientId}' from another terminal`,
         ].join('\n');
       },
     );
@@ -432,7 +434,7 @@ export async function runTunnelStart(
     const dataPlaneUnreachable = fatalReason === 'data-plane-unreachable';
     if (revoked) {
       stderr(
-        `Tunnel credential ${session.clientId} was revoked, expired, or taken over by another process.`,
+        `Tunnel credential ${terminalSafeLine(session.clientId)} was revoked, expired, or taken over by another process.`,
       );
     }
     throw ApiError.fromEnvelope({
@@ -459,7 +461,7 @@ export async function runTunnelStart(
       },
     });
   }
-  stderr(`Tunnel ${session.clientId} closed.`);
+  stderr(`Tunnel ${terminalSafeLine(session.clientId)} closed.`);
 }
 
 /**
@@ -494,9 +496,9 @@ export async function runTunnelStatus(
 
 function renderStatus(status: TunnelStatusResponse): string {
   const lines = [
-    `clientId    ${status.clientId}`,
-    `status      ${status.status}`,
-    `expiresAt   ${status.expiresAt}`,
+    `clientId    ${terminalSafeLine(status.clientId)}`,
+    `status      ${terminalSafeLine(status.status)}`,
+    `expiresAt   ${terminalSafeLine(status.expiresAt)}`,
   ];
   if (status.status !== 'online') {
     lines.push(
@@ -651,7 +653,9 @@ export async function runTunnelStop(opts: TunnelStopOptions, deps: TunnelDeps = 
         method: 'DELETE',
         path: `/api/cli/v1/tunnel/${item.clientId}`,
       }));
-      out.print({ requests }, () => requests.map(item => `${item.method} ${item.path}`).join('\n'));
+      out.print({ requests }, () =>
+        requests.map(item => `${item.method} ${terminalSafeLine(item.path)}`).join('\n'),
+      );
       return;
     }
     if (response.tunnels.length === 0) {
@@ -692,8 +696,8 @@ export async function runTunnelStop(opts: TunnelStopOptions, deps: TunnelDeps = 
       [
         ...results.map(result =>
           result.stopped
-            ? `stopped  ${result.clientId}`
-            : `failed   ${result.clientId}  ${result.error?.message}`,
+            ? `stopped  ${terminalSafeLine(result.clientId)}`
+            : `failed   ${terminalSafeLine(result.clientId)}  ${terminalSafeLine(String(result.error?.message))}`,
         ),
         `Stopped ${stopped} of ${results.length} tunnels.`,
         'hint     A running `tunnel start` notices a revoked credential within ~15 s and exits.',
@@ -735,8 +739,8 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
         'daemon, because its credential is never written to disk.\n' +
         '\nExamples:\n' +
         '  testsprite tunnel start    # hold a tunnel open (Ctrl-C to stop)\n' +
-        '  testsprite test run <test-id> --env <name> --tunnel-client <client-id>\n' +
-        '  testsprite test run <test-id> --local 3000 --tunnel-client <client-id>\n' +
+        '  testsprite run <test-id> --env <name> --tunnel-client <client-id>\n' +
+        '  testsprite run <test-id> --local 3000 --tunnel-client <client-id>\n' +
         '  testsprite tunnel stop --all --confirm\n',
     );
 
@@ -755,7 +759,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     .addHelpText(
       'after',
       '\nPrints the client id to stderr as soon as it is minted; pass it to\n' +
-        '`test run <test-id> --env <name> --tunnel-client <client-id>` for an environment on this machine.\n' +
+        '`run <test-id> --env <name> --tunnel-client <client-id>` for an environment on this machine.\n' +
         '\nDev servers can take a minute per page through the tunnel; for a heavy one, test a built\n' +
         "server (`npm run build`, then your framework's preview/start command).\n" +
         '\nExit codes:\n' +

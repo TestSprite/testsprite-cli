@@ -5,7 +5,7 @@
  * endpoint, credentials, live connectivity + key validity, and whether the
  * verify skill is installed in the current project) and prints an OK/WARN/FAIL
  * report. Exits non-zero when any check FAILS so it can gate a CI step or an
- * agent preflight (`testsprite doctor && testsprite test run ...`). Warnings
+ * agent preflight (`testsprite doctor && testsprite run ...`). Warnings
  * (e.g. skill not installed) do not fail the process.
  *
  * Every check is reused from the same helpers the real commands use, so the
@@ -15,6 +15,7 @@
  * for the skill check.
  */
 
+import { lstatSync, readFileSync } from 'node:fs';
 import { Command } from 'commander';
 import {
   assertValidEndpointUrl,
@@ -44,10 +45,11 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import type { MeIdentityWire } from '../lib/response-schemas.js';
 import { ME_IDENTITY_SCHEMA } from '../lib/response-schemas.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
-import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
+import { skillStates, type AgentFs } from './agent.js';
 import { VERSION } from '../version.js';
 import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
 import { inspectTestspriteIgnore } from '../lib/git-utils.js';
+import { terminalSafeLine } from '../lib/terminal-text.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -138,7 +140,6 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     (opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL)) !== undefined;
   const endpointCheck = checkEndpoint(config.apiUrl);
   const hasKey = Boolean(config.apiKey);
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   const connectivity = await checkConnectivity(opts, deps, {
     hasKey,
@@ -166,19 +167,6 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     connectivity.check,
   ];
 
-  // Informational routing line, only when the backend reported it (no new call).
-  if (connectivity.v3Enabled !== undefined) {
-    const label = routingLabel(connectivity.v3Enabled);
-    checks.push({
-      name: 'Routing',
-      status: 'ok',
-      detail:
-        connectivity.v3Enabled === true
-          ? `${label} (V3 execution routing is ON)`
-          : `${label} (default routing)`,
-    });
-  }
-
   // Org attribution lines — only when the backend reported them (no new call).
   const orgsSummary = formatOrgsSummary(connectivity.organizations);
   if (orgsSummary) {
@@ -203,7 +191,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     }),
   );
 
-  checks.push(checkSkill(cwd, deps));
+  checks.push(await checkSkill(cwd, deps));
   checks.push(gitChecks[1]);
 
   const failures = checks.filter(check => check.status === 'fail').length;
@@ -211,10 +199,6 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const report: DoctorReport = { checks, failures, warnings };
 
   out.print(report, () => renderDoctor(report));
-
-  if (connectivity.v3Enabled === true) {
-    emitV3RoutingAdvisory(stderr);
-  }
 
   if (failures > 0) {
     // Non-zero exit so `testsprite doctor && ...` gates a CI step or an agent
@@ -296,18 +280,63 @@ function checkCredentials(
   };
 }
 
-function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
+/**
+ * The two reads `skillStates` makes, done synchronously, so the check ends in
+ * the same turn of the event loop as doctor's other local checks. Writes are
+ * refused: doctor only reads.
+ */
+const readOnlySkillFs: AgentFs = {
+  async lstat(p) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- a skill path under the project dir doctor checks.
+      const stats = lstatSync(p);
+      return { isFile: stats.isFile(), isSymbolicLink: stats.isSymbolicLink() };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+      throw err;
+    }
+  },
+  async readFile(p) {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- a skill file under the project dir doctor checks.
+    return readFileSync(p, 'utf8');
+  },
+  async writeFile() {
+    throw new Error('doctor does not write skill files');
+  },
+  async mkdir() {
+    throw new Error('doctor does not write skill files');
+  },
+};
+
+async function checkSkill(cwd: string, deps: DoctorDeps): Promise<DoctorCheck> {
   const installed = isVerifySkillInstalled(cwd, {
     existsSync: deps.existsSync,
     readFileSync: deps.readFileSync,
   });
-  return {
-    name: 'Verify skill',
-    status: installed ? 'ok' : 'warn',
-    detail: installed
-      ? 'installed in this project'
-      : 'not installed here; run `testsprite setup` so your agent verifies its changes',
-  };
+  if (!installed) {
+    return {
+      name: 'Verify skill',
+      status: 'warn',
+      detail: 'not installed here; run `testsprite setup` so your agent verifies its changes',
+    };
+  }
+  // A skill an earlier CLI wrote names the commands of that release; the
+  // same check `agent status` makes. Best-effort: a read that fails says
+  // nothing more than "installed".
+  const stale = await skillStates(cwd, readOnlySkillFs)
+    .then(rows => rows.filter(row => row.skill === 'testsprite-verify' && row.state === 'stale'))
+    .catch(() => []);
+  if (stale.length > 0) {
+    return {
+      name: 'Verify skill',
+      status: 'warn',
+      detail:
+        'installed, but written by an earlier CLI and naming its commands; re-install it with ' +
+        stale.map(row => `\`testsprite agent install ${row.target} --force\``).join(', '),
+    };
+  }
+  return { name: 'Verify skill', status: 'ok', detail: 'installed in this project' };
 }
 
 /**
@@ -360,7 +389,6 @@ async function checkConnectivity(
   ctx: { hasKey: boolean; endpointOk: boolean; config: Config },
 ): Promise<{
   check: DoctorCheck;
-  v3Enabled?: boolean;
   organizations?: CliOrgSummary[];
   org?: CliOrgBinding;
 }> {
@@ -384,7 +412,6 @@ async function checkConnectivity(
     const who = me.userId ? ` (userId ${me.userId})` : '';
     return {
       check: { name, status: 'ok', detail: `reached GET /me, API key accepted${who}` },
-      v3Enabled: me.v3Enabled,
       organizations: me.organizations,
       org: me.org,
     };
@@ -529,7 +556,10 @@ function renderDoctor(report: DoctorReport): string {
   const nameWidth = Math.max(...report.checks.map(check => check.name.length));
   const lines: string[] = ['TestSprite doctor', ''];
   for (const check of report.checks) {
-    lines.push(`  ${STATUS_LABEL[check.status]} ${check.name.padEnd(nameWidth)}  ${check.detail}`);
+    // A detail can carry a server value (an org name, an error): one line, terminal-safe.
+    lines.push(
+      `  ${STATUS_LABEL[check.status]} ${check.name.padEnd(nameWidth)}  ${terminalSafeLine(check.detail)}`,
+    );
   }
   lines.push('');
   lines.push(
@@ -544,7 +574,7 @@ export function createDoctorCommand(deps: DoctorDeps = {}): Command {
   const cmd = new Command('doctor')
     .summary('Diagnose CLI setup: credentials, connectivity, skill')
     .description(
-      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, API connectivity, workspace routing, tunnel permission (run:tunnel) and the verify skill in this directory. Exit 1 if any check fails; warnings do not.',
+      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, API connectivity, organizations and workspace scope, tunnel permission (run:tunnel) and the verify skill in this directory. Exit 1 if any check fails; warnings do not.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .addHelpText(
@@ -552,7 +582,7 @@ export function createDoctorCommand(deps: DoctorDeps = {}): Command {
       '\nExamples:\n' +
         '  testsprite doctor                 # run all checks (exit 1 if any fails)\n' +
         '  testsprite doctor --output json   # machine-readable report\n' +
-        '  testsprite doctor && testsprite test run <id>   # gate a command on a healthy setup',
+        '  testsprite doctor && testsprite run <id>   # gate a command on a healthy setup',
     )
     .action(async (_cmdOpts, command: Command) => {
       await runDoctor(resolveCommonOptions(command, deps.env), deps);

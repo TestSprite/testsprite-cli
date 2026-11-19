@@ -16,6 +16,7 @@
  */
 import { ApiError, insufficientCreditsNextAction } from './errors.js';
 import { classifyBillingRefusal, isPausedReason } from './billing-refusal.js';
+import { runLabel } from './run-render.js';
 
 export type ConflictReason =
   | 'in_flight'
@@ -28,7 +29,7 @@ export type ConflictReason =
   | 'billing_hold'
   /**
    * A backend consumer needs a variable no test case in the project captures.
-   * Like `producer_in_flight`, its `currentRunId` is the result the server
+   * Like `producer_in_flight`, its `currentResultId` is the result the server
    * seeded BLOCKED for this request, which becomes the test case's latest
    * status: never dispatched, never charged.
    */
@@ -42,6 +43,12 @@ export type ConflictReason =
  * `producer_in_flight` / `error` (the backend's nextAction). */
 export interface RunConflict {
   testId: string;
+  /** The in-flight result (wire name). Printed as `currentResultId`. */
+  currentResultId?: string;
+  /**
+   * The launch the in-flight result belongs to (wire name). Absent on an older
+   * backend. Printed as `currentResultId`.
+   */
   currentRunId?: string;
   reason?: ConflictReason;
   message?: string;
@@ -50,7 +57,7 @@ export interface RunConflict {
 /**
  * Short human label for a conflict's cause — the reason a case did NOT dispatch.
  * Absent reason renders as the legacy "already in flight" so an old backend's
- * bare `{testId, currentRunId?}` conflicts read exactly as they did before.
+ * bare `{testId, currentResultId?}` conflicts read exactly as they did before.
  */
 export function describeConflict(c: RunConflict): string {
   switch (c.reason) {
@@ -73,7 +80,9 @@ export function describeConflict(c: RunConflict): string {
       return c.message || 'dispatch failed';
     case 'in_flight':
     default:
-      return c.currentRunId ? `already in flight (run ${c.currentRunId})` : 'already in flight';
+      return c.currentResultId
+        ? `already in flight (${runLabel({ resultId: c.currentResultId, runId: c.currentRunId }, 'lower')})`
+        : 'already in flight';
   }
 }
 
@@ -114,7 +123,7 @@ function countByReason(conflicts: readonly RunConflict[]): Map<string, number> {
 
 /**
  * A backend consumer blocked before dispatch on a missing or busy producer.
- * The CLI reports it as a refusal (exit 6), as a single `test run` does,
+ * The CLI reports it as a refusal (exit 6), as a single `run` does,
  * rather than polling the result the server seeded for it.
  */
 export function isProducerBlock(c: RunConflict): boolean {

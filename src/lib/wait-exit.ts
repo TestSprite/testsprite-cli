@@ -1,5 +1,12 @@
 import { ApiError, CLIError, isAuthCode, isErrorCode } from './errors.js';
 import { classifyBillingRefusal, isPausedReason } from './billing-refusal.js';
+import {
+  cancelCommand,
+  checkLaterHint,
+  launchIds,
+  resultCount,
+  waitCommand,
+} from './run-render.js';
 
 /**
  * One member of a `--wait` fan-out poll (a single dispatched run's outcome).
@@ -10,7 +17,18 @@ import { classifyBillingRefusal, isPausedReason } from './billing-refusal.js';
  */
 export interface WaitMemberResult {
   testId?: string;
+  /** The result id (wire name). Printed as `resultId`. */
+  resultId?: string;
+  /** The launch the result belongs to (wire name); absent on an older backend. Printed as `runId`. */
   runId?: string;
+  /** True for a run this invocation joined instead of starting; see `RunRef.joined`. */
+  joined?: boolean;
+  /**
+   * What happened when the CLI tried to stop this run (a tunnel run it stopped
+   * waiting for). `'cancelled'` means the result is cancelled: result lists
+   * leave it out, so a later lookup has to name the result itself.
+   */
+  cancel?: string;
   status: string;
   // `exitCode` is optional to accept the shared JUnit result shape; an error
   // with no exitCode is treated as the generic failure (1).
@@ -51,7 +69,8 @@ const memberEnvelopeMeta = new WeakMap<
 export function waitMemberError(
   err: ApiError,
 ): NonNullable<WaitMemberResult['error']> & { exitCode: number } {
-  const memberError = { code: err.code, message: err.message, exitCode: err.exitCode };
+  const { message } = err;
+  const memberError = { code: err.code, message, exitCode: err.exitCode };
   if (err.code === 'FEATURE_GATED' || classifyBillingRefusal(err)) {
     memberEnvelopeMeta.set(memberError, {
       nextAction: err.nextAction,
@@ -105,7 +124,7 @@ function memberMeta(error: NonNullable<WaitMemberResult['error']>): {
  * operational error), so an out-of-contract exit (0, 99, a leaked signal code)
  * can neither preempt a real verdict nor produce a printed-failure-green-exit.
  */
-const WAIT_EXIT_PRIORITY = [3, 14, 12, 13, 4, 5, 6, 11, 10, 7, 1] as const;
+export const WAIT_EXIT_PRIORITY = [3, 14, 12, 13, 4, 5, 6, 11, 10, 7, 1] as const;
 
 /**
  * A "typed operational" code is one that sits in the precedence table above the
@@ -128,9 +147,34 @@ function priorityOf(exitCode: number): number {
 }
 
 /**
+ * How to get back to results a wait let go of while they may still be
+ * running: `run wait` / `run cancel` take the launch, so each launch is
+ * named once. A result the CLI cancelled (an owned tunnel's, when the wait
+ * gave up) cannot be resumed: it is looked up itself. With no launch id from
+ * the backend neither command can be given; what can still be looked up is
+ * each test's own results.
+ */
+export function unfinishedHint(rows: readonly WaitMemberResult[]): string {
+  const cancelled = rows.filter(r => r.cancel === 'cancelled');
+  const live = rows.filter(r => r.cancel !== 'cancelled');
+  const resume = waitCommand(live);
+  const cancel = cancelCommand(live);
+  const resumable = resume !== undefined && cancel !== undefined;
+  const later = checkLaterHint(
+    [...cancelled, ...(resumable ? [] : live)].map(r => ({
+      testId: r.testId,
+      resultId: r.resultId,
+      byResult: r.cancel === 'cancelled',
+    })),
+  );
+  return [...(resumable ? [`Resume: ${resume}`, `Cancel: ${cancel}`] : []), later]
+    .filter(line => line.length > 0)
+    .join('\n');
+}
+
+/**
  * Resolve the process-level failure for a completed `--wait` fan-out, or `null`
- * when every member passed. Shared by `test run --all` / `test rerun` and
- * `testlist run` so their exit-code semantics can't drift.
+ * when every member passed. Shared by `run --project` and `run --testlist` so their exit-code semantics can't drift.
  *
  * Precedence (see {@link WAIT_EXIT_PRIORITY}): auth / client-too-old → typed
  * operational ApiError → timeout (7) → generic test-failure (1).
@@ -144,14 +188,7 @@ export function resolveWaitFailure(
     (r): r is WaitMemberResult & { error: NonNullable<WaitMemberResult['error']> } =>
       r.status === 'error' && r.error !== undefined,
   );
-  // A genuine test failure: terminal-not-passed, and not one of the synthesized
-  // timeout/typed-error members above.
-  const failed = results.filter(
-    r => r.status !== 'passed' && r.status !== 'timeout' && !(r.status === 'error' && r.error),
-  );
-  // How many runs did NOT pass — used for the auth failure count so the message
-  // agrees with the "N failed/blocked" summary printed just above it.
-  const notPassed = results.filter(r => r.status !== 'passed').length;
+  const nonPassed = results.filter(r => r.status !== 'passed');
 
   // 1) Auth wins over everything — the credential is bad, not the test.
   //    Classified via the single `isAuthCode` source (derived from `exitCodeFor`)
@@ -159,7 +196,7 @@ export function resolveWaitFailure(
   const authErr = errored.find(r => isAuthCode(r.error.code));
   if (authErr) {
     return new CLIError(
-      `${notPassed} run${notPassed !== 1 ? 's' : ''} failed — auth error (${authErr.error.code}): ${authErr.error.message}`,
+      `${resultCount(nonPassed.length)} did not pass — auth error (${authErr.error.code}): ${authErr.error.message}`,
       3,
       // Carry the member's real catalog code (AUTH_REQUIRED / AUTH_INVALID /
       // AUTH_FORBIDDEN — `isAuthCode` above guarantees one of them) so the
@@ -198,10 +235,10 @@ export function resolveWaitFailure(
   if (operational) {
     const meta = memberMeta(operational.error);
     if (meta.details && isErrorCode(operational.error.code)) {
-      // Merge the server's own details with the local runId/testId (never the
-      // reverse) so automation reading `error.details.runId`/`testId` keeps
-      // working for a billing refusal exactly as it does for any other typed
-      // error, while `reason` (billing_hold / rollout / …) survives untouched.
+      // Merge the server's own details with the local ids (never the reverse)
+      // so automation reading `error.details.resultId`/`testId` keeps working
+      // for a billing refusal exactly as it does for any other typed error,
+      // while `reason` (billing_hold / rollout / …) survives untouched.
       return new ApiError(
         {
           code: operational.error.code,
@@ -210,7 +247,8 @@ export function resolveWaitFailure(
           requestId: meta.requestId ?? 'local',
           details: {
             ...meta.details,
-            runId: operational.runId ?? null,
+            ...(operational.runId ? { runId: operational.runId } : {}),
+            resultId: operational.resultId ?? null,
             testId: operational.testId ?? null,
           },
         },
@@ -220,13 +258,30 @@ export function resolveWaitFailure(
         meta.serverNextAction,
       );
     }
+    // An outage that outlasted --timeout (UNAVAILABLE): the results not seen
+    // to finish keep executing, and billing, so the hint re-attaches to their
+    // runs. Without it the exit-10 advice is to retry, which starts and bills
+    // a second batch beside the first.
+    const unreachable = operational.error.code === 'UNAVAILABLE';
     return ApiError.fromEnvelope({
       error: {
         code: operational.error.code,
         message: operational.error.message,
-        nextAction: '',
+        nextAction: unreachable
+          ? unfinishedHint(
+              results.filter(
+                r =>
+                  r.status === 'timeout' ||
+                  (r.status === 'error' && r.error?.code === 'UNAVAILABLE'),
+              ),
+            )
+          : '',
         requestId: 'local',
-        details: { runId: operational.runId ?? null, testId: operational.testId ?? null },
+        details: {
+          ...(operational.runId ? { runId: operational.runId } : {}),
+          resultId: operational.resultId ?? null,
+          testId: operational.testId ?? null,
+        },
       },
     });
   }
@@ -234,27 +289,46 @@ export function resolveWaitFailure(
   // 3) Timeout — outranks a generic failure so the operator gets resume/cancel
   //    guidance for the runs that didn't finish.
   if (timedOut.length > 0) {
-    const runIds = timedOut.map(r => r.runId).filter((id): id is string => Boolean(id));
+    const resultIds = timedOut.map(r => r.resultId).filter((id): id is string => Boolean(id));
+    const live = timedOut.filter(r => r.cancel !== 'cancelled');
+    const launches = launchIds(live);
+    const n = timedOut.length;
     return ApiError.fromEnvelope({
       error: {
         code: 'UNSUPPORTED',
-        message: `${timedOut.length} run${timedOut.length !== 1 ? 's' : ''} timed out.`,
-        nextAction: [
-          ...runIds.map(rid => `Resume: testsprite test wait ${rid}`),
-          ...runIds.map(rid => `Cancel: testsprite test cancel ${rid}`),
-        ].join('\n'),
+        message:
+          live.length === 0
+            ? `${resultCount(n)} timed out and ${n === 1 ? 'was' : 'were'} cancelled.`
+            : `${resultCount(n)} timed out.`,
+        nextAction: unfinishedHint(timedOut),
         requestId: 'local',
-        details: { timedOutRunIds: runIds, timeoutSeconds: opts.timeoutSeconds },
+        details: {
+          // The runs to resume, under the keys `run wait`'s own timeout uses.
+          runId: launches.length === 1 ? launches[0]! : null,
+          runIds: launches,
+          timedOutResultIds: resultIds,
+          timeoutSeconds: opts.timeoutSeconds,
+        },
       },
     });
   }
 
-  // 4) Generic test failures — genuine test-fails, INTERNAL (1), and any
-  //    unknown / out-of-contract error code folded here.
-  const genericCount =
-    failed.length + errored.filter(r => !isOperationalCode(r.error.exitCode ?? 1)).length;
-  if (genericCount > 0) {
-    return new CLIError(`${genericCount} run${genericCount !== 1 ? 's' : ''} failed.`, 1);
+  // The remaining rows are result verdicts or generic errors. Multiple
+  // results can belong to the same run.
+  if (nonPassed.length > 0) {
+    const failed = nonPassed.filter(row => row.status === 'failed').length;
+    const subject = resultCount(nonPassed.length);
+    if (failed === nonPassed.length) return new CLIError(`${subject} failed.`, 1);
+    const blocked = nonPassed.filter(row => row.status === 'blocked').length;
+    const cancelled = nonPassed.filter(row => row.status === 'cancelled').length;
+    const other = nonPassed.length - failed - blocked - cancelled;
+    const detail = [
+      ...(failed ? [`${failed} failed`] : []),
+      ...(blocked ? [`${blocked} blocked`] : []),
+      ...(cancelled ? [`${cancelled} cancelled`] : []),
+      ...(other ? [`${other} unresolved`] : []),
+    ].join(', ');
+    return new CLIError(`${subject} did not pass (${detail}).`, 1);
   }
 
   return null;

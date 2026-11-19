@@ -17,17 +17,16 @@ If missing, advise CLI install or `testsprite setup`. Find the project via
 For a local app without a project:
 
 ```bash
-testsprite project create --type frontend --name "<repo name>" --local <port> --local-host <host>
-testsprite test create --plan-from plan.json --project <projectId>
-testsprite test run <id> <id> --local <port> --local-host <host> --output json
+testsprite project create --type frontend --name "<repo name>"
+testsprite project env create <projectId> --name local --local <port>
+testsprite plan "<what you built>" --diff --project <projectId>
+testsprite apply
+testsprite run --project <projectId> --wait --local <port> --local-host <host> --output json
 ```
 
-Local projects need V3 (V2-only: exit 7, `local-origin-requires-v3`). Exploration
-and `test plan generate` exit 6 before charge. Create plans with `test create
---plan-from` without `--run`; then run several ids with `--local`. Portal runs
-are blocked free until `project update <id> --url https://…` sets a public URL.
-For deployed projects use `project create --url`; empty suites can use `test plan
-generate --project <id>` then `test plan accept`.
+Portal runs of a local environment are blocked free until a public environment is
+the default: `project env create <id> --name staging --url https://… --set-default`.
+For a deployed app, `project env create … --url` is the only environment needed.
 
 ## 2. Run against the change
 
@@ -35,60 +34,59 @@ The CLI does not host apps. Create a deployed environment once; select it with
 `--env <name>` or omit for Default. Unknown names list valid names. Use `--local
 <port>` for local FE runs.
 
+You don't write or edit tests. New tests (frontend or backend): ask the
+project's agent, show the user its plan, apply it, run the saved ids. A test
+that is itself wrong: `testsprite plan "the <name> test should …"`, then apply.
+Exit 13: the agent isn't enabled; say so and stop.
+
 ```bash
-# Deployed frontend: create + run, or run an existing test
+testsprite plan "<what you built + the user's rules>" --diff --project <id>
+testsprite apply   # or --exclude <ref>; or reject "<what to change>"
 testsprite project env create <id> --name staging --url https://staging.example.com
-testsprite test create --plan-from plan.json --run --wait \
-  --env staging --timeout 600 --output json
-testsprite test run <test-id> --env staging \
-  --wait --timeout 600 --output json
-# Backend Python assertion
-testsprite test create --type backend --name "Login rejects empty password" \
-  --project <id> --code-file /tmp/test.py --run --wait --timeout 600
-# Several tests, one batch (V3 FE: 0.5 credit each)
-testsprite test run <test-id> <test-id> --env staging --wait --output json
-# Dependency batch; --filter <substr>, --status failed,blocked
-testsprite test run --all --project <id> --env staging --wait --output json
+# Project suite
+testsprite run --project <id> --env staging --wait --output json
+# One test
+testsprite run <test-id> --env staging --wait --timeout 600 --output json
+# Several tests, one batch (FE: 0.5 credit each)
+testsprite run <test-id> <test-id> --env staging --wait --output json
+# Saved list or positional subset
+testsprite run --testlist <listId> --wait
+testsprite run <test-id> --testlist <listId> --wait
 ```
 
 - Supported backends grant existing keys `run:tunnel`; a narrowed key without it
   exits 3. Free-plan local runs work. BE cannot use `--local`.
-- `--local` implies `--wait` (1200 s per run; ordinary: 600). `--local-host`:
-  `localhost`, `127.0.0.1` (default), `::1`. A dead port exits 5 before charge;
+- `--local` implies `--wait` (shared 1200 s deadline; public: 600). `--local-host`:
+  `localhost`, `127.0.0.1`, `::1`. A dead port exits 5 before charge;
   `--skip-preflight` skips the probe. Environment `--url` rejects private (non-loopback) hosts.
-  `--local` selects/creates `local-<port>`; a named `--env` must be local.
+  `--local` selects/creates `local-<port>`; `--env` keeps its sign-in settings.
   `--target-url` cannot combine with `--local`.
-- Run local ids together (`test run <id> <id> … --local <port>`); `--all --project
-<id> --local <port>` skips BE tests. One tunnel, 5 concurrent runs by default
-  (`--max-concurrency` 1–10). Five live bindings per user; `tunnel_binding_limit`
+- Run local ids together in one `run`; `run --project <id> --local <port>` skips BE tests. One run per project, one tunnel, 5 tests at once per execution by default
+  (`--max-concurrency` 1–15, a server dispatch cap only). Each distinct run is waited on independently. Five live bindings per user; `tunnel_binding_limit`
   exits 11 without retry. Use `tunnel list` then `tunnel stop <id>` or `--all --confirm`.
-- Keep early **stderr** `Run <runId>` receipts and any `Dashboard: <url>`.
-  Stdout is the JSON channel.
+- Keep each run's `Run <id>` line and its stdout `Dashboard:` link (a no-wait `--testlist` launch has none until `run wait`). All waits return `runs[].runId`,
+  `results[].resultId` and counts in `summary`. Only an incomplete timeout or
+  interruption adds `partial: true`.
 - An **owned** local timeout, Ctrl-C, or poll failure requests cancellation and
-  closes the tunnel. Before a terminal V3 FE verdict, the backend attempts a refund;
+  closes the tunnel. Before a terminal FE verdict, the backend attempts a refund;
   check `refund.status`: cancellation does not guarantee a refund.
   `--no-cancel-on-interrupt` detaches, but the owned tunnel still closes.
-- After an owned timeout, start a **new** `test run <test-id> --local <port>
---timeout 1800` (retain `--local-host`). `test wait` cannot reopen the tunnel;
-  ordinary/adopted waits can resume with `test wait <run-id>` if reachable.
+- After an owned timeout, start a **new** `run <test-id> --local <port>
+--timeout 1800` (retain `--local-host`). `run wait` cannot reopen the tunnel;
+  ordinary/adopted waits can resume with `run wait <run-id>` if reachable.
 - Keep `tunnel start` alive; borrow with `--local <port> --tunnel-client <uuid>`.
   Adopted runs normally detach without cancellation or closing the owner's tunnel.
   If the owner has disappeared during a run, cancellation is requested by default;
   `--no-cancel-on-interrupt` skips it. A second connection with the same credential
   takes over; the first exits **10**.
-- Loopback environments need `--local <port>`. Bare CLI runs selecting one by
-  name or Default exit 6 (`tunnel-required`) before dispatch or charge. The Portal
-  shows no Run; backend requests are refused free. Schedules and test lists get
-  free BLOCKED results. A public `--env` or Default works regardless of earlier
-  tunnel runs. V3 local runs use the agent path, never saved-code replay, and
-  preserve saved code.
+- Saved loopback frontend environments open a tunnel automatically, including
+  list mappings. Lists use pinned environments; no target/env overrides.
+- Choose project, named IDs, or list; never combine project with IDs/list.
+  No IDs/list: project flag then `TESTSPRITE_PROJECT_ID`. Named/list ignore it.
+  `--filter` narrows project selection. Resume with `run wait <run-id...>
+--timeout 600`; cancel with `run cancel <run-id...>`. Child flags follow the child.
 - `--wait` handles polling/backoff; don't wrap it in a retry loop.
-- Backend Python runs top-to-bottom, not via pytest: call `test_*` functions.
-  The sandbox has stdlib, `requests`, `pytest`, `numpy`, `scipy`; use HTTP,
-  not project imports or uninstalled packages.
-- Backend `--produces`/`--needs` are repeatable; `--category teardown` marks cleanup.
-  Set dependencies with `test create` or edit with `test update`; do not delete
-  and recreate. Use `test run --all` for producer → consumer → teardown ordering
+- Use `run --project <project-id>` for backend producer → consumer → teardown ordering
   and variable passing. A BE run includes that closure and its side effects;
   `--skip-dependencies` selects only the named test. Triage failed producers before
   blaming consumers starved of their token/fixture.
@@ -96,13 +94,14 @@ testsprite test run --all --project <id> --env staging --wait --output json
 ## 3. Inspect and report
 
 ```bash
-testsprite test artifact get <run-id> --out ./.testsprite/runs/<run-id>/
-testsprite test steps <test-id> --run-id <run-id> --output json
+testsprite result list --run <run-id> --status failed,blocked   # what did not pass
+testsprite result get <result-id> --output json   # error, cause, fix, every step; BE: trace, apiOutput
+testsprite result get <result-id> --out .testsprite/results/<result-id>   # evidence
 ```
 
-Read failing steps, screenshots and root cause. Bare `test steps <test-id>`
-shows the latest run; pin the receipt's id. For empty latest steps, choose an
-earlier run from `test result <test-id> --history`. Report verdict and dashboard.
+Read the result of the run you verify, not an older one (`result list --test
+<test-id>` lists them). `--out` writes `result.json`, the video and `steps/`, and
+replaces those in an existing dir: one dir per result. Report verdict and links.
 
 Exits: 0 passed; 1 failed/blocked/cancelled; 3 auth/scope; 4 not found;
 5 validation; 6 conflict/precondition; 7 timeout/unsupported; 10 unavailable;
@@ -113,8 +112,7 @@ Exits: 0 passed; 1 failed/blocked/cancelled; 3 auth/scope; 4 not found;
 `--dry-run` works without credentials:
 
 ```bash
-testsprite test run <test-id> --dry-run --output json
-testsprite test create --plan-from plan.json --dry-run --output json
+testsprite run <test-id> --dry-run --output json
 ```
 
 Setup: `npm install -g @testsprite/testsprite-cli`; `testsprite setup`.
