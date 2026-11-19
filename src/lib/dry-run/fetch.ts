@@ -61,6 +61,27 @@ export function createDryRunFetch(): FetchImpl {
   };
 }
 
+/**
+ * Wrap a dry-run fetch implementation so `onFirstResponse` fires exactly
+ * once — after the first request actually returns a response. The client
+ * factory applies this to whichever fetch is in use (the default canned
+ * fetch or an injected test fetch), so the dry-run banner is announced
+ * lazily: never at client construction, and never when local validation
+ * fails before any dry-run response is produced. If the wrapped fetch
+ * rejects, no banner fires.
+ */
+export function withDryRunBannerOnce(fetch: FetchImpl, onFirstResponse: () => void): FetchImpl {
+  let fired = false;
+  return async (input, init) => {
+    const res = await fetch(input, init);
+    if (!fired) {
+      fired = true;
+      onFirstResponse();
+    }
+    return res;
+  };
+}
+
 function resolveUrl(input: Parameters<FetchImpl>[0]): string {
   if (typeof input === 'string') return input;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
