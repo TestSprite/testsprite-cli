@@ -200,14 +200,14 @@ describe('buildJUnitReport', () => {
       results: [
         makeResult({
           testId: 'test_a',
-          runId: 'run_a',
+          resultId: 'run_a',
           status: 'failed',
           name: 'Checkout',
           durationSeconds: 2.5,
         }),
         makeResult({
           testId: 'test_b',
-          runId: 'run_b',
+          resultId: 'run_b',
           status: 'failed',
           name: 'Checkout',
           durationSeconds: 2.5,
@@ -243,11 +243,11 @@ describe('buildJUnitReport', () => {
       suiteName: 'Batch',
       classname: 'proj_1',
       results: [
-        makeResult({ testId: 'case_a', runId: 'run_a', status: 'failed', name: 'Checkout' }),
-        makeResult({ testId: 'case_b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'case_a', resultId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'case_b', resultId: 'run_b', status: 'failed', name: 'Checkout' }),
         makeResult({
           testId: 'case_c',
-          runId: 'run_c',
+          resultId: 'run_c',
           status: 'failed',
           name: 'Checkout [case_a]',
         }),
@@ -256,9 +256,9 @@ describe('buildJUnitReport', () => {
     const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
     expect(new Set(names).size).toBe(3);
     // Each colliding row keeps its own run's diagnostics.
-    expect(xml).toContain('runId: run_a');
-    expect(xml).toContain('runId: run_b');
-    expect(xml).toContain('runId: run_c');
+    expect(xml).toContain('resultId: run_a');
+    expect(xml).toContain('resultId: run_b');
+    expect(xml).toContain('resultId: run_c');
   });
 
   it('#515: names that XML attribute normalization folds together still get disambiguated', () => {
@@ -270,8 +270,13 @@ describe('buildJUnitReport', () => {
       suiteName: 'Batch',
       classname: 'proj_1',
       results: [
-        makeResult({ testId: 'test_a', runId: 'run_a', status: 'failed', name: 'Checkout fix' }),
-        makeResult({ testId: 'test_b', runId: 'run_b', status: 'failed', name: 'Checkout\tfix' }),
+        makeResult({ testId: 'test_a', resultId: 'run_a', status: 'failed', name: 'Checkout fix' }),
+        makeResult({
+          testId: 'test_b',
+          resultId: 'run_b',
+          status: 'failed',
+          name: 'Checkout\tfix',
+        }),
       ],
     });
     expect(xml).toContain('name="Checkout fix [test_a]"');
@@ -289,8 +294,8 @@ describe('buildJUnitReport', () => {
       suiteName: 'Batch',
       classname: 'proj_1',
       results: [
-        makeResult({ testId: 'a\tb', runId: 'run_a', status: 'failed', name: 'Checkout' }),
-        makeResult({ testId: 'a b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'a\tb', resultId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'a b', resultId: 'run_b', status: 'failed', name: 'Checkout' }),
       ],
     });
     const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]!);
@@ -304,7 +309,7 @@ describe('buildJUnitReport', () => {
   });
 
   it('#515: a group whose rows share one testId is left unsuffixed instead of spinning to the cap', () => {
-    // testlist run can pass the same id twice, billing each row. Duplicate
+    // run --testlist can pass the same id twice, billing each row. Duplicate
     // rows are exact duplicates no suffix can separate, so the resolver must
     // leave them alone rather than re-suffixing until the round cap.
     const xml = buildJUnitReport({
@@ -313,21 +318,21 @@ describe('buildJUnitReport', () => {
       results: [
         makeResult({
           testId: 'dup',
-          runId: 'run_a',
+          resultId: 'run_a',
           status: 'failed',
           name: 'Checkout',
           durationSeconds: 1,
         }),
         makeResult({
           testId: 'dup',
-          runId: 'run_b',
+          resultId: 'run_b',
           status: 'failed',
           name: 'Checkout',
           durationSeconds: 2,
         }),
         makeResult({
           testId: 'dup',
-          runId: 'run_c',
+          resultId: 'run_c',
           status: 'failed',
           name: 'Checkout',
           durationSeconds: 3,
@@ -347,9 +352,9 @@ describe('buildJUnitReport', () => {
       suiteName: 'Batch',
       classname: 'proj_1',
       results: [
-        makeResult({ testId: 'dup', runId: 'run_a', status: 'failed', name: 'Checkout' }),
-        makeResult({ testId: 'dup', runId: 'run_b', status: 'failed', name: 'Checkout' }),
-        makeResult({ testId: 'test_b', runId: 'run_c', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'dup', resultId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'dup', resultId: 'run_b', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'test_b', resultId: 'run_c', status: 'failed', name: 'Checkout' }),
       ],
     });
     expect((xml.match(/<failure /g) ?? []).length).toBe(3);
@@ -391,7 +396,7 @@ describe('buildJUnitReport', () => {
       results: [
         makeResult({
           testId: 'test_a',
-          runId: 'run_a',
+          resultId: 'run_a',
           status: 'passed',
           name: 'Login flow works',
           durationSeconds: 12.5,
@@ -400,7 +405,7 @@ describe('buildJUnitReport', () => {
     });
     // A CI test tab shows "Login flow works", not the UUID — the id stays as an attr.
     expect(xml).toContain(
-      '<testcase classname="proj_1" name="Login flow works" testId="test_a" runId="run_a" time="12.5">',
+      '<testcase classname="proj_1" name="Login flow works" testId="test_a" resultId="run_a" time="12.5">',
     );
     // testsuite time is the sum of testcase durations (was always 0 before).
     expect(xml).toContain('skipped="0" time="12.5">');
@@ -423,12 +428,12 @@ describe('buildJUnitReport', () => {
         makeResult({
           testId: 'test_fail',
           status: 'failed',
-          runId: 'run_1',
+          resultId: 'run_1',
         }),
       ],
     });
     expect(xml).toContain('<failure message="failed" type="failed">');
-    expect(xml).toContain('runId: run_1');
+    expect(xml).toContain('resultId: run_1');
     expect(xml).toContain('failures="1"');
   });
 
@@ -647,7 +652,7 @@ describe('skippedJUnitResultsFromSummary', () => {
     failed: 0,
     skipped: 2,
     timedOut: 0,
-    runs: [
+    results: [
       { testId: 'ran', status: 'passed' },
       { testId: 'deferred', status: 'deferred', error: 'deferred: run in flight' },
       // A dispatched run the server later reports under a non-dispatched
@@ -662,6 +667,48 @@ describe('skippedJUnitResultsFromSummary', () => {
       { testId: 'ran', status: 'skipped', skipReason: 'skipped' },
     ]);
   });
+
+  it("a test another run holds keeps that run's result and launch, and the suite claims none", () => {
+    const skipped = skippedJUnitResultsFromSummary({
+      total: 2,
+      passed: 1,
+      failed: 0,
+      skipped: 1,
+      timedOut: 0,
+      results: [
+        { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+        { testId: 'busy', resultId: 'r9', runId: 'e9', status: 'conflict', error: 'in flight' },
+      ],
+    });
+    expect(skipped).toEqual([
+      {
+        testId: 'busy',
+        resultId: 'r9',
+        runId: 'e9',
+        status: 'skipped',
+        skipReason: 'in flight',
+      },
+    ]);
+    const xml = buildJUnitReport({
+      suiteName: 'suite',
+      classname: 'p',
+      results: [{ testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' }, ...skipped],
+    });
+    expect(xml).toContain('<testsuite name="suite" tests="2"');
+    expect(xml).toContain('testId="busy" resultId="r9"');
+  });
+
+  it('a row with no reason of its own gives its status as the reason', () =>
+    expect(
+      skippedJUnitResultsFromSummary({
+        total: 1,
+        passed: 0,
+        failed: 0,
+        skipped: 1,
+        timedOut: 0,
+        results: [{ testId: 'C', status: 'conflict' }],
+      }),
+    ).toEqual([{ testId: 'C', status: 'skipped', skipReason: 'conflict' }]));
 
   it('leaves out members that are already in the polled results', () => {
     expect(skippedJUnitResultsFromSummary(summary, [{ testId: 'ran' }])).toEqual([
@@ -788,4 +835,114 @@ describe('assertArtifactPath', () => {
       );
     },
   );
+});
+
+// A row keeps the wire names inside the CLI (`runId` is the result,
+// `executionId` the launch); the report names them `resultId` and `runId`.
+describe('the launch and the result in the JUnit report', () => {
+  const report = (results: JUnitTestResult[]): string =>
+    buildJUnitReport({ suiteName: 'suite', classname: 'p', results });
+
+  it('junit puts resultId on the testcase and runId on the testsuite', () => {
+    const xml = report([
+      { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+      { testId: 'B', resultId: 'r2', runId: 'e1', status: 'passed' },
+    ]);
+    expect(xml).toContain('<testsuite name="suite" runId="e1" tests="2"');
+    expect(xml).toContain('<testcase classname="p" name="A" testId="A" resultId="r1" time="0">');
+    expect(xml).toContain('<testcase classname="p" name="B" testId="B" resultId="r2" time="0">');
+    expect(xml).not.toMatch(/<testcase[^>]* runId=/);
+  });
+
+  it('a failure and an error name the result in their text', () => {
+    const xml = report([
+      { testId: 'A', resultId: 'r1', runId: 'e1', status: 'failed' },
+      {
+        testId: 'B',
+        resultId: 'r2',
+        runId: 'e1',
+        status: 'error',
+        error: { code: 'INTERNAL', message: 'boom' },
+      },
+    ]);
+    expect(xml).toContain('status: failed\nresultId: r1</failure>');
+    expect(xml).toContain('message: boom\nresultId: r2</error>');
+    expect(xml).not.toContain('runId: ');
+  });
+
+  it('skipped members that never got a result do not unset the suite launch', () => {
+    const xml = report([
+      { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+      { testId: 'C', status: 'skipped', skipReason: 'not dispatched' },
+    ]);
+    expect(xml).toContain('<testsuite name="suite" runId="e1" tests="2"');
+    expect(xml).toContain('<testcase classname="p" name="C" testId="C" time="0">');
+  });
+
+  it('a skipped test that names a result of another run leaves the suite without a launch', () => {
+    // Every testcase that names a result, skipped ones too, must belong to the
+    // launch the suite names; this one names the run that already held it.
+    const xml = report([
+      { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+      { testId: 'C', resultId: 'r9', runId: 'e9', status: 'conflict', skipReason: 'in flight' },
+    ]);
+    expect(xml).toContain('<testsuite name="suite" tests="2"');
+    expect(xml).not.toContain('runId=');
+    expect(xml).toContain('testId="C" resultId="r9"');
+  });
+
+  it('a skipped test of the same run keeps the suite launch', () => {
+    const xml = report([
+      { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+      { testId: 'B', resultId: 'r2', runId: 'e1', status: 'skipped', skipReason: 'not awaited' },
+    ]);
+    expect(xml).toContain('<testsuite name="suite" runId="e1" tests="2"');
+  });
+
+  it('an all-conflict batch: every test is held by one earlier run, and the suite names no run', () => {
+    // Nothing ran in this invocation; the run holding the tests is not its own.
+    const xml = report([
+      {
+        testId: 'A',
+        resultId: 'r_prev_A',
+        runId: 'e_prev',
+        status: 'conflict',
+        skipReason: 'in flight',
+      },
+      {
+        testId: 'B',
+        resultId: 'r_prev_B',
+        runId: 'e_prev',
+        status: 'conflict',
+        skipReason: 'in flight',
+      },
+    ]);
+    expect(xml).toContain('<testsuite name="suite" tests="2"');
+    expect(xml).not.toContain('runId=');
+    expect(xml).toContain('testId="A" resultId="r_prev_A"');
+  });
+
+  it('cases from several launches: no launch on the suite', () => {
+    const xml = report([
+      { testId: 'A', resultId: 'r1', runId: 'e1', status: 'passed' },
+      { testId: 'B', resultId: 'r2', runId: 'e2', status: 'passed' },
+    ]);
+    expect(xml).toContain('<testsuite name="suite" tests="2"');
+    expect(xml).not.toContain('runId=');
+  });
+
+  it('an old server: resultId on the testcase and no runId anywhere', () => {
+    const xml = report([
+      { testId: 'A', resultId: 'r1', status: 'failed' },
+      { testId: 'B', resultId: 'r2', runId: 'e1', status: 'passed' },
+    ]);
+    expect(xml).toContain('testId="A" resultId="r1"');
+    expect(xml).toContain('resultId: r1</failure>');
+    expect(xml).not.toContain('runId');
+  });
+
+  it('escapes the launch id on the suite', () =>
+    expect(report([{ testId: 'A', resultId: 'r1', runId: 'e"<1', status: 'passed' }])).toContain(
+      'runId="e&quot;&lt;1"',
+    ));
 });

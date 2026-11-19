@@ -13,25 +13,30 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_BASE_URL,
   errorHandlers,
-  failureContextFixture,
-  failureContextNoAnalysisFixture,
   FIXTURE_PROJECT_ID,
+  FIXTURE_RESULT_ENVIRONMENTS,
+  FIXTURE_RESULT_ID_BLOCKED,
+  FIXTURE_RESULT_ID_CANCELLED,
+  FIXTURE_RESULT_ID_FAILED,
+  FIXTURE_RESULT_ID_EARLIER,
+  FIXTURE_RESULT_ID_PASSED,
+  FIXTURE_RESULT_RUN_ID,
+  FIXTURE_TEST_ID_BLOCKED,
   FIXTURE_TEST_ID_FAILED,
   FIXTURE_TEST_ID_LARGE_CODE,
   FIXTURE_TEST_ID_NO_ANALYSIS,
   FIXTURE_TEST_ID_PASSED,
   FIXTURE_TEST_ID_RUNNING,
-  latestResultFailedFixture,
-  latestResultPassedFixture,
-  latestResultRunningFixture,
   meFixture,
   mockBackend,
   projectFixtures,
-  testCodeFixture,
-  testCodeLargeFixture,
+  resultDetailFixtures,
+  resultHistoryWindowFixture,
+  resultLineFixtures,
   testFixtures,
-  testStepsFixture,
 } from './index.js';
+import { RESULT_DETAIL_SCHEMA, RESULT_LIST_SCHEMA } from '../../src/lib/response-schemas.js';
+import * as v from 'valibot';
 
 mockBackend.installLifecycle();
 
@@ -62,7 +67,7 @@ describe('mock-backend default handlers', () => {
     expect(res.status).toBe(401);
     const body = (await res.json()) as { error: { code: string; nextAction: string } };
     expect(body.error.code).toBe('AUTH_REQUIRED');
-    expect(body.error.nextAction).toContain('testsprite auth configure');
+    expect(body.error.nextAction).toContain('testsprite setup');
   });
 
   it('lists projects with pagination defaults', async () => {
@@ -131,110 +136,14 @@ describe('mock-backend default handlers', () => {
     await expect(res.json()).resolves.toEqual(testFixtures[0]);
   });
 
-  it('serves /tests/:id/code (inline body)', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_FAILED}/code`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as typeof testCodeFixture;
-    expect(body).toEqual(testCodeFixture);
-    expect(body.code.startsWith('https://')).toBe(false);
-  });
-
-  it('serves /tests/:id/code (presigned URL when source is large)', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_LARGE_CODE}/code`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as typeof testCodeLargeFixture;
-    expect(body).toEqual(testCodeLargeFixture);
-    expect(body.code.startsWith('https://')).toBe(true);
-  });
-
-  it('serves /tests/:id/steps', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_FAILED}/steps`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: typeof testStepsFixture };
-    expect(body.items).toEqual(testStepsFixture);
-  });
-
-  it('serves /tests/:id/result for the failed fixture', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_FAILED}/result`);
-    expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual(latestResultFailedFixture);
-  });
-
-  it('serves /tests/:id/result for the passed fixture', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_PASSED}/result`);
-    expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual(latestResultPassedFixture);
-  });
-
-  it('serves /tests/:id/result for an in-flight run', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_RUNNING}/result`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as typeof latestResultRunningFixture;
-    expect(body).toEqual(latestResultRunningFixture);
-    expect(body.status).toBe('running');
-    // §6.5: fields not backed by current data must be `null`, not omitted.
-    expect(body.finishedAt).toBeNull();
-    expect(body.videoUrl).toBeNull();
-    expect(body.failureAnalysisUrl).toBeNull();
-    expect(body.failedStepIndex).toBeNull();
-    expect(body.failureKind).toBeNull();
-  });
-
-  it('serves /tests/:id/failure for the failed fixture', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_FAILED}/failure`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as typeof failureContextFixture;
-    expect(body).toEqual(failureContextFixture);
-
-    // §3 atomicity: bundle snapshotId equals the embedded result.snapshotId.
-    expect(body.snapshotId).toBe(body.result.snapshotId);
-    // §3 atomicity: every step shares one runIdIfAvailable.
-    const runIds = new Set(body.steps.map(s => s.runIdIfAvailable));
-    expect(runIds.size).toBe(1);
-    expect(runIds.has(body.result.runIdIfAvailable)).toBe(true);
-    // §3 atomicity: every step shares the result's codeVersion.
-    expect(body.steps.every(s => s.codeVersion === body.result.codeVersion)).toBe(true);
-    expect(body.code.codeVersion).toBe(body.result.codeVersion);
-    // §6.2: when evidence is non-empty, at least one entry covers the failed step.
-    if (body.failure.evidence.length > 0) {
-      expect(body.failure.evidence.some(e => e.stepIndex === body.result.failedStepIndex)).toBe(
-        true,
-      );
-    }
-    // Every evidence URL is presigned (https), never an opaque token.
-    expect(body.failure.evidence.every(e => e.url.startsWith('https://'))).toBe(true);
-  });
-
-  it('serves /tests/:id/failure with null analysis when analysis is missing', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_NO_ANALYSIS}/failure`);
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as typeof failureContextNoAnalysisFixture;
-    expect(body).toEqual(failureContextNoAnalysisFixture);
-    expect(body.failure.rootCauseHypothesis).toBeNull();
-    expect(body.failure.recommendedFixTarget.kind).toBe('unknown');
-    expect(body.failure.evidence).toEqual([]);
-    // §7.4: pre-step infra failure → empty steps[] is legal.
-    expect(body.steps).toEqual([]);
-    // Atomicity still applies: bundle snapshotId equals result.snapshotId.
-    expect(body.snapshotId).toBe(body.result.snapshotId);
-  });
-
   it('makes the no-analysis test discoverable via /tests/:id', async () => {
     const res = await get(`/tests/${FIXTURE_TEST_ID_NO_ANALYSIS}`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { id: string; status: string };
+    const body = (await res.json()) as { id: string; title: string };
     expect(body.id).toBe(FIXTURE_TEST_ID_NO_ANALYSIS);
-    expect(body.status).toBe('failed');
-  });
-
-  it('returns 404 with reason "no_failing_run" when the test is currently passing', async () => {
-    const res = await get(`/tests/${FIXTURE_TEST_ID_PASSED}/failure`);
-    expect(res.status).toBe(404);
-    const body = (await res.json()) as {
-      error: { code: string; details: { reason: string } };
-    };
-    expect(body.error.code).toBe('NOT_FOUND');
-    expect(body.error.details.reason).toBe('no_failing_run');
+    expect(body.title).toBe('Smoke — health check');
+    // The case alone: its results are read from `/results?test=`.
+    expect(body).not.toHaveProperty('status');
   });
 });
 
@@ -305,15 +214,15 @@ describe('mock-backend canonical error envelopes', () => {
     expect(body.error.details.reason).toBe('required');
   });
 
-  it('CONFLICT — 409 with snapshot_in_flight reason', async () => {
+  it('CONFLICT — 409 with a reason in details', async () => {
     mockBackend.use(errorHandlers.conflict());
-    const res = await get(`/tests/${FIXTURE_TEST_ID_FAILED}/result`);
+    const res = await get(`/results/${FIXTURE_RESULT_ID_FAILED}`);
     expect(res.status).toBe(409);
     const body = (await res.json()) as {
       error: { code: string; details: { reason: string } };
     };
     expect(body.error.code).toBe('CONFLICT');
-    expect(body.error.details.reason).toBe('snapshot_in_flight');
+    expect(body.error.details.reason).toBe('synthetic_conflict');
   });
 
   it('RATE_LIMITED — 429 with Retry-After and retryAfterSec details', async () => {
@@ -331,13 +240,13 @@ describe('mock-backend canonical error envelopes', () => {
 
   it('UNSUPPORTED — 501 with feature in details', async () => {
     mockBackend.use(errorHandlers.unsupported());
-    const res = await get(`/tests/${FIXTURE_TEST_ID_FAILED}/failure`);
+    const res = await get(`/results?run=${FIXTURE_RESULT_RUN_ID}`);
     expect(res.status).toBe(501);
     const body = (await res.json()) as {
       error: { code: string; details: { feature: string } };
     };
     expect(body.error.code).toBe('UNSUPPORTED');
-    expect(body.error.details.feature).toBe('failure_bundle');
+    expect(body.error.details.feature).toBe('synthetic_feature');
   });
 
   it('INTERNAL — 500 with empty details', async () => {
@@ -366,5 +275,287 @@ describe('mock-backend canonical error envelopes', () => {
     const body = (await res.json()) as { error: { requestId: string } };
     expect(body.error.requestId).toMatch(/^req_/);
     expect(res.headers.get('x-request-id')).toBe(body.error.requestId);
+  });
+});
+
+describe('mock-backend result routes', () => {
+  const idsOf = async (res: Response): Promise<string[]> =>
+    ((await res.json()) as { results: Array<{ resultId: string }> }).results.map(r => r.resultId);
+
+  const details = new Map(Object.entries(resultDetailFixtures));
+  const detailOf = (resultId: string) => details.get(resultId);
+
+  const errorOf = async (res: Response) =>
+    (
+      (await res.json()) as {
+        error: { code: string; message: string; details: Record<string, unknown> };
+      }
+    ).error;
+
+  describe('GET /results?run=', () => {
+    it('lists the passed, failed and blocked results of the run, and not the cancelled one', async () => {
+      const res = await get(`/results?run=${FIXTURE_RESULT_RUN_ID}`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { results: Array<{ resultId: string; runId: string }> };
+      expect(body.results.map(r => r.resultId)).toEqual([
+        FIXTURE_RESULT_ID_BLOCKED,
+        FIXTURE_RESULT_ID_FAILED,
+        FIXTURE_RESULT_ID_PASSED,
+      ]);
+      expect(body.results.every(r => r.runId === FIXTURE_RESULT_RUN_ID)).toBe(true);
+      // A run's listing carries no history fields.
+      expect(Object.keys(body)).toEqual(['results']);
+      expect(v.safeParse(RESULT_LIST_SCHEMA, body).success).toBe(true);
+    });
+
+    it('returns each line exactly as the fixture holds it', async () => {
+      const res = await get(`/results?run=${FIXTURE_RESULT_RUN_ID}&status=failed`);
+      const body = (await res.json()) as { results: unknown[] };
+      expect(body.results).toEqual([
+        resultLineFixtures.find(r => r.resultId === FIXTURE_RESULT_ID_FAILED),
+      ]);
+    });
+
+    it('refuses a status it does not know as the server does: the reason as the message, no details', async () => {
+      const res = await get(`/results?run=${FIXTURE_RESULT_RUN_ID}&status=failed,finished`);
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as {
+        error: { code: string; message: string; nextAction: string; details: unknown };
+      };
+      expect(body.error).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        message: 'status must be one of passed, failed, running, blocked, cancelled',
+        nextAction: '',
+      });
+      // Strict: a nested `{}` under toMatchObject would match any details.
+      expect(body.error.details).toEqual({});
+    });
+
+    it('lists the cancelled result only when status names it', async () => {
+      const only = await get(`/results?run=${FIXTURE_RESULT_RUN_ID}&status=cancelled`);
+      expect(await idsOf(only)).toEqual([FIXTURE_RESULT_ID_CANCELLED]);
+      const every = await get(
+        `/results?run=${FIXTURE_RESULT_RUN_ID}&status=passed,failed,running,blocked,cancelled`,
+      );
+      expect(await idsOf(every)).toEqual([
+        FIXTURE_RESULT_ID_CANCELLED,
+        FIXTURE_RESULT_ID_BLOCKED,
+        FIXTURE_RESULT_ID_FAILED,
+        FIXTURE_RESULT_ID_PASSED,
+      ]);
+    });
+
+    it('reads status as a comma-separated list in any case', async () => {
+      const res = await get(`/results?run=${FIXTURE_RESULT_RUN_ID}&status=Failed,%20BLOCKED`);
+      expect(await idsOf(res)).toEqual([FIXTURE_RESULT_ID_BLOCKED, FIXTURE_RESULT_ID_FAILED]);
+    });
+
+    it.each(['environment=staging', 'limit=5'])('refuses %s on a run', async param => {
+      const res = await get(`/results?run=${FIXTURE_RESULT_RUN_ID}&${param}`);
+      expect(res.status).toBe(400);
+      const error = await errorOf(res);
+      expect(error.code).toBe('VALIDATION_ERROR');
+      expect(error.details.field).toBe(param.split('=')[0]);
+    });
+
+    it('answers NOT_FOUND for a run it does not have', async () => {
+      const res = await get('/results?run=exec_missing');
+      expect(res.status).toBe(404);
+      expect((await errorOf(res)).details).toEqual({ resource: 'run', id: 'exec_missing' });
+    });
+  });
+
+  describe('GET /results?test=', () => {
+    it("lists a test's results newest first, with the history window", async () => {
+      const res = await get(`/results?test=${FIXTURE_TEST_ID_FAILED}`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        results: Array<{ resultId: string }>;
+        hiddenRunCount: number;
+        retentionDays: number | null;
+      };
+      expect(body.results.map(r => r.resultId)).toEqual([
+        FIXTURE_RESULT_ID_FAILED,
+        FIXTURE_RESULT_ID_EARLIER,
+      ]);
+      expect(body.hiddenRunCount).toEqual(expect.any(Number));
+      expect(body).toHaveProperty('retentionDays');
+      expect(v.safeParse(RESULT_LIST_SCHEMA, body).success).toBe(true);
+    });
+
+    it('takes the caseKey of any line as the test id and answers with that test only', async () => {
+      const run = await get(
+        `/results?run=${FIXTURE_RESULT_RUN_ID}&status=passed,failed,running,blocked,cancelled`,
+      );
+      const { results } = (await run.json()) as { results: Array<{ caseKey: string }> };
+      const caseKeys = [...new Set(results.map(r => r.caseKey))];
+      expect(caseKeys.sort()).toEqual(
+        [
+          FIXTURE_TEST_ID_PASSED,
+          FIXTURE_TEST_ID_FAILED,
+          FIXTURE_TEST_ID_BLOCKED,
+          FIXTURE_TEST_ID_RUNNING,
+        ].sort(),
+      );
+      for (const caseKey of caseKeys) {
+        const res = await get(
+          `/results?test=${caseKey}&status=passed,failed,running,blocked,cancelled`,
+        );
+        expect(res.status).toBe(200);
+        const history = (await res.json()) as { results: Array<{ caseKey: string }> };
+        expect(history.results.length).toBeGreaterThan(0);
+        expect(history.results.every(r => r.caseKey === caseKey)).toBe(true);
+      }
+    });
+
+    it('narrows by environment, by status and by limit', async () => {
+      const [earlierEnv] = FIXTURE_RESULT_ENVIRONMENTS.filter(
+        name =>
+          name !==
+          resultLineFixtures.find(r => r.resultId === FIXTURE_RESULT_ID_FAILED)?.environmentName,
+      );
+      const byEnv = await get(`/results?test=${FIXTURE_TEST_ID_FAILED}&environment=${earlierEnv}`);
+      expect(await idsOf(byEnv)).toEqual([FIXTURE_RESULT_ID_EARLIER]);
+      const byStatus = await get(`/results?test=${FIXTURE_TEST_ID_FAILED}&status=passed`);
+      expect(await idsOf(byStatus)).toEqual([FIXTURE_RESULT_ID_EARLIER]);
+      const byLimit = await get(`/results?test=${FIXTURE_TEST_ID_FAILED}&limit=1`);
+      expect(await idsOf(byLimit)).toEqual([FIXTURE_RESULT_ID_FAILED]);
+    });
+
+    it('leaves a cancelled result out of a history unless status names it', async () => {
+      const plain = await get(`/results?test=${FIXTURE_TEST_ID_RUNNING}`);
+      expect(await idsOf(plain)).toEqual([]);
+      const named = await get(`/results?test=${FIXTURE_TEST_ID_RUNNING}&status=cancelled`);
+      expect(await idsOf(named)).toEqual([FIXTURE_RESULT_ID_CANCELLED]);
+    });
+
+    it('refuses an environment the project does not have, listing the ones it has', async () => {
+      const res = await get(`/results?test=${FIXTURE_TEST_ID_FAILED}&environment=nope`);
+      expect(res.status).toBe(400);
+      const error = await errorOf(res);
+      expect(error.code).toBe('VALIDATION_ERROR');
+      expect(error.details.field).toBe('environment');
+      for (const name of FIXTURE_RESULT_ENVIRONMENTS) {
+        expect(String(error.details.reason)).toContain(name);
+      }
+    });
+
+    it.each(['limit=0', 'limit=101', 'limit=abc'])('refuses %s, naming the field', async param => {
+      const res = await get(`/results?test=${FIXTURE_TEST_ID_FAILED}&${param}`);
+      expect(res.status).toBe(400);
+      expect((await errorOf(res)).details.field).toBe('limit');
+    });
+
+    it('refuses status=flaky with the reason as the message and no details', async () => {
+      const res = await get(`/results?test=${FIXTURE_TEST_ID_FAILED}&status=flaky`);
+      expect(res.status).toBe(400);
+      const error = await errorOf(res);
+      expect(error.code).toBe('VALIDATION_ERROR');
+      expect(error.message).toBe(
+        'status must be one of passed, failed, running, blocked, cancelled',
+      );
+      expect(error.details).toEqual({});
+    });
+
+    it('answers a test that exists but has never run with an empty list, not NOT_FOUND', async () => {
+      const res = await get(`/results?test=${FIXTURE_TEST_ID_LARGE_CODE}`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as unknown;
+      expect(body).toEqual({
+        results: [],
+        hiddenRunCount: 0,
+        retentionDays: resultHistoryWindowFixture.retentionDays,
+      });
+      expect(v.safeParse(RESULT_LIST_SCHEMA, body).success).toBe(true);
+    });
+
+    it('answers NOT_FOUND for a test it does not have', async () => {
+      const res = await get('/results?test=test_missing');
+      expect(res.status).toBe(404);
+      expect((await errorOf(res)).details).toEqual({ resource: 'test', id: 'test_missing' });
+    });
+
+    it('looks the test up before the environment, so an unknown test with an unknown env is NOT_FOUND', async () => {
+      const res = await get('/results?test=test_missing&environment=nope');
+      expect(res.status).toBe(404);
+      expect((await errorOf(res)).details).toEqual({ resource: 'test', id: 'test_missing' });
+    });
+  });
+
+  it.each([
+    ['both run and test', `/results?run=${FIXTURE_RESULT_RUN_ID}&test=${FIXTURE_TEST_ID_FAILED}`],
+    ['neither run nor test', '/results'],
+  ])('refuses %s', async (_what, path) => {
+    const res = await get(path);
+    expect(res.status).toBe(400);
+    const error = await errorOf(res);
+    expect(error.code).toBe('VALIDATION_ERROR');
+    expect(error.details.field).toBe('run');
+  });
+
+  it('requires an API key on both routes', async () => {
+    for (const path of [`/results?run=${FIXTURE_RESULT_RUN_ID}`, '/results/anything']) {
+      const res = await fetch(`${DEFAULT_BASE_URL}${path}`);
+      expect(res.status).toBe(401);
+    }
+  });
+
+  describe('GET /results/:resultId', () => {
+    it.each([
+      FIXTURE_RESULT_ID_PASSED,
+      FIXTURE_RESULT_ID_FAILED,
+      FIXTURE_RESULT_ID_BLOCKED,
+      FIXTURE_RESULT_ID_CANCELLED,
+      FIXTURE_RESULT_ID_EARLIER,
+    ])('serves %s in the shape the CLI reads', async resultId => {
+      const res = await get(`/results/${resultId}`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual(detailOf(resultId));
+      // The fixture spells out every field, so parsing must change nothing.
+      const parsed = v.safeParse(RESULT_DETAIL_SCHEMA, body);
+      expect(parsed.success).toBe(true);
+      expect(parsed.output).toEqual(body);
+    });
+
+    it('agrees with the listing about each result', () => {
+      for (const line of resultLineFixtures) {
+        expect(detailOf(line.resultId)).toMatchObject({
+          resultId: line.resultId,
+          runId: line.runId,
+          caseKey: line.caseKey,
+          title: line.title,
+          testStatus: line.testStatus,
+          error: line.error,
+          blockedReason: line.blockedReason,
+          created: line.created,
+        });
+      }
+    });
+
+    it('names the first failed step of the failed result', () => {
+      const failed = detailOf(FIXTURE_RESULT_ID_FAILED)!;
+      expect(failed.failedStep).toEqual(failed.steps.find(s => s.status === 'failed'));
+      expect(failed.failedStep).not.toBeNull();
+      expect(failed.signIn).toBeNull();
+    });
+
+    it('carries the sign-in run on the blocked result only', () => {
+      for (const [resultId, detail] of Object.entries(resultDetailFixtures)) {
+        if (resultId === FIXTURE_RESULT_ID_BLOCKED) {
+          expect(detail.signIn?.steps.length).toBeGreaterThan(0);
+          // A sign-in step has a page snapshot and no screenshot.
+          expect(detail.signIn?.steps.every(s => s.screenshotSignedUrl === null)).toBe(true);
+        } else {
+          expect(detail.signIn).toBeNull();
+        }
+      }
+    });
+
+    it('answers NOT_FOUND for a result it does not have', async () => {
+      const res = await get('/results/result_missing');
+      expect(res.status).toBe(404);
+      expect((await errorOf(res)).details).toEqual({ resource: 'result', id: 'result_missing' });
+    });
   });
 });

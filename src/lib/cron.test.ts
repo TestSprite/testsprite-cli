@@ -133,7 +133,7 @@ describe('formatScheduleFrequencyAdvisory', () => {
     const out = formatScheduleFrequencyAdvisory('0 3 * * *');
     expect(out).toContain('~30 time(s)/month');
     expect(out).toContain('daily at 03:00');
-    expect(out).toContain('full test run');
+    expect(out).toContain('full run');
   });
 
   it('quotes no credit figure', () => {
@@ -167,7 +167,7 @@ describe('formatScheduleFrequencyAdvisory', () => {
   it('still advises, without a frequency, for an expression it cannot read', () => {
     const out = formatScheduleFrequencyAdvisory('0 0 3 * * *');
     expect(out).toContain('0 0 3 * * *');
-    expect(out).toContain('full test run');
+    expect(out).toContain('full run');
     expect(out).not.toMatch(/time\(s\)\/month/);
   });
 });

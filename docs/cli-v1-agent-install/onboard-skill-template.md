@@ -1,6 +1,6 @@
 ---
 name: testsprite-onboard
-description: Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), generate a coherent set of tests (or derive and batch-create them from the codebase), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.
+description: Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), have the project's agent plan a coherent set of tests (`testsprite plan`, then `testsprite apply`), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.
 ---
 
 <!--
@@ -23,13 +23,12 @@ description: Stand up a complete, runnable TestSprite test suite for the current
 
 # TestSprite: onboard a repo with a seed test suite
 
-Your job is to take a repo that has **no TestSprite tests yet** and leave it with a
-**coherent, runnable suite** plus a couple of **already-green** smoke tests — in one pass.
-A new user who can immediately run a real, passing test is an activated user; an empty
-project is the #1 drop-off.
+Seed a repo with no tests into a coherent suite and 2–3 passing smoke tests.
 
-This skill only uses shipped CLI commands. It works the same whether the user is on the V2
-or V3 backend — the CLI routes internally. Do **not** call backend APIs directly.
+This skill only uses shipped CLI commands. Do **not** call backend APIs directly.
+
+The tests are written by the project's agent (`testsprite plan` → `testsprite apply`);
+you give it what it needs, review what it proposes, and smoke-run the result.
 
 ## When to use
 
@@ -45,119 +44,134 @@ or V3 backend — the CLI routes internally. Do **not** call backend APIs direct
 
 `testsprite setup` has run (an API key is configured). If `testsprite project list` errors on
 auth, stop and tell the user to run `testsprite setup` first — don't try to configure for them.
+In a sandbox, `testsprite setup --from-env` can use `TESTSPRITE_API_KEY` even when HOME
+is read-only: credential-write permission failures warn and continue session-only.
+The JSON summary has `credentials.persisted: false`; export the key in every invoking
+shell. Agent installation still needs a writable target; `--no-agent` skips it.
 
 ## Steps
 
-### 1. Understand the app (don't skip — this is where coverage quality comes from)
+### 1. Understand the app
 
-Read the repo to establish, concretely:
+Read the source to identify:
 
 - **Frontend**: the deployed/local **URL**, the 4–8 most important user flows (auth, core
   CRUD, checkout, search, settings…), and whether flows need **login**.
 - **Backend**: the key **API endpoints** and their success/error contracts.
 
-Prefer **code-derived** routes/handlers over guessing — you have the source; use it. This
-beats a blind crawl.
+Use code-derived routes/handlers; do not guess.
 
-### 2. Create the project (FE must have a URL)
-
-Frontend:
+### 2. Create the project and its environment
 
 ```bash
-testsprite project create --type frontend --name "<repo name>" --url <app-url> \
+testsprite project create --type frontend --name "<repo name>"   # or --type backend
+```
+
+Capture the returned `projectId`, then say where the app runs.
+
+Deployed:
+
+```bash
+testsprite project env create <projectId> --name default --url <app-url> \
   [--username <user> --password-file <path-to-secret>]
 ```
 
-Backend:
+Local frontend (start the app first):
 
 ```bash
-testsprite project create --type backend --name "<repo name>"
+testsprite project env create <projectId> --name local --local <port>
 ```
 
-Capture the returned `projectId`.
+`--local` stores `http://localhost:<port>`; `--url http://127.0.0.1:<port>` or
+`http://[::1]:<port>` keeps another loopback host. Reuse that host on runs with
+`--local-host`; omit it for `localhost`. Dead port: exit 5 (`--skip-preflight` bypasses).
+Local runs work on Free and need `run:tunnel` (mint a new key if missing).
 
-> **Critical for FE**: a frontend test with no resolvable target URL fails immediately with
-> `No environment URL configured` — the suite goes all-red. Always pass `--url`. If flows need
-> login, pass `--username/--password-file` now so authenticated pages are reachable.
+With a frontend test account, the cloud agent logs in through the tunnel using the
+environment's username/password. OTP environments are refused before charge (exit 6).
 
-### 3. Author the tests (quality over quantity)
+Backend: configure the API credential once on its environment (ask the user for the value —
+never invent it or reuse a key you happened to see). The agent's tests read it from the
+injected `__AUTH_HEADERS__`; they never hardcode it. A static credential:
+`testsprite project env update <projectId> <env> --auth bearer|basic|apikey --credential-file <f>`
+(extra headers: `--header "Name: value"`, secret ones in `--header-file <f>`); a sign-in that
+refreshes the credential: `--auto-auth-file <f>`.
 
-**Frontend** — one JSON plan file per flow, in a directory (e.g. `./testsprite-plans/`).
-Each file is a COMPLETE plan and must include `projectId` (from step 2), `type: "frontend"`,
-`name`, and `planSteps` — `create-batch` reads the project from each file, not from a flag:
+#### 2b. FE: register the app's test-hook attribute
 
-```json
-{
-  "projectId": "<projectId from step 2>",
-  "type": "frontend",
-  "name": "Checkout — guest can complete a purchase",
-  "planSteps": [
-    { "type": "action", "description": "Navigate to /products and open the first product" },
-    { "type": "action", "description": "Click 'Add to cart', then go to /cart" },
-    {
-      "type": "assertion",
-      "description": "The cart shows exactly 1 line item with the product's name and price"
-    },
-    { "type": "action", "description": "Proceed to checkout as guest and submit the test payment" },
-    { "type": "assertion", "description": "A confirmation page appears showing an order number" }
-  ]
-}
-```
+If the source tags elements with something other than `data-testid` (e.g. `data-element`),
+run `testsprite project update <projectId> --test-id-attributes data-element,data-testid`
+once; exported locators then use the tag (check: `project get` → `testIdAttrs:`).
 
-**Backend** — one `.py` file per endpoint, using `requests` with concrete assertions on
-status code and response body.
+### 3. Ask the project's agent for the tests
 
-**Assertion rule (this is the whole game for FE):** every `assertion` step must name a
-**concrete, observable** outcome — an element, text, URL, count, or status. Never write
-`"verify it works"`, `"check the page loads"`, or other narrative that an AI judge can
-rubber-stamp. Vague assertions are how false-PASS sneaks in.
-
-Aim for ~8–15 tests covering the core flows. Don't pad.
-
-### 4. Batch-create
-
-Frontend (one call, up to 50 plans from the directory — `create-batch` is FE-only and has
-**no `--project` flag**; the project comes from each plan file's `projectId`):
+Name the flows from step 1 in the request, so the suite covers them rather than one page.
+Attach what the agent can't see: an API spec (backend projects need one), a PRD, your
+change.
 
 ```bash
-testsprite test create-batch --plan-from-dir ./testsprite-plans
+testsprite plan "Seed a first suite: <the 4–8 flows from step 1>" --project <projectId> \
+  [--file ./openapi.yaml] [--file ./prd.md] [--diff] --output json
 ```
 
-Backend (one call per file — `create-batch` is FE-only; `--name` is required):
+- Frontend: the agent explores the deployed app in a real browser. A local project's app
+  can't be opened from the cloud: attach your change (`--diff`) and the agent works from it.
+- `"state": "replied"` → read `reply`; answer from the code what you can with
+  `testsprite reply "..."`, ask the user only what only they know.
+- Exit 7: still working; `testsprite status --wait` follows it.
+- Exit 13: the agent isn't enabled for this account. Tell the user and stop — the CLI
+  has no other way to write tests.
+
+`"state": "proposed"` → review the plan against the source before applying it:
+
+- Drop flows that don't exist and duplicates.
+- Every assertion names an observable element, text, URL, count, or status; vague
+  ones like "verify it works" create false passes.
+- Aim for ~8–15 tests covering the core flows. Don't pad.
 
 ```bash
-testsprite test create --type backend --name "<behavior being tested>" \
-  --code-file ./tests/<endpoint>.py --project <projectId>
+testsprite apply                                   # all of it
+testsprite apply --exclude <ref>,<ref>             # without some tests
+testsprite apply --answer 1=b --answer 2=a,c       # a card that asks questions: answer by letter
+testsprite reject "<what to change>"               # the agent revises and proposes again
 ```
 
-Capture the created `testId`s from the output.
+`apply` prints the saved test ids (`applied.tests` in JSON).
 
-### 5. Smoke-run a few — NOT all (protect credits)
+### 4. Smoke-run a few — NOT all (protect credits)
 
 Pick the **2–3 highest-value happy-path** tests (prefer ones you're most confident are green)
 and run only those:
 
 ```bash
-testsprite test run <testId> --wait
+testsprite run <test-id> --wait                     # deployed target
+testsprite run <test-id> --local <port> --local-host <host>  # local frontend
 ```
 
-Do **not** run the whole suite automatically — a 20-test FE suite is ~40 credits and a free
-account only has 150. Running the full suite is the user's explicit choice.
+Do **not** run the whole suite automatically. Frontend runs, including local runs,
+cost 0.5 credit each; check `testsprite usage` before sizing the suite.
+Local runs wait (1200 s each). Put several in ONE `run <id> <id> --local <port>`
+(one tunnel, 5 at a time; each process holds 1 of 5 tunnel slots). Keep the stderr
+`Run <run-id>` receipt. An owned local timeout cancels by default: start a new run with
+`--local <port> --local-host <host> --timeout 1800` (same host), not `run wait`. For a frontend test cancelled before a terminal verdict the server attempts a refund; read the reported `refund`.
 
-### 6. Report
+### 5. Report
 
 Tell the user, plainly:
 
 - "Your project now has **N** tests covering: <list the flows>."
 - "I smoke-ran **M** — here's the result: <pass/fail + the dashboard link from the run output>."
-- "To run the rest (≈X credits — state the cost so they choose knowingly):
-  - frontend — run each remaining test by id: `testsprite test run <testId> --wait` (there is
-    **no `--all` for frontend**);
-  - backend — `testsprite test run --all --project <id>` (wave-ordered, runs every BE test)."
+- "To run the rest (≈X credits, so they choose knowingly):
+  - frontend — use `run <test-id> --wait` for deployed targets or
+    `run --project <id> --local <port> --local-host <host>` for local targets;
+  - backend — `testsprite run --project <id>` (wave-ordered, runs every BE test)."
 
 ## Quality checklist (self-check before reporting done)
 
-- [ ] FE project has a real `--url`; login configured if the app needs it.
+- [ ] FE project has a public `--url` or uses `--local`; login configured if needed.
+- [ ] API project: the API spec attached to the request (a PRD is optional, alongside it).
+- [ ] You **read the plan** and rejected or excluded the tests that don't fit,
+      rather than applying it unseen.
 - [ ] Every FE assertion names a concrete, observable outcome (no "verify it works").
 - [ ] Tests cover the core flows you found in the code, not just one page.
 - [ ] Smoke-ran 2–3 happy-path tests, not the whole suite.
@@ -166,13 +180,12 @@ Tell the user, plainly:
 ## Don'ts
 
 - Don't auto-run the full suite (credit wall / surprise 402).
-- Don't write narrative assertions an AI judge can't fail.
+- Don't apply narrative assertions an AI judge can't fail.
 - Don't call backend endpoints directly — only the `testsprite` CLI.
-- Don't create a FE project without a URL.
-- Don't re-seed a project that already has tests — that's not this skill's job.
+- Don't create a FE project without public `--url` or `--local <port>`.
+- Don't apply a plan unread — reviewing it is the point of the proposal.
+- Don't write or edit tests yourself — ask the agent (`reply`, `reject`, or a new `plan`).
 
 ## Hand off to verify
 
-This skill's job ends once the project has a seeded suite and a first green run. From here on,
-the **`testsprite-verify`** skill takes over: after the user changes code, it runs the tests
-covering that change before they report the work done. Onboard once; verify continuously.
+After seeding and a first green run, hand off to `testsprite-verify` for subsequent changes.

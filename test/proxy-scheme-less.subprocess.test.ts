@@ -45,6 +45,12 @@ function runCli(env: Record<string, string>) {
     const child = spawn(process.execPath, [binary, 'auth', 'status', '--output', 'json'], {
       env: {
         ...process.env,
+        HTTP_PROXY: '',
+        http_proxy: '',
+        HTTPS_PROXY: '',
+        https_proxy: '',
+        NO_PROXY: '',
+        no_proxy: '',
         TESTSPRITE_API_KEY: 'sk-user-subproc',
         TESTSPRITE_API_URL: 'http://api.proxy-only.example',
         TESTSPRITE_NO_UPDATE_NOTIFIER: '1',

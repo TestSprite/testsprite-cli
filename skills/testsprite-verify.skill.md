@@ -11,10 +11,10 @@ running the test catches what breaks for a real user.
 ## When to run
 
 Run after a feature or fix lands — one feature → one test run, at the moment it
-lands, not batched at the end. Tests you create this way accumulate into the
-project's TestSprite suite; before writing a new one, check `testsprite test list`
-for an existing test that already covers the behavior and extend it instead of
-duplicating.
+lands, not batched at the end. You don't write or edit TestSprite tests yourself:
+the project's agent does (`testsprite plan` → `testsprite apply`), and what it
+saves accumulates into the project's suite. Before asking for a new test, check
+`testsprite test list` for an existing one that already covers the behavior.
 
 The CLI tests either a **deployed** URL or a frontend test running on this
 machine — it doesn't build or host your environment either way. For a deployed
@@ -24,14 +24,14 @@ public URL once, then select it with `--env <name>` on runs. Running earlier
 verifies the previous build, not your change.
 
 For a change that is only running locally, don't wait for a deployment: run
-`testsprite test run <test-id> --local <port>` instead. It tunnels this
+`testsprite run <test-id> --local <port>` instead. It tunnels this
 machine's own loopback address (`localhost` / `127.0.0.1` / `::1` — not a LAN
 or RFC1918 address, and not a general local-network escape hatch) to the test
-runner. It is for frontend tests only (a backend test's target is baked into
-its generated code, so run it normally). Existing API keys work for local runs; no replacement key is
-needed. `--local <port>` selects or creates the
-project's `local-<port>` environment. With `--env <name> --local <port>`, that
-named environment must also be local (`project env list <projectId>` shows names).
+runner. It is for frontend tests only (a backend test reaches its API over HTTP from
+the runner, so run it normally against a deployed environment). Existing API keys work for local runs; no replacement key is
+needed. To use a saved environment's sign-in against the local app, pass
+`--env <name> --local <port>`. Check the name with
+`testsprite project env list <projectId>`.
 
 If the user explicitly named a tool (the CLI or the MCP), honor that choice
 regardless of which one the change's reachability would otherwise suggest.
@@ -55,19 +55,17 @@ Every shipped feature gets **at least one** TestSprite run to a terminal verdict
 (`passed` / `failed` / `blocked` / `inconclusive`) before you call it done. What
 counts:
 
-- `testsprite test create … --run --wait` returning a terminal verdict, **or**
-- `testsprite test run <id> --wait` against an existing test, **or**
-- `testsprite test create-batch --plans plans.jsonl --run --wait` (or
-  two-step: create-batch, then `test run <id> --wait`) on at least one
-  test returning a terminal verdict.
+- `testsprite run --project <projectId> --wait` for the project suite, **or**
+- `testsprite run <id> --wait` against an existing test, **or**
+- `testsprite run <id...> --wait` on the tests `testsprite apply` just
+  saved, with at least one returning a terminal verdict.
 
-What does **not** count: unit tests / typecheck / lint; drafting a plan without
-`--run`; asking the user to run it for you.
+What does **not** count: unit tests / typecheck / lint; a plan the agent
+proposed but nobody ran; asking the user to run it for you.
 
 If the project has **no tests at all**, that's the `testsprite-onboard` skill's
-job, not this one — seed a suite first (it can generate the proposals for you
-with `testsprite test plan generate` / `test plan accept` for a deployed target;
-local projects require authored plans and `test create --plan-from`). Seeding is a deliberate setup pass, not part of the verify loop.
+job, not this one — seed a suite first with the project's agent (`testsprite plan`
+→ `testsprite apply`). Seeding is a deliberate setup pass, not part of the verify loop.
 
 If you can't satisfy this — no creds, no valid target URL, repo not linked —
 **say so explicitly**: "Feature shipped but I could not run any TestSprite test
@@ -96,22 +94,23 @@ In priority order:
 4. Still ambiguous → list the candidates and ask the user which to use (one short
    question; picking the wrong project wastes a run).
 
-If no project exists for an app running only locally, bootstrap a frontend project
-(V3 required), author a plan, and run the returned test id:
+If no project exists for an app running only locally, bootstrap a frontend project,
+ask the agent for tests, and run the ids `apply` saved:
 
 ```bash
-testsprite project create --type frontend --name "<repo name>" --local <port> --local-host <host>
-testsprite test create --plan-from plan.json --project <projectId>
-testsprite test run <id> <id> --local <port> --local-host <host> --output json
+testsprite project create --type frontend --name "<repo name>"
+testsprite project env create <projectId> --name local --local <port>
+testsprite plan "<what you built>" --diff --project <projectId> --output json
+testsprite apply --output json
+testsprite run <id> <id> --local <port> --local-host <host> --output json
 ```
 
 Keep the app listening and use the same `--local-host` for creation and follow-up
 runs. It selects both the probe and stored URL host: `localhost`, `127.0.0.1`
 (default), or `::1`; omit it in both commands to use the default.
 The port probe fails with exit 5 if nothing listens (`--skip-preflight`
-bypasses it). Local projects skip exploration: `test plan generate` is refused
-before charge (exit 6), so use `test create --plan-from` without `--run`, then
-`test run --local`. V2-only local-project creation is unsupported (exit 7).
+bypasses it). The agent's browser can't open an app on this machine, so it works
+from your change (`--diff`) and the project's other environments.
 The Portal shows local environments without a Run action. Create a public
 environment for deployed apps and select it with `--env <name>`.
 
@@ -119,15 +118,13 @@ environment for deployed apps and select it with `--env <name>`.
 
 Look at the diff (`git diff --stat`, then the changed files) to understand what
 user-facing behavior changed. Pick one sub-mode. For a brand-new feature the
-right default is almost always (b) or (c); (a) is for tweaks to behavior an
-existing test already covers.
+right default is almost always (b); (a) is for tweaks to behavior an existing
+test already covers; (c) is for a test that is itself wrong.
 
 ### (a) An existing test covers the change
 
 ```bash
-testsprite test list --project <projectId> --output json
-testsprite test list --project <projectId> --status failed --output json   # what's already red
-testsprite test run --all --project <projectId> --status failed,blocked --wait --timeout 600 --output json   # re-run what did not pass
+testsprite test list --project <projectId> --output json   # the cases, as they are written
 ```
 
 Heuristic: a change to `src/components/CheckoutForm.tsx` is more likely covered
@@ -136,285 +133,126 @@ backend → `type: backend`.
 
 ### (b) A new test for the change (most common)
 
-**Frontend — draft a `plan.json`.** You name the behavior and list steps in plain
-language; you don't write browser code.
-
-```jsonc
-{
-  "projectId": "prj_abc",
-  "type": "frontend",
-  "name": "Booking date range change updates the estimated total",
-  "description": "When a user opens a listing and extends the booking date range, the booking-panel estimated total updates to reflect the new dates before payment.",
-  "priority": "p1",
-  "planSteps": [
-    { "type": "action", "description": "Navigate to the homepage" },
-    { "type": "action", "description": "Search for stays with a valid destination and date range" },
-    { "type": "action", "description": "Open a listing from the search results" },
-    {
-      "type": "action",
-      "description": "Select an initial short date range to view the estimated total",
-    },
-    { "type": "action", "description": "Change the date range to a longer stay" },
-    {
-      "type": "assertion",
-      "description": "Verify the estimated total on the booking panel updates from the initial value to reflect the new longer dates",
-    },
-  ],
-}
-```
-
-- `name` — an assertable behavior statement (subject + verb + outcome), not a noun
-  fragment — e.g. "Booking date range change updates the estimated total" tells
-  the testing agent what to verify; "date range" tells it nothing.
-- `description` — the condition + expected outcome in one sentence; disambiguates
-  a short name.
-- `priority` — `p0` (must-pass) / `p1` (important paths) / `p2` (edge) / `p3`
-  (cosmetic). Pick honestly.
-- `planSteps` — `Array<{ type: 'action' | 'assertion', description: string }>`,
-  max 200 steps / 256 KB. Describe user intent, not selectors.
-
-**Backend — write the Python yourself and use `--code-file`.** There is no
-server-side codegen on the CLI. Read the API surface that changed (OpenAPI, the
-route handler, request/response shapes) and write a pytest-style assertion script
-to a tempfile. **End the file by calling your `test_*` function(s)** — the runner
-executes the file top-to-bottom and does NOT auto-discover/collect test functions
-the way `pytest` does, so a test that is only _defined_ (never called) silently
-passes regardless of its assertions:
-
-```python
-# /tmp/login-empty-password.py — runs against the project's target URL, creds injected.
-import requests
-
-def test_login_rejects_empty_password():
-    r = requests.post(f"{TARGET_URL}/login", json={"email": "a@b.c", "password": ""})
-    assert r.status_code == 400
-    assert r.json().get("error") == "invalid password"
-
-# Required: actually invoke the test so its assertions run.
-test_login_rejects_empty_password()
-```
-
-**Execution environment (backend).** The code runs in a locked-down sandbox with
-only the Python **standard library + `requests` + `pytest` + `numpy` + `scipy`**
-(plus `requests`' own deps like `urllib3`). So:
-
-- **Test the API over HTTP** with `requests` against the target URL — that's what a
-  backend test verifies.
-- **Do NOT `import` the project's own source modules** (e.g. `from app.services import …`,
-  `import core`, `import model`) or other third-party/ML packages (e.g. `torch`,
-  `pandas`, `django`). They are not installed, so the test fails to even run.
-- Get values from the API's responses (and captured variables), not by importing and
-  calling the app's internals.
-
-**Authentication — read the injected credential, NEVER hardcode any credential.** This
-applies to **every** secret the API needs — Bearer/JWT tokens **and** API keys, basic-auth
-blobs, session cookies. Do not paste a literal `Bearer …`, `sk-…`, `x-api-key` value, or any
-other credential into the test. Before your script runs, TestSprite prepends a managed
-credential block built from the project's Authentication settings, and `__AUTH_HEADERS__`
-already contains the right header(s) for the configured auth type:
-
-```python
-# Auto-injected credentials — do not modify
-__AUTH_CREDENTIAL__ = "..."
-__AUTH_TYPE__       = "Bearer token"            # or "API key" / "basic token" / "public"
-__AUTH_HEADERS__    = {"Authorization": "Bearer ..."}   # API key → {"X-API-Key": "..."}; basic → {"Authorization": "Basic ..."}
-```
-
-Spread `__AUTH_HEADERS__` into every authenticated request — it adapts to whatever auth type
-the project is configured for, so the same line works for Bearer, API-key, or basic auth:
-
-```python
-r = requests.get(f"{TARGET_URL}/profile", headers={**__AUTH_HEADERS__})
-```
-
-Configure the credential **once on the project** (ask the user for the value — never invent
-or reuse a key you happened to see), and the block stays correct + refreshable:
-
-- **Bearer / API key / basic (static):**
-  `testsprite project credential <projectId> --type "Bearer token"|"API key"|"basic token" --credential <value>`
-- **Auto-refreshing login (recurring token):** `testsprite project auto-auth <projectId> …`
-
-A hardcoded token expires within hours (and a hardcoded key can't be rotated centrally), so
-the test breaks on later runs; the managed block is rewritten with a fresh value each run.
-`test create` emits a `[warn]` when it detects an inlined credential literal — treat that as
-a must-fix, not a nuisance.
-
-**Backend tests that share state declare dependencies at create time.** For a
-one-off verification, prefer a single self-contained script (log in inside the
-same file). But when the coverage set splits naturally into producer → consumer
-→ cleanup — one test captures an auth token or created-resource id that others
-reuse — declare the graph with the dependency flags instead of duplicating setup
-in every file:
+**Ask the project's agent.** It is the agent the user has in the TestSprite
+portal: it explores the app in a real browser (frontend) or calls the API
+(backend), reads your change, and writes the tests against what the app is
+supposed to do. You review its plan and apply it; you don't write the tests
+yourself, so they don't share your blind spots.
 
 ```bash
-# producer — captures a variable for later waves
-testsprite test create --type backend --project <projectId> --name "login issues an auth token" \
-  --code-file /tmp/login.py --produces auth_token
-
-# consumer — scheduled in a wave after every producer it names
-testsprite test create --type backend --project <projectId> --name "profile update accepts the issued token" \
-  --code-file /tmp/profile.py --needs auth_token
-
-# cleanup — always scheduled in the final wave
-testsprite test create --type backend --project <projectId> --name "fixture user is deleted" \
-  --code-file /tmp/cleanup.py --category teardown
+testsprite plan "<what you built, and the rules the user gave for it>" --diff \
+  [--file <prd-ticket-or-api-spec>] --project <projectId> --output json
+# "state": "proposed" → show the user the plan, then:
+testsprite apply                      # or: apply --exclude <ref>; reject "<what to change>"
+# "proposal.kind": "question" → show the user its questions and options, then answer by letter:
+testsprite apply --answer 1=b --answer 2=a,c   # or your own words: --answer 1="…"
+testsprite run <test-id...> --wait --output json   # the ids apply saved, in "applied.tests"
 ```
 
-- `--produces <var>` / `--needs <var>` are repeatable. All three flags are
-  **backend-only** — combined with `--type frontend` the CLI exits 5.
-- **Don't hand-sequence `test run` calls to fake ordering.** The wave engine owns
-  ordering: trigger the set with `test run --all` (§4) and producers run before
-  consumers, `teardown` last. Chaining `run A --wait && run B --wait` yourself
-  loses the engine's variable passing and conflicts with concurrent runs.
-- **Declarations are editable.** `test update` amends them (`--produces` /
-  `--needs` / `--category`, repeatable) and `test get` echoes them back —
-  still declare the graph at create time when you can, so wave ordering is
-  right on the first run.
+- Put the rules the user told you in the request. Don't invent expectations: a
+  test whose description says its expectation is only what the app does today is
+  the user's call, so ask them before you apply it.
+- For distinct paths (happy + error + edge), ask for them in the same request;
+  2–5 tests, more only with the user's confirmation.
+- `"state": "replied"` → read `reply`. Answer from the code what you can with
+  `testsprite reply "..."`; ask the user only what only they know.
+- Exit 7: the agent is still working; `testsprite status --wait` follows it.
+  Exit 13: the agent isn't enabled for this account; tell the user and stop —
+  the CLI has no other way to write tests.
+- For an app only on this machine, the agent works from your change and the
+  project's other environments; run what it saved with `--local <port>`.
+- When you open the pull request, put `prSummary` from the `apply` output in its
+  description, so reviewers see the tests that now guard the change.
 
-**Show the user the drafted plan / code before creating it** — creating writes to
-their project. One short confirmation; let them edit the tempfile first.
+**Review the plan before you apply it.** A loose plan produces a
+confidently-wrong `passed` or a thrashing `blocked`. Reject (`testsprite reject
+"<what to change>"`) a test that:
 
-#### Authoring planSteps the testing agent will execute reliably
+- asserts only that something is visible — presence ≠ working (an `<img>` whose
+  `src` 404s still "renders"); the assertion must say the thing works and is correct;
+- for a visual / layout feature, asserts content only — at least one assertion
+  should name geometry or position (side-by-side, stacked, above/below, grid);
+- names no specific page region for its assertion, or a fuzzy target ("open a thing");
+- depends on state outside the test's control: third-party auth (OAuth/SSO/2FA),
+  OS-native surfaces (file upload/download, native dialogs), multi-tab or iframes.
 
-Execution reliability tracks plan wording. A loose plan produces a
-confidently-wrong `passed` (bare visibility assertions) or a thrashing
-`blocked`. Write to these rules first:
+**Backend credentials.** The agent's backend tests read the project's injected
+credential (`__AUTH_HEADERS__`); they never hardcode a token. Configure it **once on
+the project's environment** (ask the user for the value — never invent or reuse a key
+you happened to see):
 
-- **One verb per step.** `and` / `then` between two verbs → split — e.g.
-  "Search for stays and open the first result" becomes two steps.
-- **Describe outcomes, not selectors.** The testing agent locates targets
-  semantically — describe the intent and the match stays robust across copy
-  changes; a guessed literal label defeats that. E.g. write `"Submit the form"`,
-  not `"Click the blue 'Submit' button"`. If the app tags elements with its own
-  attribute (`data-element`, `data-cy`, …), make sure the project knows —
-  `testsprite project get <projectId>` shows `testIdAttrs:`; set it once with
-  `project update <projectId> --test-id-attributes <attr>,data-testid` — and the
-  exported code will locate tagged elements by that attribute instead of text.
-- **`Navigate to` only on step 1** (or a login page). Use clicks for every later
-  transition — direct URLs break SPA routing.
-- **FE plans narrate a user journey through their actions.** Each action is
-  what a real user does (click, type, navigate, hover, scroll), forming a
-  sequence that exercises what gives the feature its value. The final assertion
-  verifies what the journey produced — the state the user arrived at, a
-  comparison against an earlier state, a derived count — not just that the
-  starting page rendered.
-- **Name the target entity type, not a fuzzy noun.** If a page has several
-  look-alike row kinds, "open a thing" lets the testing agent pick the wrong
-  kind. Name the type and the page/view you expect to land on.
-- **1–2 assertions, at the end, on whether the content is present _and actually
-  works_** (see _presence ≠ working_ below) rather than UI copy / formatting.
-  (Quoting a literal you submitted earlier in the same plan, to verify it
-  round-trips, is fine.)
-- **Presence ≠ working.** A node can exist yet be broken or wrong — e.g. an
-  `<img>` whose `src` 404s renders a broken-image box but still passes "element
-  present / has alt." Assert the thing actually **works and is correct**, not
-  just that the tag exists; trust the testing agent to judge correctness rather
-  than hard-coding the expected answer into the assertion.
-- **Assertion targets name the specific page region** (panel / tab / output area).
-  Otherwise the testing agent settles for "some element with that text is
-  visible anywhere," which passes for wrong reasons.
-- **For visual / CSS / layout-sensitive features, content-presence-only
-  assertions are dangerous.** "Verify the methodology section is visible" passes
-  even when the stylesheet is missing and three cards render as flat unstyled
-  text stacked vertically — the strings exist on the page, and a content-presence
-  assertion constrains nothing about layout. For any feature whose value depends on
-  layout, include at least one assertion that names geometry or relative
-  position (row, column, side-by-side, stacked, grid, above/below, span, card
-  background, border), not just content existence:
+- **Bearer / API key / basic (static):**
+  `testsprite project env update <projectId> <env> --auth bearer|basic|apikey --credential-file <path>`
+  (extra headers: `--header "Name: value"`, secret ones in `--header-file <path>`)
+- **Auto-refreshing login (recurring token):**
+  `testsprite project env update <projectId> <env> --auto-auth-file <path>` (format: `project env update --help`)
 
-  ```jsonc
-  // BEFORE — content-presence-only (passes even on broken CSS)
-  { "type": "assertion", "description": "Verify the methodology section with three sub-score formulas is visible" }
+### (c) A test that is wrong
 
-  // AFTER — content + layout
-  { "type": "assertion", "description": "Verify the methodology section shows three card cells laid out side-by-side in a single horizontal row, each with a distinct card background and a heading; the three cards together span the full content width" }
-  ```
+You don't edit tests. If a test fails because the test itself is wrong (stale
+steps, a wrong expectation), tell the agent and apply its fix:
 
-- **Keep `description` and `planSteps` in scope agreement** — the testing agent
-  reads `description` as the test's purpose and shrinks execution to match. If
-  you change the steps, re-align the description.
-- **Keep flows that depend on state outside the test's control out of scope:**
-  third-party auth (OAuth/SSO/2FA), OS-native surfaces (file upload/download,
-  drag-and-drop, native dialogs), cross-context state (iframes, multi-tab,
-  external services). Pick a different verification.
-- **Test data must be self-contained** — create what you need within the plan, or
-  don't write the plan.
-
-### (c) A coverage set — multiple FE plans as a batch
-
-When a FE feature has distinct paths (happy + error + edge), draft a
-`plans.jsonl`, one spec per line. Aim for 2–5 plans; more only with explicit user
-confirmation. Max 50 plans / 5 MB per batch.
-
-```jsonc
-// plans.jsonl — FE only
-{"projectId":"prj_abc","type":"frontend","name":"login happy path","planSteps":[...]}
-{"projectId":"prj_abc","type":"frontend","name":"login wrong password","planSteps":[...]}
-{"projectId":"prj_abc","type":"frontend","name":"login empty email","planSteps":[...]}
+```bash
+testsprite plan "the <test name> test should <correct behavior>: <why>" --project <projectId>
+testsprite apply
 ```
 
-Batch is **FE-only.** For 3 backend tests, run `test create --type backend
---project <projectId> --code-file <file>` three times with three Python files.
-
-### (d) Refine an existing test
-
-- **FE** — replace the steps, then re-run:
-  ```bash
-  testsprite test plan put <test-id> --steps refined.json
-  ```
-- **BE** — write updated Python and replace the code (optimistic concurrency):
-  ```bash
-  testsprite test code put <test-id> --code-file refined.py --expected-version <current-version>
-  ```
+Drifted steps are healed during a run; a wrong expectation needs the agent.
 
 ## 4. Run
 
 For a deployed target, create its environment once, then use `--env <name>`
 after that deployment contains the change. Omit `--env` for Default; an unknown
 name fails with available names and never falls back. For a local change,
-use `testsprite test run <test-id> --local <port>` (frontend only); it implies
-waiting and defaults to 1200 seconds. Create a missing test from a plan first,
-without `--run`, then run its id with `--local`.
+use `testsprite run <test-id> --local <port>` (frontend only); it implies
+waiting and defaults to 1200 seconds.
+
+For a long `--wait` or a local run, start the CLI as a background task in your
+agent tool (for example, `run_in_background: true` in Claude Code) and poll
+that same task for its output and exit code. If running in the foreground,
+set the tool's wall-clock timeout longer than the CLI wait budget, including
+time for setup and cleanup. A tool timeout can terminate the CLI. After an
+ordinary cloud run detaches, resume with `testsprite run wait <run-id>`.
+Terminating the process that owns a local tunnel closes it and requests
+cancellation by default.
 
 ```bash
 # One-time setup for a deployed target
 testsprite project env create <projectId> --name staging --url https://staging.example.com
 
+# Run the project suite and wait
+testsprite run --project <projectId> --env staging --wait --timeout 600 --output json
+
 # (a) existing test
-testsprite test run <test-id> --env staging --wait --timeout 600 --output json
+testsprite run <test-id> --env staging --wait --timeout 600 --output json
 
 # (a-several) several tests in one batch; --skip-dependencies (BE) runs only the named tests
-testsprite test run <test-id> <test-id> --env staging --wait --timeout 600 --output json
-testsprite test run <test-id> --skip-dependencies --wait --timeout 600
+testsprite run <test-id> <test-id> --env staging --wait --timeout 600 --output json
+testsprite run <test-id> --skip-dependencies --wait --timeout 600
 
-# (b-FE) new FE test from plan
-testsprite test create --plan-from plan.json --run --wait --env staging --timeout 600
+# (b) the tests `apply` saved
+testsprite run <test-id> <test-id> --env staging --wait --timeout 600 --output json
 
-# (b-BE) new BE test from Python (backend create needs --project)
-testsprite test create --type backend --name "..." --project <projectId> --code-file foo.py --run --wait --timeout 600
-
-# (b-BE coverage set with dependencies) create each test without --run, then one wave-ordered batch
-testsprite test run --all --project <projectId> --env staging --wait --timeout 600 --output json
-testsprite test run --all --project <projectId> --filter <name-substr> --wait --timeout 600   # subset by name
-testsprite test run --all --project <projectId> --status failed,blocked --wait --timeout 600   # only what did not pass
-
-# (c) FE coverage set — single-call create + run (FE-only)
-testsprite test create-batch --plans plans.jsonl --run --wait \
-  --env staging --max-concurrency 3 --timeout 600 --output json
-# Two-step alternative (inspect before running):
-#   testsprite test create-batch --plans plans.jsonl --output json
-#   then trigger each id: testsprite test run <test-id> --env staging --wait --timeout 600
-
-# (d-FE) refine + re-run
-testsprite test plan put <test-id> --steps refined.json && \
-testsprite test run <test-id> --env staging --wait --timeout 600
-
-# (d-BE) refine BE code + re-run. A BE run dispatches the producer/teardown closure by default —
-# use --skip-dependencies while iterating on one script (producers already verified this round),
-# then finish with a closure run before reporting.
-testsprite test code put <test-id> --code-file refined.py --expected-version <current-version> && \
-testsprite test run <test-id> --env staging --wait --timeout 600
+# Narrow a project selection by title
+testsprite run --project <projectId> --filter <name-substr> --wait --timeout 600   # subset by name
 ```
+
+Saved lists retain their pinned project/environment mappings:
+
+```bash
+testsprite run --testlist <listId> --wait --output json
+testsprite run <test-id> <test-id> --testlist <listId> --wait --output json
+# Resume or cancel whole executions; these IDs are runId, not testId/resultId
+testsprite run wait <run-id...> --timeout 600 --output json
+testsprite run cancel <run-id...> --output json
+```
+
+Choose a project, named tests, or a saved list. `--project` cannot combine with
+positional IDs or `--testlist`; named IDs and list selection ignore
+`TESTSPRITE_PROJECT_ID`. Without IDs or a list, that variable supplies the default
+project. Lists reject environment/target overrides and use positional members
+for subsets. `--filter` narrows only project selection. Use `run wait R --timeout
+600` with lifecycle flags after the child; launch flags before a child are errors.
 
 Key behaviors:
 
@@ -424,19 +262,25 @@ Key behaviors:
   and waits, like `--local <port>`. `--env <name> --local <port>` sends that
   environment's sign-in to your local app; the server applies it or refuses
   before dispatch.
-- `--wait` long-polls until terminal and handles its own backoff — don't wrap it
+- `--wait` reads execution status until terminal and handles its own backoff — don't wrap it
   in a retry loop.
-- `--local` implies `--wait`, with a default timeout of 1200 seconds per run (ordinary
-  waits default to 600). Run several local frontend tests in ONE command (`test run <id> <id> … --local <port>`) instead of starting one process per test. `--all --project <id> --local <port>` runs frontend tests and reports backend tests as skipped. One tunnel serves the invocation; `--max-concurrency` defaults to 5 and caps at 10. There are
+- `--local` implies `--wait`, with a default timeout of 1200 seconds for the command (ordinary
+  waits default to 600). Run several local frontend tests in ONE command (`run <id> <id> … --local <port>`) instead of starting one process per test. `run --project <id> --local <port>` runs frontend tests and reports backend tests as skipped. They start one run per project (up to 5000 named test IDs per request) through one tunnel; `--max-concurrency` sets the server dispatch limit per execution, default 5 and maximum 15. Each execution is waited on independently; this limit never queues polling. There are
   5 live tunnel bindings per user; `tunnel_binding_limit` is exit 11 and is not
   auto-retried. Reuse a live tunnel with `--tunnel-client` or stop an unused one.
   On a tunnel-limit error, run `testsprite tunnel list`, then `testsprite tunnel stop <id>`
   or `testsprite tunnel stop --all --confirm` if every binding should be revoked.
-- Keep the early **stderr** run-id receipts (`Run <runId>` for one test, `[i/N] <testId> → run <runId>` for a batch); `Dashboard: <url>` follows when supplied. Preserve each id even if
-  the wait later stops; stdout remains the normal JSON result channel.
+- Keep the ids the run prints. A run is one launch (`runId`); each test in it has a
+  result (`resultId`). A project or named launch prints `Run <run-id>` on **stderr** at
+  once, and so does a saved list (`--testlist`) under `--wait`; the card on stdout lists
+  each run (`Run <run-id>`) with its results and, when the server supplies one, a
+  `Dashboard: <url>` line (that run's page in the Portal).
+  Parse `runs[].runId`, `results[].resultId` and the outcome counts in `summary` for
+  any selection or resumed wait. `partial: true` marks an incomplete timeout or
+  interruption. A completed failure can be inspected immediately with `result get`.
 - An **owned** local run requests cancellation by default when waiting stops (timeout,
   Ctrl-C, or a polling failure), then its tunnel closes. Read the reported
-  cancellation outcome. For a V3 frontend run cancelled before a terminal verdict,
+  cancellation outcome. For a frontend run cancelled before a terminal verdict,
   the backend attempts a refund. Inspect `refund.status`; cancellation does not
   guarantee a refund.
   `--no-cancel-on-interrupt` detaches instead, but the owned tunnel still closes.
@@ -447,58 +291,39 @@ Key behaviors:
   A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
 - Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout
   or unsupported. An owned local timeout is inconclusive: start a **new**
-  `testsprite test run <test-id> --local <port> --timeout 1800`, keeping the same
-  `--local-host <host>` if used; do not suggest `test wait` for that closed tunnel. Resume **ordinary or adopted-tunnel**
-  waits with `testsprite test wait <run-id>` only while the target is reachable
+  `testsprite run <test-id> --local <port> --timeout 1800`, keeping the same
+  `--local-host <host>` if used; do not suggest `run wait` for that closed tunnel. Resume **ordinary or adopted-tunnel**
+  waits with `testsprite run wait <run-id>` only while the target is reachable
   (and the adopted tunnel's owner remains alive).
 - Exit `13` (`FEATURE_GATED`) and exit `12` (`INSUFFICIENT_CREDITS`) are not retriable: show the user the server's message and the link from `nextAction` or JSON `links`, then stop.
-- A local environment has a loopback URL and needs `--local <port>` from that
-  machine. A bare CLI run selecting it, explicitly or as Default, is refused
-  before dispatch without charge (`tunnel-required`, exit 6). The Portal shows
+- When `run` selects a saved loopback environment by name or as Default, run
+  it on the machine hosting the app. The CLI opens a tunnel and waits. An
+  explicit `--no-wait` suppresses automatic tunneling. Without a live tunnel
+  the server refuses dispatch (`tunnel-required`, exit 6). The Portal shows
   local environments but offers no Run; backend Portal requests are refused
-  without charge. Schedules and test lists targeting them get a free BLOCKED
-  result. A deployed environment selected with `--env <name>` or made Default
-  runs normally even if the test ran through a tunnel before. V3 local runs use
+  without charge. A CLI test-list launch can tunnel to its pinned local
+  environment. Scheduled runs cannot start a tunnel on your machine. A deployed environment selected with `--env <name>` or made Default
+  runs normally even if the test ran through a tunnel before. Local runs use
   the agent path, never saved-code replay, and preserve the test's saved code.
-- Batch: `create-batch --run --wait` creates the tests (FE-only) and fans
-  out triggers in one call (bounded by `--max-concurrency`), emitting
-  `{ results: [...] }` that mirrors the single-test `test run --wait`
-  envelope. Exit `0` if every run passed; `1` for any failed/blocked/
-  cancelled or trigger error; `7` only when EVERY run timed out. Drop
-  `--run` if you want to inspect the created tests before triggering.
-- Run-trigger rate limit is 60/min/key, server-enforced; the CLI self-throttles
-  to 50/min. `--max-concurrency` (default 50) does NOT raise the server cap —
-  excess triggers return `RATE_LIMITED` (per-spec in batch JSON; exit 11 for
-  single `test run`). The test row stays created, the run never started. A full
-  `create-batch` (≤50 specs) fires all at once under the cap. The 50/min throttle
-  is per-invocation — separate batches/processes don't share it — so for >50 specs
-  in a minute you lean on the server's 60/min cap + `RATE_LIMITED` retries, not
-  client queuing. Re-list and check `draft` rows — "tests created" is
-  not the same as "runs triggered".
-- **Backend execution is dependency-aware; frontend is not.** `test run --all
---project <id>` triggers a fresh wave-ordered batch over the project's backend
-  tests (producers → consumers → `teardown` last); FE tests in the project are
-  skipped with an advisory, and everything not dispatched is enumerated
-  (`conflicts` / `deferred` / `skippedFrontend`) so don't count `accepted[]`
-  alone. A big batch is accepted whole and its runs show `queued` until they
+- Run-trigger rate limit is 60/min/key, server-enforced; excess triggers return
+  `RATE_LIMITED` (exit 11 for a single `run`).
+- **Backend execution is dependency-aware; frontend is not.** `run
+--project <id>` triggers a fresh batch over every test in the project: backend
+  tests in wave order (producers → consumers → `teardown` last), frontend tests
+  alongside. Check dispatch diagnostics and `summary.skipped` for tests that did not start. A big batch is accepted whole and its tests show `queued` until they
   start; `deferred` is rare (a project's lock stayed busy, or a test went in
   flight during dispatch) and is never resent (exit 7). A BE run expands the
-  producer/teardown closure by default; failed
-  members surface as `closureFailures[]` without flipping the exit
-  code. Pass `--skip-dependencies` only when this round already verified the
-  producers and you're iterating fast on one script.
-- `test code put`: `--expected-version <codeVersion>` is optional (the CLI
-  fetches the current version, which races with concurrent edits); stale etag → exit 6,
-  re-fetch via
-  `test get <id>` and retry. `--force` bypasses but is audit-logged.
+  producer/teardown closure by default. Pass `--skip-dependencies` (`run <test-id> --skip-dependencies`)
+  only when this round already verified the producers.
 - Idempotency: the CLI auto-mints an `Idempotency-Key`; replays within 24h return
-  the original test/run.
+  the original run.
 
 ## 4a. Read the result — plan, or product?
 
-Don't take the verdict at face value. After a run, pull the steps
-(`testsprite test steps <test-id> --output json`) and ask: **plan quality, or
-actual product behavior?**
+Don't take the verdict at face value. After a run, read the result
+(`testsprite result get <result-id> --output json`: `error`, `cause`, `fix`,
+`failedStep` and every step; a backend test adds its traceback `trace` and its
+output `apiOutput`) and ask: **plan quality, or actual product behavior?**
 
 The plan is the problem (most common — check first) when:
 
@@ -513,11 +338,10 @@ The product/environment is the problem (believe these) when:
   read-only", "page 404s");
 - the trace blames infra (deploy lag, auth gate, missing fixture).
 
-`test steps <test-id>` shows the **latest run's steps**. For the run you are
-verifying, use `testsprite test steps <test-id> --run-id <run-id> --output json`
-with the id from the early stderr receipt. An empty latest run is not evidence
-from an earlier run; use `test result <test-id> --history` to choose one explicitly.
-Older backends may return cumulative bare steps; pin `--run-id` before counting.
+Read the result of the run you are verifying, by the `resultId` that run printed.
+`testsprite result list --run <run-id> --status failed,blocked` lists what did not
+pass in a run; `testsprite result list --test <test-id> --limit 5` lists a test's
+recent results, newest first. A result of an earlier run is not evidence for this one.
 
 **Read the testing agent's failure summary skeptically — it can conflate two
 failure phases.** When a flow produces an artifact that then runs against an external
@@ -528,26 +352,34 @@ and runtime output: if the runtime output references a literal you submitted
 earlier in the plan, the action succeeded and the error is runtime-phase.
 
 **BE closure runs: root-cause the earliest failed wave, not the selected test.**
-When a `run` or `run --all` expanded a dependency closure and a **producer**
+When `run` expanded a dependency closure and a **producer**
 failed, every consumer downstream of it fails or blocks by starvation (missing
 token / missing fixture). The selected test's red verdict does not implicate
-your feature — report it as failed-downstream, pull the producer's artifact
+your feature — report it as failed-downstream, read the producer's result
 first, and only blame the consumer once its producers pass in the same run.
 
-If it's the plan: tighten via `test plan put` and re-run **once** (two runs total),
-then stop. Don't grind. If it's the product/env: report the verdict with the
+If it's the plan: tell the agent what is wrong with it (§3c), apply its fix and
+re-run **once** (two runs total), then stop. Don't grind. If it's the product/env: report the verdict with the
 testing agent's observation; don't auto-fix on the recommendation alone. If you
 genuinely can't tell: report `inconclusive` with the signal that triggered the
 call and ask.
 
-## 5. On failure → download the artifact
+## 5. On failure → download the evidence
 
 ```bash
-testsprite test artifact get <run-id> --out ./.testsprite/runs/<run-id>/
+testsprite result get <result-id> --out .testsprite/results/<result-id>
+testsprite result get <result-id> --out .testsprite/results/<result-id> --failed-only  # failed step ±1
 ```
 
-Inspect the failure bundle (result, failed step + neighbors, video, root-cause
-hypothesis, recommended fix target) before deciding whether your change caused it.
+It writes `result.json` (the result, each link replaced by its file), the video and
+each step's `steps/001.png` / `steps/001.html`. Give each result its own directory:
+in an existing one, `result.json`, `video.*`, `steps/` and `sign-in/` are replaced.
+Read `cause`, `fix` and the failed step in `result.json` first. Raw HTML
+snapshots may contain credentials in form values. Use the neighboring screenshots
+and the video for visual context. Keep the export private and
+use a redacted excerpt when sharing evidence. The CLI creates
+`.testsprite/.gitignore` on first export there and preserves existing rules.
+Check Git's ignore rules when using a custom output directory.
 
 ## 6. Report
 
@@ -558,8 +390,9 @@ When you tell the user the feature is done, include:
 - The verdict. Don't report `passed` if §4a's sanity check tripped — surface as
   `inconclusive` with the specific signal.
 - If the user wants to inspect a test or run themselves, point them at the
-  dashboard link from the CLI output (`dashboardUrl` in JSON; a `Dashboard:` line
-  in text mode) — `test create` and `--wait` terminal output carry one.
-- If failed, a one-line summary of the bundle's root-cause hypothesis and
-  recommended fix target. **Don't auto-fix** on that alone — the recommendation
+  dashboard link from the CLI output (`runs[].dashboardUrl` in JSON; a `Dashboard:` line
+  under each run in text mode) — `run`, `run --wait` and `run wait` all carry one when
+  the server supplies it (a saved list launched without `--wait` has none until
+  `run wait`). It opens that run's page in the Portal.
+- If failed, a one-line summary of the result's `cause` and `fix`. **Don't auto-fix** on that alone — the recommendation
   can be wrong; the human should look.

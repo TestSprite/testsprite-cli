@@ -1,26 +1,24 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
 import { terminalWidth } from '../lib/ticker.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
   type CliProject,
-  type CliCreateProjectResponse,
   type CliDeleteProjectResponse,
   type CliUpdateProjectResponse,
   createProjectCommand,
   renderProjectListText,
-  runAutoAuth,
   runCreate,
-  runCredential,
   runDelete,
   runGet,
   runList,
   runUpdate,
   parseTestIdAttributesFlag,
 } from './project.js';
+import { onFakeTimers } from '../../test/helpers/fake-timers.js';
 
 const PROJECT_FIXTURE: CliProject = {
   id: 'project_b3c91efa',
@@ -83,18 +81,7 @@ describe('createProjectCommand', () => {
   it('exposes project subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
-    expect(names).toEqual([
-      'auto-auth',
-      'create',
-      'credential',
-      'delete',
-      'docs',
-      'env',
-      'get',
-      'list',
-      'sign-in',
-      'update',
-    ]);
+    expect(names).toEqual(['create', 'delete', 'env', 'get', 'list', 'update']);
   });
 
   it('list exposes the pagination flags from the design contract', () => {
@@ -624,7 +611,22 @@ describe('runGet — org attribution', () => {
   });
 });
 
-describe('project update no longer accepts the dead --description flag', () => {
+describe('the environment flags are gone from project create and update', () => {
+  it.each([
+    ['create', ['--type', 'frontend', '--name', 'Shop', '--url', 'https://shop.example.com']],
+    ['create', ['--type', 'frontend', '--name', 'Shop', '--local', '3000']],
+    ['create', ['--type', 'frontend', '--name', 'Shop', '--description', 'x']],
+    ['update', ['proj_x', '--url', 'https://shop.example.com']],
+    ['update', ['proj_x', '--username', 'qa', '--password-file', '/tmp/pw']],
+  ])('%s %j is an unknown option', async (name, args) => {
+    const project = createProjectCommand();
+    project.exitOverride();
+    project.commands.find(c => c.name() === name)!.exitOverride();
+    await expect(project.parseAsync([name, ...args], { from: 'user' })).rejects.toThrow(
+      /unknown option/i,
+    );
+  });
+
   it('rejects --description on `project update` as an unknown option', async () => {
     const project = createProjectCommand();
     const update = project.commands.find(c => c.name() === 'update')!;
@@ -690,7 +692,7 @@ describe('project read response validation', () => {
   it.each([
     ['missing name', { ...PROJECT_FIXTURE, name: undefined }],
     ['invalid attribute list', { ...PROJECT_FIXTURE, testIdAttributes: 'data-testid' }],
-    ['invalid nullable URL', { ...PROJECT_FIXTURE, targetUrl: false }],
+    ['invalid instruction', { ...PROJECT_FIXTURE, instruction: { text: 'Unexpected shape' } }],
   ])('rejects %s before printing a successful result', async (_label, body) => {
     const out: string[] = [];
     await expect(
@@ -742,7 +744,6 @@ describe('project read response validation', () => {
   it.each([
     ['defaultEnvironment', { defaultEnvironment: {} }],
     ['environmentCount', { environmentCount: 'x' }],
-    ['originMode', { originMode: 1 }],
   ])('rejects a wrong-typed %s before the text renderer runs', async (_field, patch) => {
     const out: string[] = [];
     await expect(
@@ -793,6 +794,33 @@ describe('project read response validation', () => {
 });
 
 describe('runGet', () => {
+  it('shows the saved project instruction as indented text and returns the original value in JSON', async () => {
+    const instruction = 'Use the guest environment.\n\u001b[31mStop on a challenge.\u001b[0m';
+    const options = { profile: 'default', debug: false, projectId: PROJECT_FIXTURE.id };
+    const out: string[] = [];
+    const deps = {
+      ...makeCreds(),
+      fetchImpl: makeFetch(() => ({ body: { ...PROJECT_FIXTURE, instruction } })),
+      stdout: (line: string) => out.push(line),
+    };
+    await runGet({ ...options, output: 'text' }, deps);
+    expect(out[0]).toContain('instruction:\n  Use the guest environment.\n  Stop on a challenge.');
+    await runGet({ ...options, output: 'json' }, deps);
+    expect(JSON.parse(out[1]!).instruction).toBe(instruction);
+  });
+
+  it('distinguishes an unset instruction from an older server that omits the field', async () => {
+    const out: string[] = [];
+    for (const body of [{ ...PROJECT_FIXTURE, instruction: null }, PROJECT_FIXTURE]) {
+      await runGet(
+        { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+        { ...makeCreds(), fetchImpl: makeFetch(() => ({ body })), stdout: line => out.push(line) },
+      );
+    }
+    expect(out[0]).toContain('instruction: (not set)');
+    expect(out[1]).not.toContain('instruction:');
+  });
+
   it('get shows default environment and count', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({
@@ -937,42 +965,10 @@ describe('runGet', () => {
     expect(block).toContain('createdFrom: portal');
   });
 
-  it('renders a configured targetUrl', async () => {
+  it('ignores the targetUrl and originMode fields an older backend still sends', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({
-      body: { ...PROJECT_FIXTURE, targetUrl: 'https://staging.example.com' },
-    }));
-    const out: string[] = [];
-    await runGet(
-      { profile: 'default', output: 'text', debug: false, projectId: 'project_b3c91efa' },
-      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
-    );
-    expect(out.join('\n')).toContain('targetUrl:   https://staging.example.com');
-  });
-
-  it('renders an explicit null targetUrl as "(not set)" with the fix-it command', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: { ...PROJECT_FIXTURE, targetUrl: null } }));
-    const out: string[] = [];
-    await runGet(
-      { profile: 'default', output: 'text', debug: false, projectId: 'project_b3c91efa' },
-      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
-    );
-    const block = out.join('\n');
-    expect(block).toContain('targetUrl:   (not set');
-    expect(block).toContain('testsprite project update project_b3c91efa --url <url>');
-  });
-
-  it('offers the same fix-it for a BACKEND project with a null targetUrl (the V3 case, where it works)', async () => {
-    // A null on a backend project only ever comes from V3, where the default
-    // environment URL is real, settable, and exactly what the run guard checks —
-    // so the `--url` remedy is correct there. V2 never sends null for a backend
-    // project (it omits the key, because a V2 backend run resolves no project URL
-    // and the remedy would change nothing) — which is why this renderer can print
-    // one message for `null` without asking which execution path it came from.
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      body: { ...PROJECT_FIXTURE, type: 'backend', targetUrl: null },
+      body: { ...PROJECT_FIXTURE, targetUrl: 'http://localhost:3000', originMode: 'local' },
     }));
     const out: string[] = [];
     await runGet(
@@ -980,25 +976,9 @@ describe('runGet', () => {
       { credentialsPath, fetchImpl, stdout: line => out.push(line) },
     );
     const block = out.join('\n');
-    expect(block).toContain('type:        backend');
-    expect(block).toContain('testsprite project update project_b3c91efa --url <url>');
-  });
-
-  // NOTE: a guard, not a proof — this assertion also holds on the pre-change
-  // renderer (which had no targetUrl line at all). It exists so a future edit
-  // cannot switch the presence check to a truthiness check without going red.
-  it('says nothing about targetUrl when the backend omits the field (older backend, or `project list`)', async () => {
-    const { credentialsPath } = makeCreds();
-    // PROJECT_FIXTURE deliberately has no targetUrl key — an absent field must
-    // NOT render as "(not set)", or every project on a pre-field backend reads
-    // as URL-less, including the ones that have a URL.
-    const fetchImpl = makeFetch(() => ({ body: PROJECT_FIXTURE }));
-    const out: string[] = [];
-    await runGet(
-      { profile: 'default', output: 'text', debug: false, projectId: 'project_b3c91efa' },
-      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
-    );
-    expect(out.join('\n')).not.toContain('targetUrl');
+    expect(block).toContain('id:');
+    expect(block).not.toContain('targetUrl');
+    expect(block).not.toContain('(Local)');
   });
 
   it('NOT_FOUND envelope from server propagates as ApiError exit 4', async () => {
@@ -1046,60 +1026,6 @@ describe('runGet', () => {
 // ---------------------------------------------------------------------------
 
 describe('runCreate', () => {
-  it.each(['http://localhost:3123', 'http://127.0.0.1:5173', 'http://[::1]:5173'])(
-    'accepts %s as --url and previews the existing local marker',
-    async targetUrl => {
-      const result = await runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: true,
-          type: 'frontend',
-          name: 'Local App',
-          targetUrl,
-        },
-        { stdout: () => {}, stderr: () => {} },
-      );
-      expect(result).toMatchObject({ targetUrl, originMode: 'local' });
-    },
-  );
-
-  it('names --url and project create help when rejecting a private-network project URL', async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network — validation must fire client-side');
-    });
-
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: true,
-          type: 'frontend',
-          name: 'Local App',
-          targetUrl: 'http://10.0.0.5:3123',
-        },
-        {
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      nextAction: expect.stringContaining('See `testsprite project create --help`'),
-      details: {
-        field: 'url',
-        reason: expect.any(String),
-        hint: expect.any(String),
-      },
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
   it('P6 FE happy — POSTs /projects with type=frontend + name + idempotency header', async () => {
     const { credentialsPath } = makeCreds();
     const sentBodies: unknown[] = [];
@@ -1134,7 +1060,6 @@ describe('runCreate', () => {
         debug: false,
         type: 'frontend',
         name: 'My FE App',
-        targetUrl: 'https://example.com',
         idempotencyKey: 'idem-fe-001',
       },
       {
@@ -1200,7 +1125,6 @@ describe('runCreate', () => {
         dryRun: true,
         type: 'frontend',
         name: 'DryRun Project',
-        targetUrl: 'https://example.com',
       },
       {
         credentialsPath,
@@ -1233,7 +1157,6 @@ describe('runCreate', () => {
         debug: false,
         type: 'frontend',
         name: 'Text Mode',
-        targetUrl: 'https://example.com',
       },
       { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
     );
@@ -1241,32 +1164,6 @@ describe('runCreate', () => {
     expect(block).toContain('id:');
     expect(block).toContain('name:');
     expect(block).toContain('type:');
-  });
-
-  it('P6 — frontend without --url rejects with VALIDATION_ERROR (exit 5)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network — validation must fire client-side');
-    });
-
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          type: 'frontend',
-          name: 'No URL Project',
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
-    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('rejects a whitespace-only --name with VALIDATION_ERROR (exit 5), no network', async () => {
@@ -1283,7 +1180,6 @@ describe('runCreate', () => {
           debug: false,
           type: 'frontend',
           name: '   ',
-          targetUrl: 'https://example.com',
         },
         {
           credentialsPath,
@@ -1294,267 +1190,6 @@ describe('runCreate', () => {
       ),
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
-  });
-  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network - validation must fire client-side');
-    });
-
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          type: 'frontend',
-          name: 'Password Guard Project',
-          targetUrl: 'https://example.com',
-          password: '   ',
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('keeps inline password precedence on real and dry-run paths', async () => {
-    const { credentialsPath } = makeCreds();
-    for (const dryRun of [false, true]) {
-      const bodies: unknown[] = [];
-      const stderr: string[] = [];
-      await runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun,
-          type: 'frontend' as const,
-          name: 'Project',
-          targetUrl: 'https://example.com',
-          password: 'inline-secret',
-          passwordFile: '/missing-file-must-not-be-read',
-        },
-        {
-          credentialsPath,
-          fetchImpl: makeFetch((_url, init) => {
-            bodies.push(JSON.parse(String(init.body)));
-            return {
-              body: { ...PROJECT_FIXTURE, projectId: 'proj_abc', updatedFields: ['password'] },
-            };
-          }),
-          stdout: () => {},
-          stderr: line => stderr.push(line),
-        },
-      );
-      expect(bodies).toHaveLength(dryRun ? 0 : 1);
-      if (!dryRun) expect(bodies[0]).toMatchObject({ password: 'inline-secret' });
-      expect(stderr.filter(line => line.startsWith('Warning:'))).toEqual([
-        'Warning: --password takes precedence; --password-file was ignored.',
-      ]);
-    }
-  });
-
-  it('rejects --description with VALIDATION_ERROR (exit 5), no network — projects have no description', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network — validation must fire client-side');
-    });
-
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          type: 'frontend',
-          name: 'Desc Project',
-          targetUrl: 'https://example.com',
-          description: 'a human description',
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  describe('backend project without --url — dead-on-arrival advisory (dogfood 2026-07-30)', () => {
-    it('emits [advisory] on stderr naming no-target-resolvable + the copy-pasteable fix, with the real created project id', async () => {
-      const { credentialsPath } = makeCreds();
-      const createdProject: CliProject = {
-        ...PROJECT_FIXTURE,
-        id: 'proj_be_nourl',
-        type: 'backend',
-        name: 'No URL BE',
-      };
-      const fetchImpl = makeFetch(() => ({ body: createdProject }));
-      const stderrLines: string[] = [];
-
-      await runCreate(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          type: 'backend',
-          name: 'No URL BE',
-        },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
-      );
-
-      const advisory = stderrLines.find(l => l.includes('[advisory]'));
-      expect(advisory).toBeDefined();
-      expect(advisory).toContain('no-target-resolvable');
-      expect(advisory).toContain('testsprite project update proj_be_nourl --url <url>');
-      // The guard that produces no-target-resolvable only applies on the V3
-      // execution path (V2 backend runs never resolve a project URL at all),
-      // so the claim must be scoped, not stated as universal — and it must
-      // point the reader at how to check which path they're on.
-      expect(advisory).toContain('V3');
-      expect(advisory).toContain('auth status');
-    });
-
-    it('does NOT emit the advisory when --url is supplied for a backend project', async () => {
-      const { credentialsPath } = makeCreds();
-      const createdProject: CliProject = {
-        ...PROJECT_FIXTURE,
-        id: 'proj_be_withurl',
-        type: 'backend',
-        name: 'With URL BE',
-      };
-      const fetchImpl = makeFetch(() => ({ body: createdProject }));
-      const stderrLines: string[] = [];
-
-      await runCreate(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          type: 'backend',
-          name: 'With URL BE',
-          targetUrl: 'https://staging.example.com',
-        },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
-      );
-
-      expect(
-        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
-      ).toBe(false);
-    });
-
-    it('does NOT emit the advisory for a frontend project (--url is already required there)', async () => {
-      const { credentialsPath } = makeCreds();
-      const createdProject: CliProject = {
-        ...PROJECT_FIXTURE,
-        id: 'proj_fe',
-        type: 'frontend',
-        name: 'FE Project',
-      };
-      const fetchImpl = makeFetch(() => ({ body: createdProject }));
-      const stderrLines: string[] = [];
-
-      await runCreate(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          type: 'frontend',
-          name: 'FE Project',
-          targetUrl: 'https://staging.example.com',
-        },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
-      );
-
-      expect(
-        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
-      ).toBe(false);
-    });
-
-    it('emits the advisory to stderr in --output json mode too, while stdout stays valid parseable JSON with no advisory text', async () => {
-      // The advisory goes to stderr, which no output mode ever routes into
-      // stdout — there is nothing for a --output json gate to protect, and
-      // --output json is exactly the non-interactive/agent/CI case where a
-      // silent dead-on-arrival project is most costly (nobody is watching a
-      // terminal for a warning that never fires).
-      const { credentialsPath } = makeCreds();
-      const createdProject: CliProject = {
-        ...PROJECT_FIXTURE,
-        id: 'proj_be_json',
-        type: 'backend',
-        name: 'JSON BE',
-      };
-      const fetchImpl = makeFetch(() => ({ body: createdProject }));
-      const stderrLines: string[] = [];
-      const stdoutLines: string[] = [];
-
-      const result = await runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          type: 'backend',
-          name: 'JSON BE',
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => stdoutLines.push(line),
-          stderr: line => stderrLines.push(line),
-        },
-      );
-
-      expect(result.type).toBe('backend');
-      expect(
-        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
-      ).toBe(true);
-
-      // Pipeline-contract assertion: stdout is still exactly one valid,
-      // parseable JSON payload — the advisory never leaks into it.
-      expect(stdoutLines).toHaveLength(1);
-      const parsed: unknown = JSON.parse(stdoutLines[0]!);
-      expect((parsed as CliCreateProjectResponse).type).toBe('backend');
-      expect(stdoutLines[0]).not.toContain('[advisory]');
-    });
-
-    it('does NOT emit the advisory under --dry-run (the remedy would embed the fake dry-run project id)', async () => {
-      resetDryRunBannerForTesting();
-      const { credentialsPath } = makeCreds();
-      const fetchImpl = vi.fn(async () => {
-        throw new Error('should not hit network in dry-run');
-      });
-      const stderrLines: string[] = [];
-
-      await runCreate(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: true,
-          type: 'backend',
-          name: 'DryRun BE No URL',
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: line => stderrLines.push(line),
-        },
-      );
-
-      expect(fetchImpl).not.toHaveBeenCalled();
-      expect(
-        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
-      ).toBe(false);
-    });
   });
 
   describe('id-field normalization', () => {
@@ -1577,7 +1212,6 @@ describe('runCreate', () => {
           debug: false,
           type: 'frontend',
           name: 'Live Shape Project',
-          targetUrl: 'https://example.com',
         },
         { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
       );
@@ -1601,7 +1235,6 @@ describe('runCreate', () => {
           debug: false,
           type: 'frontend',
           name: 'Legacy Shape Project',
-          targetUrl: 'https://example.com',
         },
         { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
       );
@@ -1621,7 +1254,6 @@ describe('runCreate', () => {
           dryRun: true,
           type: 'frontend',
           name: 'DryRun Shape Project',
-          targetUrl: 'https://example.com',
         },
         { credentialsPath, stdout: () => {}, stderr: () => {} },
       );
@@ -1638,134 +1270,6 @@ describe('runCreate', () => {
 // ---------------------------------------------------------------------------
 
 describe('runUpdate', () => {
-  it('preserves a missing-default conflict after the compatible retry', async () => {
-    const { credentialsPath } = makeCreds();
-    let requests = 0;
-    const nextAction = 'Run testsprite project env set-default proj_abc staging';
-    const error = await runUpdate(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'proj_abc',
-        targetUrl: 'https://new.example.com',
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => {
-          requests += 1;
-          return {
-            status: 409,
-            body: {
-              error: {
-                code: 'CONFLICT',
-                message: 'Default environment unavailable',
-                nextAction,
-                requestId: 'req_conflict',
-                details: { reason: 'default-environment-unavailable' },
-              },
-            },
-          };
-        }),
-        stdout: () => {},
-        stderr: () => {},
-      },
-    ).catch(e => e as ApiError);
-    expect(requests).toBe(2);
-    expect(error).toMatchObject({
-      code: 'CONFLICT',
-      exitCode: 6,
-      nextAction,
-      details: { reason: 'default-environment-unavailable' },
-    });
-  });
-
-  it('project update prints the updated default environment', async () => {
-    const { credentialsPath } = makeCreds();
-    const output: string[] = [];
-    await runUpdate(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        projectId: 'proj_abc',
-        targetUrl: 'https://new.example.com',
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({
-          body: {
-            projectId: 'proj_abc',
-            updatedFields: ['targetUrl'],
-            environment: { name: 'staging', isDefault: true },
-            effects: ['environment.url', 'project.name'],
-          },
-        })),
-        stdout: line => output.push(line),
-        stderr: () => {},
-      },
-    );
-    expect(output.join('\n')).toContain('environment: staging (default)');
-    expect(output.join('\n')).toContain('Environment URL updated');
-    expect(output.join('\n')).toContain('Project name updated');
-  });
-
-  it('project update never prints the password', async () => {
-    const { credentialsPath } = makeCreds();
-    const output: string[] = [];
-    await runUpdate(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        projectId: 'proj_abc',
-        password: 'sensitive-password',
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({
-          body: {
-            projectId: 'proj_abc',
-            environment: { name: 'staging', isDefault: true, password: 'sensitive-password' },
-            effects: ['environment.credentials'],
-          },
-        })),
-        stdout: line => output.push(line),
-        stderr: () => {},
-      },
-    );
-    expect(output.join('\n')).toContain('Environment credentials updated');
-    expect(output.join('\n')).not.toContain('sensitive-password');
-  });
-
-  it('project update keeps old output for older servers', async () => {
-    const { credentialsPath } = makeCreds();
-    const output: string[] = [];
-    await runUpdate(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        projectId: 'proj_abc',
-        targetUrl: 'https://new.example.com',
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch(() => ({
-          body: {
-            projectId: 'proj_abc',
-            updatedFields: ['targetUrl'],
-            updatedAt: '2026-05-16T10:00:00.000Z',
-          },
-        })),
-        stdout: line => output.push(line),
-        stderr: () => {},
-      },
-    );
-    expect(output.join('\n')).toBe(
-      'id:            proj_abc\nupdatedFields: targetUrl\nupdatedAt:     2026-05-16T10:00:00.000Z',
-    );
-  });
   it('P7 happy — PATCHes /projects/{id} with the updated fields', async () => {
     const { credentialsPath } = makeCreds();
     const updateResponse: CliUpdateProjectResponse = {
@@ -1962,66 +1466,6 @@ describe('runUpdate', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not be called');
-    });
-    await expect(
-      runUpdate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'proj_abc',
-          password: '   ',
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('keeps inline password precedence on real and dry-run paths', async () => {
-    const { credentialsPath } = makeCreds();
-    for (const dryRun of [false, true]) {
-      const bodies: unknown[] = [];
-      const stderr: string[] = [];
-      await runUpdate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun,
-          projectId: 'proj_abc',
-          password: 'inline-secret',
-          passwordFile: '/missing-file-must-not-be-read',
-        },
-        {
-          credentialsPath,
-          fetchImpl: makeFetch((_url, init) => {
-            bodies.push(JSON.parse(String(init.body)));
-            return {
-              body: { ...PROJECT_FIXTURE, projectId: 'proj_abc', updatedFields: ['password'] },
-            };
-          }),
-          stdout: () => {},
-          stderr: line => stderr.push(line),
-        },
-      );
-      expect(bodies).toHaveLength(dryRun ? 0 : 1);
-      if (!dryRun) expect(bodies[0]).toMatchObject({ password: 'inline-secret' });
-      expect(stderr.filter(line => line.startsWith('Warning:'))).toEqual([
-        'Warning: --password takes precedence; --password-file was ignored.',
-      ]);
-    }
-  });
-
   it('P7 — dry-run returns canned shape without network call', async () => {
     resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
@@ -2051,39 +1495,6 @@ describe('runUpdate', () => {
     expect(result.updatedFields).toContain('name');
     // The canned sample must carry the "not from the server" banner.
     expect(err).toContain(DRY_RUN_BANNER);
-  });
-
-  it('P7 — dry-run with --password-file does not read the filesystem', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network');
-    });
-    const nofileDir = mkdtempSync(join(tmpdir(), 'cli-p2-nofile-'));
-    let result: Awaited<ReturnType<typeof runUpdate>>;
-    try {
-      result = await runUpdate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          dryRun: true,
-          projectId: 'proj_dry',
-          passwordFile: join(nofileDir, 'definitely-not-here-testsprite'),
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      );
-    } finally {
-      rmSync(nofileDir, { recursive: true, force: true });
-    }
-
-    expect(fetchImpl).not.toHaveBeenCalled();
-    expect(result.id).toBe('proj_dry');
-    expect(result.updatedFields).toContain('password');
   });
 
   it('P7 — renders text mode with updatedFields and updatedAt', async () => {
@@ -2238,127 +1649,6 @@ describe('runUpdate', () => {
   });
 });
 
-describe('#79 — an unreadable --password-file is a validation error, not a crash', () => {
-  const missingDir = mkdtempSync(join(tmpdir(), 'cli-p79-nofile-'));
-  const missing = join(missingDir, 'testsprite-issue-79-absent-password-file');
-  afterAll(() => {
-    rmSync(missingDir, { recursive: true, force: true });
-  });
-
-  it('runCreate rejects a missing file with VALIDATION_ERROR (exit 5) before the network', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network');
-    });
-
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          type: 'backend',
-          name: 'Guarded',
-          passwordFile: missing,
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('runUpdate rejects a missing file with VALIDATION_ERROR (exit 5) before the network', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not hit network');
-    });
-
-    await expect(
-      runUpdate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'proj_guarded',
-          passwordFile: missing,
-        },
-        {
-          credentialsPath,
-          fetchImpl: fetchImpl as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('names the flag in nextAction instead of leaking a raw ENOENT', async () => {
-    const { credentialsPath } = makeCreds();
-
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          type: 'backend',
-          name: 'Guarded',
-          passwordFile: missing,
-        },
-        {
-          credentialsPath,
-          fetchImpl: (async () => {
-            throw new Error('should not hit network');
-          }) as unknown as typeof fetch,
-          stdout: () => {},
-          stderr: () => {},
-        },
-      ),
-    ).rejects.toMatchObject({
-      nextAction: expect.stringContaining('--password-file') as unknown as string,
-    });
-  });
-
-  it('still reads a password file that exists', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-p79-'));
-    const passwordFile = join(dir, 'pw.txt');
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
-    writeFileSync(passwordFile, 'from-file\n');
-
-    const sentBodies: unknown[] = [];
-    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
-      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
-      return new Response(JSON.stringify({ ...PROJECT_FIXTURE, id: 'proj_pw' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }) as typeof fetch;
-
-    await runCreate(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        type: 'backend',
-        name: 'Guarded',
-        passwordFile,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-
-    expect((sentBodies[0] as Record<string, unknown>).password).toBe('from-file');
-  });
-});
-
 describe('runDelete', () => {
   it('refuses without --confirm and never hits the network (exit 5)', async () => {
     const { credentialsPath } = makeCreds();
@@ -2493,227 +1783,7 @@ describe('runDelete', () => {
   });
 });
 
-describe('runCredential', () => {
-  interface Captured {
-    url: string;
-    method: string;
-    body: unknown;
-    headers: Headers;
-  }
-  function captureFetch(captured: Captured[], body: unknown) {
-    return makeFetch((url, init) => {
-      captured.push({
-        url,
-        method: init.method ?? 'GET',
-        body: init.body ? JSON.parse(init.body as string) : undefined,
-        headers: new Headers(init.headers as Record<string, string>),
-      });
-      return { status: 200, body };
-    });
-  }
-
-  it('PUTs /projects/:id/credential with authType + credential + idempotency-key', async () => {
-    const { credentialsPath } = makeCreds();
-    const captured: Captured[] = [];
-    const fetchImpl = captureFetch(captured, {
-      projectId: 'p1',
-      authType: 'Bearer token',
-      rewroteCount: 2,
-    });
-    const res = await runCredential(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'p1',
-        authType: 'Bearer token',
-        credential: 'tok-123',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    expect(res.rewroteCount).toBe(2);
-    const put = captured.find(c => c.method === 'PUT')!;
-    expect(put.url).toContain('/projects/p1/credential');
-    expect(put.body).toEqual({ authType: 'Bearer token', credential: 'tok-123' });
-    expect(put.headers.get('idempotency-key')).toMatch(/^cli-proj-cred-[0-9a-f-]{36}$/);
-  });
-
-  it('public clears the credential (no credential in body, none required)', async () => {
-    const { credentialsPath } = makeCreds();
-    const captured: Captured[] = [];
-    const fetchImpl = captureFetch(captured, {
-      projectId: 'p1',
-      authType: 'public',
-      rewroteCount: 0,
-    });
-    await runCredential(
-      { profile: 'default', output: 'json', debug: false, projectId: 'p1', authType: 'public' },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    const put = captured.find(c => c.method === 'PUT')!;
-    expect(put.body).toEqual({ authType: 'public' });
-  });
-
-  it('non-public without --credential → VALIDATION_ERROR (exit 5), no fetch', async () => {
-    const { credentialsPath } = makeCreds();
-    let fetched = false;
-    const fetchImpl = makeFetch(() => {
-      fetched = true;
-      return { body: {} };
-    });
-    await expect(
-      runCredential(
-        { profile: 'default', output: 'json', debug: false, projectId: 'p1', authType: 'API key' },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(fetched).toBe(false);
-  });
-
-  it('rejects an unknown --type locally (no fetch)', async () => {
-    const { credentialsPath } = makeCreds();
-    let fetched = false;
-    const fetchImpl = makeFetch(() => {
-      fetched = true;
-      return { body: {} };
-    });
-    await expect(
-      runCredential(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'p1',
-          authType: 'jwt',
-          credential: 'x',
-        },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(fetched).toBe(false);
-  });
-});
-
-describe('runAutoAuth', () => {
-  interface Captured {
-    url: string;
-    method: string;
-    body: Record<string, unknown>;
-    headers: Headers;
-  }
-  function captureFetch(captured: Captured[]) {
-    return makeFetch((url, init) => {
-      captured.push({
-        url,
-        method: init.method ?? 'GET',
-        body: init.body ? JSON.parse(init.body as string) : {},
-        headers: new Headers(init.headers as Record<string, string>),
-      });
-      return {
-        status: 200,
-        body: { projectId: 'p1', enabled: true, method: 'aws_cognito_refresh', inject: 'bearer' },
-      };
-    });
-  }
-
-  it('PUTs /projects/:id/auto-auth with the config body + idempotency-key', async () => {
-    const { credentialsPath } = makeCreds();
-    const captured: Captured[] = [];
-    const fetchImpl = captureFetch(captured);
-    await runAutoAuth(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'p1',
-        method: 'aws_cognito_refresh',
-        inject: 'bearer',
-        region: 'us-east-1',
-        clientId: 'abc',
-        refreshToken: 'rt-xyz',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    const put = captured.find(c => c.method === 'PUT')!;
-    expect(put.url).toContain('/projects/p1/auto-auth');
-    expect(put.body).toEqual({
-      enabled: true,
-      method: 'aws_cognito_refresh',
-      inject: 'bearer',
-      region: 'us-east-1',
-      clientId: 'abc',
-      refreshToken: 'rt-xyz',
-    });
-    expect(put.headers.get('idempotency-key')).toMatch(/^cli-proj-autoauth-[0-9a-f-]{36}$/);
-  });
-
-  it('--disable sends enabled:false', async () => {
-    const { credentialsPath } = makeCreds();
-    const captured: Captured[] = [];
-    const fetchImpl = captureFetch(captured);
-    await runAutoAuth(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'p1',
-        disable: true,
-        method: 'password',
-        inject: 'bearer',
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    expect(captured.find(c => c.method === 'PUT')!.body.enabled).toBe(false);
-  });
-
-  it('reads a secret from --refresh-token-file', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-rt-'));
-    const rtFile = join(dir, 'rt.txt');
-    writeFileSync(rtFile, '  rt-from-file\n');
-    const captured: Captured[] = [];
-    const fetchImpl = captureFetch(captured);
-    await runAutoAuth(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'p1',
-        method: 'refresh_token',
-        inject: 'bearer',
-        tokenEndpoint: 'https://idp.example.com/token',
-        refreshTokenFile: rtFile,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    expect(captured.find(c => c.method === 'PUT')!.body.refreshToken).toBe('rt-from-file');
-  });
-
-  it('rejects an unknown --method / --inject locally (no fetch)', async () => {
-    const { credentialsPath } = makeCreds();
-    let fetched = false;
-    const fetchImpl = makeFetch(() => {
-      fetched = true;
-      return { body: {} };
-    });
-    await expect(
-      runAutoAuth(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'p1',
-          method: 'magic',
-          inject: 'bearer',
-        },
-        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(fetched).toBe(false);
-  });
-});
-
-describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with `test create`)', () => {
+describe('dogfood 2026-06-30 — whitespace-only --name is rejected', () => {
   const noNetwork = () => {
     throw new Error('network should not be hit');
   };
@@ -2755,303 +1825,6 @@ describe('parseTestIdAttributesFlag', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// project update --local <port> — one spelling for "an app on this machine",
-// on update exactly as on create
-// ---------------------------------------------------------------------------
-
-describe('runUpdate — --local <port>', () => {
-  function recording(response: unknown = { projectId: 'proj_abc', updatedFields: ['targetUrl'] }) {
-    const bodies: unknown[] = [];
-    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
-      if (init.body) bodies.push(JSON.parse(init.body as string) as unknown);
-      return new Response(JSON.stringify(response), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }) as typeof fetch;
-    return { bodies, fetchImpl };
-  }
-  const base = { profile: 'default', output: 'json' as const, debug: false, projectId: 'proj_abc' };
-  const quiet = { stdout: () => {}, stderr: () => {} };
-
-  it('builds the loopback URL, probes the port once, and sends the local marker', async () => {
-    const { credentialsPath } = makeCreds();
-    const { bodies, fetchImpl } = recording();
-    const connect = vi.fn(async () => {});
-    await runUpdate(
-      { ...base, local: '3000' },
-      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
-    );
-    expect(connect).toHaveBeenCalledWith('127.0.0.1', 3000, 2000);
-    expect(bodies[0]).toEqual({ targetUrl: 'http://localhost:3000', originMode: 'local' });
-  });
-
-  it('--local-host selects the stored host; --skip-preflight dials nothing', async () => {
-    const { credentialsPath } = makeCreds();
-    const { bodies, fetchImpl } = recording();
-    const connect = vi.fn(async () => {
-      throw new Error('no listener');
-    });
-    await runUpdate(
-      { ...base, local: '3000', localHost: '::1', skipPreflight: true },
-      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
-    );
-    expect(connect).not.toHaveBeenCalled();
-    expect(bodies[0]).toEqual({ targetUrl: 'http://[::1]:3000', originMode: 'local' });
-  });
-
-  it('refuses a dead port before any request, naming the URL and the bypass', async () => {
-    const { credentialsPath } = makeCreds();
-    const { bodies, fetchImpl } = recording();
-    const connect = vi.fn(async () => {
-      throw new Error('ECONNREFUSED');
-    });
-    await expect(
-      runUpdate(
-        { ...base, local: '3000' },
-        { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      message:
-        'Nothing is listening on http://localhost:3000. Start your app first, or pass --skip-preflight.',
-    });
-    expect(bodies).toEqual([]);
-  });
-
-  it.each([
-    [
-      { local: '3000', targetUrl: 'https://example.com' },
-      '--local and --url are mutually exclusive',
-    ],
-    [{ localHost: 'localhost', targetUrl: 'https://example.com' }, '--local-host requires --local'],
-    [{ local: '65536' }, 'must be a port number between 1 and 65535'],
-    [{ local: '3000', localHost: 'example.com' }, 'must name your own machine'],
-  ])('refuses %j before TCP or HTTP', async (flags, explanation) => {
-    const { credentialsPath } = makeCreds();
-    const { bodies, fetchImpl } = recording();
-    const connect = vi.fn(async () => {});
-    const error = await runUpdate(
-      { ...base, ...flags },
-      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
-    ).catch(e => e as ApiError);
-    expect((error as ApiError).code).toBe('VALIDATION_ERROR');
-    expect(`${(error as ApiError).message} ${(error as ApiError).nextAction}`).toContain(
-      explanation,
-    );
-    expect(bodies).toEqual([]);
-    expect(connect).not.toHaveBeenCalled();
-  });
-
-  it('a loopback --url sends the same local marker as shorthand', async () => {
-    const { credentialsPath } = makeCreds();
-    const { bodies, fetchImpl } = recording();
-    await runUpdate(
-      { ...base, targetUrl: 'http://localhost:3000', skipPreflight: true },
-      { credentialsPath, fetchImpl, ...quiet },
-    );
-    expect(bodies).toEqual([{ targetUrl: 'http://localhost:3000', originMode: 'local' }]);
-  });
-
-  it('dry-run validates the flags, dials nothing, and prints the run-it-locally hint', async () => {
-    const { credentialsPath } = makeCreds();
-    const { bodies, fetchImpl } = recording();
-    const connect = vi.fn(async () => {});
-    const out: string[] = [];
-    const res = await runUpdate(
-      { ...base, output: 'text', dryRun: true, local: '3000' },
-      {
-        credentialsPath,
-        fetchImpl,
-        localPortProbeDeps: { connect },
-        stdout: l => out.push(l),
-        stderr: () => {},
-      },
-    );
-    expect(res.updatedFields).toEqual(['targetUrl']);
-    expect(connect).not.toHaveBeenCalled();
-    expect(bodies).toEqual([]);
-    expect(out.join('\n')).toContain('testsprite test run <test-id>');
-  });
-});
-
-describe('#282 — secret --*-file flags are guarded (structured error, exit 5, no raw ENOENT)', () => {
-  const noNetwork = () => {
-    throw new Error('network should not be hit');
-  };
-  const deps = (credentialsPath: string) => ({
-    credentialsPath,
-    fetchImpl: makeFetch(noNetwork),
-    stdout: () => {},
-    stderr: () => {},
-  });
-  const missingPath = () => join(mkdtempSync(join(tmpdir(), 'cli-missing-')), 'no-such-secret.txt');
-
-  it('runCredential --credential-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
-    const { credentialsPath } = makeCreds();
-    await expect(
-      runCredential(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'p1',
-          authType: 'API key',
-          credentialFile: missingPath(),
-        },
-        deps(credentialsPath),
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('runCredential --credential-file pointing at a directory → VALIDATION_ERROR (exit 5)', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-dir-'));
-    await expect(
-      runCredential(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'p1',
-          authType: 'API key',
-          credentialFile: dir,
-        },
-        deps(credentialsPath),
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('runCredential reads a valid --credential-file (trimmed) and sends it', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-ok-'));
-    const credFile = join(dir, 'cred.txt');
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
-    writeFileSync(credFile, '  tok-from-file\n');
-    let sentBody: { credential?: string } | undefined;
-    const fetchImpl = makeFetch((_url, init) => {
-      sentBody = init.body ? JSON.parse(init.body as string) : undefined;
-      return { status: 200, body: { projectId: 'p1', authType: 'API key', rewroteCount: 1 } };
-    });
-    await runCredential(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'p1',
-        authType: 'API key',
-        credentialFile: credFile,
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    // The on-disk fixture is "  tok-from-file\n"; the shared guard trims it.
-    expect(sentBody?.credential).toBe('tok-from-file');
-  });
-
-  it('runAutoAuth --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
-    const { credentialsPath } = makeCreds();
-    await expect(
-      runAutoAuth(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'p1',
-          method: 'password',
-          inject: 'bearer',
-          passwordFile: missingPath(),
-        },
-        deps(credentialsPath),
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('runAutoAuth --client-secret-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
-    const { credentialsPath } = makeCreds();
-    await expect(
-      runAutoAuth(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'p1',
-          method: 'refresh_token',
-          inject: 'bearer',
-          clientSecretFile: missingPath(),
-        },
-        deps(credentialsPath),
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('runAutoAuth --refresh-token-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
-    const { credentialsPath } = makeCreds();
-    await expect(
-      runAutoAuth(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'p1',
-          method: 'refresh_token',
-          inject: 'bearer',
-          refreshTokenFile: missingPath(),
-        },
-        deps(credentialsPath),
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('runAutoAuth --dry-run with missing --password-file skips filesystem (returns sample)', async () => {
-    const { credentialsPath } = makeCreds();
-    let fetched = false;
-    const fetchImpl = makeFetch(() => {
-      fetched = true;
-      return { body: {} };
-    });
-    const result = await runAutoAuth(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        projectId: 'p1',
-        method: 'password',
-        inject: 'bearer',
-        passwordFile: missingPath(),
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    expect(fetched).toBe(false);
-    // Dry-run skips file reads; the sample carries the projectId we passed in.
-    expect(result.projectId).toBe('p1');
-  });
-
-  it('runCredential --dry-run with missing --credential-file skips filesystem (returns sample)', async () => {
-    const { credentialsPath } = makeCreds();
-    let fetched = false;
-    const fetchImpl = makeFetch(() => {
-      fetched = true;
-      return { body: {} };
-    });
-    const result = await runCredential(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        projectId: 'p1',
-        authType: 'API key',
-        credentialFile: missingPath(),
-      },
-      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-    expect(fetched).toBe(false);
-    expect(result).toEqual({ projectId: 'p1', authType: 'API key', rewroteCount: 0 });
-  });
-});
-
 describe('project compatibility contracts', () => {
   it('appends environment columns after the legacy created column', async () => {
     const { credentialsPath } = makeCreds();
@@ -3069,79 +1842,41 @@ describe('project compatibility contracts', () => {
     expect(header.indexOf('CREATED')).toBeLessThan(header.indexOf('DEFAULT ENV'));
   });
 
-  it.each(['create', 'update'] as const)(
-    '%s keeps inline password precedence and warns without reading the file',
-    async operation => {
-      const { credentialsPath } = makeCreds();
-      const bodies: unknown[] = [];
-      const stderr: string[] = [];
-      const deps = {
-        credentialsPath,
-        fetchImpl: makeFetch((_url, init) => {
-          bodies.push(JSON.parse(String(init.body)));
-          return {
-            body:
-              operation === 'create'
-                ? { ...PROJECT_FIXTURE, projectId: PROJECT_FIXTURE.id }
-                : { projectId: PROJECT_FIXTURE.id, updatedFields: ['password'] },
-          };
-        }),
-        stdout: () => {},
-        stderr: (line: string) => stderr.push(line),
-      };
-      const common = {
-        profile: 'default',
-        output: 'json' as const,
-        debug: false,
-        password: 'inline-value',
-        passwordFile: '/file-that-must-not-be-read',
-      };
-      if (operation === 'create')
-        await runCreate(
-          { ...common, type: 'frontend', name: 'Demo', targetUrl: 'https://example.com' },
-          deps,
-        );
-      else await runUpdate({ ...common, projectId: PROJECT_FIXTURE.id }, deps);
-      expect(bodies[0]).toMatchObject({ password: 'inline-value' });
-      expect(stderr.filter(line => line.startsWith('Warning:'))).toEqual([
-        'Warning: --password takes precedence; --password-file was ignored.',
-      ]);
-    },
-  );
-
   it('project update retries one transient conflict with the same idempotency key', async () => {
     const { credentialsPath } = makeCreds();
     const headers: string[] = [];
-    const result = await runUpdate(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: PROJECT_FIXTURE.id,
-        name: 'New name',
-      },
-      {
-        credentialsPath,
-        fetchImpl: makeFetch((_url, init) => {
-          headers.push(new Headers(init.headers).get('idempotency-key')!);
-          return headers.length === 1
-            ? {
-                status: 409,
-                body: {
-                  error: {
-                    code: 'CONFLICT',
-                    message: 'Retry',
-                    nextAction: 'Retry',
-                    requestId: 'r',
-                    details: {},
+    const result = await onFakeTimers(() =>
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: PROJECT_FIXTURE.id,
+          name: 'New name',
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch((_url, init) => {
+            headers.push(new Headers(init.headers).get('idempotency-key')!);
+            return headers.length === 1
+              ? {
+                  status: 409,
+                  body: {
+                    error: {
+                      code: 'CONFLICT',
+                      message: 'Retry',
+                      nextAction: 'Retry',
+                      requestId: 'r',
+                      details: {},
+                    },
                   },
-                },
-              }
-            : { body: { projectId: PROJECT_FIXTURE.id, updatedFields: ['name'] } };
-        }),
-        stdout: () => {},
-        stderr: () => {},
-      },
+                }
+              : { body: { projectId: PROJECT_FIXTURE.id, updatedFields: ['name'] } };
+          }),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
     ).catch(err => err as ApiError);
     expect(result).not.toBeInstanceOf(ApiError);
     expect(headers).toHaveLength(2);
@@ -3151,12 +1886,12 @@ describe('project compatibility contracts', () => {
 
 // ---------------------------------------------------------------------------
 // A project created without a coding agent must not dead-end. After
-// a real create in text mode, one [hint] on stderr points at the generate →
-// accept path (with the hand-authored fallback). JSON callers already hold the
+// a real create in text mode, one [hint] on stderr points at the project's
+// agent: plan, then apply. JSON callers already hold the
 // id, and --dry-run would embed the canned sample id, so neither gets it.
 // ---------------------------------------------------------------------------
 describe('first-suite signpost after `project create`', () => {
-  it('text mode, frontend: [hint] names test plan generate + accept with the real id, plus the hand-authored fallback', async () => {
+  it('text mode, frontend: [hint] names plan and apply with the real id', async () => {
     const { credentialsPath } = makeCreds();
     const createdProject: CliProject = {
       ...PROJECT_FIXTURE,
@@ -3174,21 +1909,19 @@ describe('first-suite signpost after `project create`', () => {
         debug: false,
         type: 'frontend',
         name: 'Signpost FE',
-        targetUrl: 'https://example.com',
       },
       { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
     );
 
     const hint = stderrLines.find(l => l.startsWith('[hint]'));
     expect(hint).toBeDefined();
-    expect(hint).toContain('testsprite test plan generate --project proj_fe_signpost');
-    expect(hint).toContain('testsprite test plan accept --project proj_fe_signpost');
-    expect(hint).toContain('testsprite test create --plan-template');
-    // A frontend project is explored directly; no document upload step.
-    expect(hint).not.toContain('docs upload');
+    expect(hint).toContain('testsprite project env create proj_fe_signpost --name default');
+    expect(hint).toContain('testsprite plan --project proj_fe_signpost');
+    expect(hint).toContain('testsprite apply');
+    expect(hint).not.toContain('--file');
   });
 
-  it('text mode, backend: the hint puts `project docs upload` BEFORE generate', async () => {
+  it('text mode, backend: the hint attaches the API spec to plan', async () => {
     const { credentialsPath } = makeCreds();
     const createdProject: CliProject = {
       ...PROJECT_FIXTURE,
@@ -3206,18 +1939,15 @@ describe('first-suite signpost after `project create`', () => {
         debug: false,
         type: 'backend',
         name: 'Signpost BE',
-        targetUrl: 'https://api.example.com',
       },
       { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
     );
 
     const hint = stderrLines.find(l => l.startsWith('[hint]'));
     expect(hint).toBeDefined();
-    expect(hint).toContain('testsprite project docs upload');
-    expect(hint).toContain('--project proj_be_signpost');
-    expect(hint).toContain('testsprite test plan generate --project proj_be_signpost');
-    expect(hint!.indexOf('project docs upload')).toBeLessThan(hint!.indexOf('test plan generate'));
-    expect(hint).toContain('testsprite test create --plan-template');
+    expect(hint).toContain('testsprite project env create proj_be_signpost --name default');
+    expect(hint).toContain('testsprite plan --project proj_be_signpost --file <api-spec.yaml>');
+    expect(hint).toContain('testsprite apply');
   });
 
   it('json mode: no hint — the caller already holds the project id', async () => {
@@ -3233,7 +1963,6 @@ describe('first-suite signpost after `project create`', () => {
         debug: false,
         type: 'frontend',
         name: 'JSON FE',
-        targetUrl: 'https://example.com',
       },
       { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
     );
@@ -3256,7 +1985,6 @@ describe('first-suite signpost after `project create`', () => {
         dryRun: true,
         type: 'frontend',
         name: 'Dry FE',
-        targetUrl: 'https://example.com',
       },
       {
         credentialsPath,
@@ -3268,68 +1996,6 @@ describe('first-suite signpost after `project create`', () => {
 
     expect(stderrLines.some(l => l.startsWith('[hint]'))).toBe(false);
   });
-});
-
-describe('first-suite signpost for a `--local` project', () => {
-  // Plan generation cannot reach an app on this machine (the backend refuses a
-  // local-origin project before any charge), and the text record already ends
-  // with the hand-written-plan next steps. So no second `[hint]` block: the
-  // record's own block is the one next step, and it must name the right host.
-  async function createLocal(localHost?: string) {
-    const { credentialsPath } = makeCreds();
-    const createdProject: CliProject = {
-      ...PROJECT_FIXTURE,
-      id: 'proj_local_signpost',
-      type: 'frontend',
-      name: 'Local FE',
-    };
-    const fetchImpl = makeFetch(() => ({ body: createdProject }));
-    const connect = vi.fn(async () => {});
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    await runCreate(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        type: 'frontend',
-        name: 'Local FE',
-        local: '3000',
-        ...(localHost !== undefined ? { localHost } : {}),
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        localPortProbeDeps: { connect },
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-      },
-    );
-    return { stdout: stdoutLines.join('\n'), stderr: stderrLines.join('\n') };
-  }
-
-  it('text mode, --local: no [hint] block; the record names the hand-written plan and the local run', async () => {
-    const { stdout, stderr } = await createLocal();
-    expect(stderr).not.toContain('[hint]');
-    expect(stderr).not.toContain('plan generate');
-    expect(stdout).toContain('testsprite test create --plan-template > plan.json');
-    expect(stdout).toContain('set projectId to proj_local_signpost');
-    expect(stdout).toContain('testsprite test create --plan-from plan.json');
-    expect(stdout).not.toContain('--project proj_local_signpost --plan-from');
-    // The run picks the project's saved local environment up itself, so no flags.
-    expect(stdout).toContain('testsprite test run <test-id>');
-    expect(stdout).not.toContain('--local-host');
-  });
-
-  it.each(['::1', 'localhost'])(
-    'a non-default --local-host (%s) needs no extra run flag: the saved environment carries it',
-    async localHost => {
-      const { stdout, stderr } = await createLocal(localHost);
-      expect(stdout).toContain('testsprite test run <test-id>');
-      expect(stdout).not.toContain('test run <test-id> --local');
-      expect(stderr).not.toContain('[hint]');
-    },
-  );
 });
 
 describe('renderProjectListText — CJK display-width regression (#369)', () => {

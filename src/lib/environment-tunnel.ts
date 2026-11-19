@@ -1,3 +1,4 @@
+import { isProxyAgentActive } from './proxy.js';
 import {
   makeHttpClient,
   resolveRequestTimeoutMs,
@@ -5,22 +6,23 @@ import {
   type ClientFactoryDeps,
 } from './client-factory.js';
 import { globalShutdown, type ShutdownHandle } from './interrupt.js';
-import { openTunnelSession, TunnelLostError, type TunnelClientHandle } from './tunnel-session.js';
+import {
+  TUNNEL_DATA_PLANE_PROXY_BYPASS_DESCRIPTION,
+  openTunnelSession,
+  TunnelLostError,
+  type TunnelClientHandle,
+} from './tunnel-session.js';
 import { TunnelClient, type TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import { assertLocalPortListening } from './local-target.js';
-import { recordTelemetryTunnelOpened } from './telemetry.js';
+import { recordTelemetryExtras, recordTelemetryTunnelOpened } from './telemetry.js';
 import type { HttpClient } from './http.js';
-import type { RunResponse } from './runs.types.js';
+import type { RunWaitSnapshot } from './run-wait.js';
 import { Output } from './output.js';
-import type { DeprecationEntry } from './deprecate.js';
-import { emitCiArtifacts, summarizeAcceptedPayload } from './gh-output.js';
-import { buildJUnitReport, writeJUnitReportFile } from './junit-report.js';
-import {
-  pollRunUntilTerminal,
-  TimeoutError,
-  isTerminalStatus,
-  UnreachableAtDeadlineError,
-} from './poll.js';
+import { emitCiArtifacts, isNonDispatchedStatus } from './gh-output.js';
+import { buildJUnitReport, skippedRowFromSummary, writeJUnitReportFile } from './junit-report.js';
+import { launchIds } from './run-render.js';
+import type { CliTestListRunResponse } from './testlist.types.js';
+import { buildRunOutput, listResultReceipt, renderRunResults } from './run-output.js';
 import { ApiError, InterruptError, RequestTimeoutError, localValidationError } from './errors.js';
 import {
   buildLocalTargetUrl,
@@ -29,6 +31,7 @@ import {
   type LoopbackHost,
   type StoredLocalTarget,
 } from './local-target.js';
+import { terminalSafeLine, terminalSafeWriter } from './terminal-text.js';
 
 export interface RunTargetTest {
   type: 'frontend' | 'backend';
@@ -157,7 +160,7 @@ export async function resolveEnvironmentRunTarget(args: {
     if (explicit)
       throw localValidationError(
         'local',
-        `backend tests don't open a browser; the tunnel is not used. Run: testsprite test run ${args.testId}`,
+        `backend tests don't open a browser; the tunnel is not used. Run: testsprite run ${args.testId}`,
       );
     return undefined;
   }
@@ -215,7 +218,7 @@ export async function resolveEnvironmentRunTarget(args: {
     if (args.environment !== undefined && selected && !localOf(selected))
       announce(
         `sign-in:${projectId}:${selected.name}:${target.targetUrl}`,
-        `Using environment "${selected.name}" sign-in against ${target.targetUrl} through a tunnel.`,
+        `Using environment "${terminalSafeLine(selected.name)}" sign-in against ${terminalSafeLine(target.targetUrl)} through a tunnel.`,
       );
     return target;
   };
@@ -252,8 +255,8 @@ export async function resolveEnvironmentRunTarget(args: {
     announce(
       key,
       args.dryRun
-        ? `Would open a tunnel to ${selected!.url} (environment "${selected!.name}").`
-        : `Environment "${selected!.name}" is on this machine (${selected!.url}) — opening a tunnel.`,
+        ? `Would open a tunnel to ${terminalSafeLine(selected!.url)} (environment "${terminalSafeLine(selected!.name)}").`
+        : `Environment "${terminalSafeLine(selected!.name)}" is on this machine (${terminalSafeLine(selected!.url)}) — opening a tunnel.`,
     );
   }
   return {
@@ -264,25 +267,11 @@ export async function resolveEnvironmentRunTarget(args: {
   };
 }
 
-export function tunnelScopeError(err: unknown): unknown {
-  if (!(err instanceof ApiError) || err.httpStatus !== 403) return err;
-  return new ApiError(
-    {
-      code: err.code,
-      message: err.message,
-      requestId: err.requestId,
-      details: err.details,
-      nextAction: `${err.nextAction ?? ''} A tunnel is required for this environment; use an API key with run:tunnel permission.`,
-    },
-    err.httpStatus,
-  );
-}
-
 export function unsupportedTunnelError(command: string): ApiError {
   return new ApiError({
     code: 'UNSUPPORTED',
     message: `This server did not confirm tunnel use for ${command}. Cancellation was attempted for the started runs; no tunnel-free result can be trusted.`,
-    nextAction: 'Update the server, or use testsprite test run <id> with the saved environment.',
+    nextAction: 'Update the server, or use testsprite run <id> with the saved environment.',
     requestId: 'local',
     details: {},
   });
@@ -295,24 +284,26 @@ export interface EnvironmentTunnelContext {
   maxConcurrency: number;
   deadlineMs: number;
   session: Awaited<ReturnType<typeof openTunnelSession>>;
-  cancellation: (runId: string) => 'cancelled' | 'cancel-failed' | undefined;
+  cancellation: (runId: string) => 'cancelled' | 'cancel-failed' | 'already-terminal' | undefined;
+  cancelActive: () => Promise<void>;
   skipped?: Array<{ testId: string; reason: 'backend-test' }>;
-  terminalRun: (runId: string) => RunResponse | undefined;
-  waitForCapacity: (incoming: number) => Promise<void>;
+  resultStatus: (resultId: string) => string | undefined;
   confirm: (
     response: { tunnelClientId?: string },
     runIds: string[],
     requireEcho?: boolean,
   ) => Promise<void>;
-  onPoll: (run: { runId: string; status: string }) => void;
+  onRead: (snapshot: RunWaitSnapshot, signal: AbortSignal) => Promise<void>;
 }
 
-/** Replay and list dispatch keep their existing envelopes under one owned tunnel. */
+/** Own tunnel lifecycle and executions, without a client-side dispatch capacity loop. */
 export async function withEnvironmentTunnel<T>(
   opts: CommonOptions & {
     skipPreflight?: boolean;
     maxConcurrency?: number;
     timeoutSeconds?: number;
+    tunnelClientId?: string;
+    cancelOnInterrupt?: boolean;
   },
   deps: ClientFactoryDeps & {
     shutdown?: ShutdownHandle;
@@ -323,8 +314,13 @@ export async function withEnvironmentTunnel<T>(
   command: string,
   operation: (context: EnvironmentTunnelContext) => Promise<T>,
 ): Promise<T> {
-  const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
   const shutdown = deps.shutdown ?? globalShutdown;
+  if (isProxyAgentActive())
+    stderr(
+      `[advisory] An HTTP proxy is configured for this process. The tunnel control channel honours it, but ${TUNNEL_DATA_PLANE_PROXY_BYPASS_DESCRIPTION} — if the run cannot reach your machine, an egress proxy is the first thing to rule out.`,
+    );
+  recordTelemetryExtras({ localConcurrencyLimit: opts.maxConcurrency ?? 5 });
   const seen = new Set<string>();
   for (const target of targets) {
     if (seen.has(target.targetUrl)) continue;
@@ -358,40 +354,55 @@ export async function withEnvironmentTunnel<T>(
   const cleanup = <R>(operation: (client: HttpClient) => Promise<R>): Promise<R> =>
     request(10_000, operation);
   const client = makeHttpClient(opts, { ...deps, shutdownSignal: shutdown.signal, shutdown });
+  const livenessClient = makeHttpClient(
+    { ...opts, debug: false, verbose: false },
+    { ...deps, shutdownSignal: shutdown.signal, shutdown },
+  );
   const active = new Set<string>();
-  const terminalRuns = new Map<string, RunResponse>();
-  const getRun = client.getRun.bind(client);
-  client.getRun = async (runId, options) => {
-    const cached = terminalRuns.get(runId);
-    if (cached) return cached;
-    const run = await getRun(runId, options);
-    if (isTerminalStatus(run.status)) terminalRuns.set(runId, run);
-    return run;
-  };
-  const cancellations = new Map<string, 'cancelled' | 'failed'>();
+  const statuses = new Map<string, string>();
+  const cancellations = new Map<string, 'cancelled' | 'cancel-failed' | 'already-terminal'>();
   let failure: unknown;
-  let context: EnvironmentTunnelContext | undefined;
-  const cancel = async () => {
+  let session: Awaited<ReturnType<typeof openTunnelSession>> | undefined;
+  let ownerGone = false;
+  let lastLivenessRead = -Infinity;
+  const cancel = async (force = false): Promise<void> => {
+    if (!force && (opts.cancelOnInterrupt === false || (session?.adopted && !ownerGone))) return;
     for (const runId of active) {
       try {
-        await cleanup(transport => transport.cancelRun(runId));
-        cancellations.set(runId, 'cancelled');
-        stderr(`[tunnel] Cancellation requested for ${runId}; the owned tunnel is closing.`);
-      } catch (err) {
-        cancellations.set(runId, 'failed');
+        const cancelled = await cleanup(transport => transport.cancelRun(runId));
+        cancellations.set(runId, cancelled.alreadyFinished ? 'already-terminal' : 'cancelled');
         stderr(
-          `[tunnel] Could not cancel ${runId}: ${err instanceof Error ? err.message : String(err)}. Use testsprite test cancel ${runId}.`,
+          cancelled.alreadyFinished
+            ? `[tunnel] Run ${terminalSafeLine(runId)} had already finished; no cancellation was needed.`
+            : `[tunnel] Cancellation requested for run ${terminalSafeLine(runId)}; its tunnel is closing.`,
+        );
+        for (const result of cancelled.results)
+          if (result.refund?.status === 'failed')
+            stderr(
+              `[tunnel] Refund failed for result ${terminalSafeLine(result.resultId)}: inspect the cancellation response or contact support.`,
+            );
+      } catch (err) {
+        cancellations.set(runId, 'cancel-failed');
+        stderr(
+          `[tunnel] Could not cancel run ${terminalSafeLine(runId)}: ${terminalSafeLine(err instanceof Error ? err.message : String(err))}. Use testsprite run cancel ${terminalSafeLine(runId)}.`,
         );
       }
       active.delete(runId);
     }
   };
   const disarm = shutdown.arm();
-  let session: Awaited<ReturnType<typeof openTunnelSession>> | undefined;
   try {
     try {
       session = await openTunnelSession(
-        { log: stderr, logLevel: opts.debug ? 'debug' : opts.verbose ? 'info' : 'error' },
+        {
+          log: stderr,
+          onMinted: ({ clientId }) =>
+            stderr(`[tunnel] Minted tunnel client ${terminalSafeLine(clientId)}`),
+          logLevel: opts.debug ? 'debug' : opts.verbose ? 'info' : 'error',
+          ...(opts.tunnelClientId
+            ? { adopt: { clientId: opts.tunnelClientId, expiresAt: '' } }
+            : {}),
+        },
         {
           mint: ttlSeconds =>
             request(requestTimeoutMs, transport =>
@@ -405,126 +416,80 @@ export async function withEnvironmentTunnel<T>(
         },
       );
     } catch (err) {
-      throw tunnelScopeError(err);
+      if (shutdown.signal.aborted) throw shutdown.signal.reason;
+      throw err;
     }
-    recordTelemetryTunnelOpened(true);
-    if (shutdown.signal.aborted) throw shutdown.signal.reason;
-    const checkDispatch = (): void => {
+    recordTelemetryTunnelOpened(!session.adopted);
+    const dispatch = <R>(operation: (transport: HttpClient) => Promise<R>): Promise<R> => {
       if (shutdown.signal.aborted) throw shutdown.signal.reason;
       if (session!.fatalReason())
-        throw new TunnelLostError(session!.fatalReason()!, '', session!.fatalMessage());
-    };
-    // Retain a charged response across the first interrupt, with a total retry deadline.
-    const dispatch = <R>(operation: (transport: HttpClient) => Promise<R>): Promise<R> => {
-      checkDispatch();
+        throw new TunnelLostError(session!.fatalReason()!, {}, session!.fatalMessage());
+      // Keep the response across the first interrupt so its owned run can be cancelled.
       return request(requestTimeoutMs, operation);
     };
-    client.triggerRerun = (...args) => dispatch(transport => transport.triggerRerun(...args));
-    client.triggerBatchRerun = (...args) =>
-      dispatch(transport => transport.triggerBatchRerun(...args));
+    client.triggerProjectRun = (...args) =>
+      dispatch(transport => transport.triggerProjectRun(...args));
     client.triggerTestListRun = (...args) =>
       dispatch(transport => transport.triggerTestListRun(...args));
-    client.triggerRunWithMeta = (...args) =>
-      dispatch(transport => transport.triggerRunWithMeta(...args));
-    const deadlineMs = Date.now() + (opts.timeoutSeconds ?? 600) * 1000;
-    const assertCapacityDeadline = (): void => {
-      if (Date.now() >= deadlineMs)
-        throw new ApiError({
-          code: 'UNSUPPORTED',
-          message: `Timed out after ${opts.timeoutSeconds ?? 600}s waiting for tunnel batch capacity.`,
-          nextAction:
-            'The owned tunnel is closing; inspect cancellation with testsprite test cancel <run-id>.',
-          requestId: 'local',
-          details: {},
-        });
-    };
-    context = {
+    return await operation({
       client,
       session,
-      deadlineMs,
-      cancellation: id => {
-        const outcome = cancellations.get(id);
-        return outcome === 'failed' ? 'cancel-failed' : outcome;
-      },
       clientId: session.clientId,
       maxConcurrency: opts.maxConcurrency ?? 5,
-      terminalRun: runId => terminalRuns.get(runId),
-      waitForCapacity: async incoming => {
-        assertCapacityDeadline();
-        while (active.size + incoming > (opts.maxConcurrency ?? 5)) {
-          const runId = active.values().next().value!;
-          try {
-            await pollRunUntilTerminal(client, runId, {
-              timeoutSeconds: Math.max(0, (deadlineMs - Date.now()) / 1000),
-              shutdown,
-              sleep: deps.sleep,
-              onTick: run => context!.onPoll(run),
-            });
-          } catch (err) {
-            // The deadline passed while the API was unreachable: still exit 10,
-            // with the owned-tunnel hint instead of the re-attach one, since the
-            // tunnel closes with this process.
-            if (err instanceof UnreachableAtDeadlineError) {
-              throw new ApiError(
-                {
-                  code: 'UNAVAILABLE',
-                  message: err.message,
-                  nextAction: `The owned tunnel is closing; inspect cancellation with testsprite test cancel ${runId}.`,
-                  requestId: err.requestId,
-                  details: err.details,
-                },
-                err.httpStatus,
-              );
-            }
-            if (!(err instanceof TimeoutError)) throw err;
-            throw new ApiError({
-              code: 'UNSUPPORTED',
-              message: err.message,
-              nextAction: `The owned tunnel is closing; inspect cancellation with testsprite test cancel ${runId}.`,
-              requestId: 'local',
-              details: { runId },
-            });
-          }
-        }
-        assertCapacityDeadline();
-      },
+      deadlineMs: Date.now() + (opts.timeoutSeconds ?? 600) * 1000,
+      cancellation: runId => cancellations.get(runId),
+      cancelActive: () => cancel(),
+      resultStatus: resultId => statuses.get(resultId),
       confirm: async (response, runIds, requireEcho = true) => {
-        for (const id of runIds) active.add(id);
-        if (requireEcho && runIds.length && response.tunnelClientId !== session!.clientId) {
-          await cancel();
+        for (const runId of runIds) active.add(runId);
+        if (requireEcho && runIds.length > 0 && response.tunnelClientId !== session!.clientId) {
+          await cancel(true);
           throw unsupportedTunnelError(command);
         }
       },
-      onPoll: run => {
-        if (['passed', 'failed', 'blocked', 'cancelled'].includes(run.status))
+      onRead: async ({ run, results }, signal) => {
+        for (const result of results)
+          statuses.set(result.resultId, result.testStatus.toLowerCase());
+        if (run.status === 'finished') {
           active.delete(run.runId);
-        else if (active.has(run.runId) && session!.fatalReason())
-          throw new TunnelLostError(session!.fatalReason()!, run.runId, session!.fatalMessage());
+          return;
+        }
+        if (!active.has(run.runId)) return;
+        const fatal = session!.fatalReason();
+        if (fatal) throw new TunnelLostError(fatal, { runId: run.runId }, session!.fatalMessage());
+        if (session!.adopted && Date.now() - lastLivenessRead >= 15_000) {
+          lastLivenessRead = Date.now();
+          try {
+            const observed = await livenessClient.getTunnelStatus(session!.clientId, {
+              signal,
+              retry: false,
+            });
+            ownerGone = observed.status.toLowerCase() === 'offline';
+          } catch (err) {
+            ownerGone = err instanceof ApiError && err.httpStatus === 404;
+          }
+          if (ownerGone) throw new TunnelLostError('owner-gone', { runId: run.runId });
+        }
       },
-    };
-    return await operation(context!);
+    });
   } catch (err) {
     failure = err;
     throw err;
   } finally {
     const closing = [...active];
     await cancel();
-    if (failure instanceof InterruptError && closing.length) {
-      const runId = closing[0]!;
-      const cancelOutcome = closing.every(id => cancellations.get(id) === 'cancelled')
-        ? 'cancelled'
-        : 'failed';
-      const retry =
-        [...(context?.targets ?? [])]
-          .map(
-            ([id, target]) =>
-              `testsprite test run ${id}${target.environmentName ? ` --env ${quoteEnvironmentName(target.environmentName)}` : ''}`,
-          )
-          .join('; ') || 'testsprite test run <id>';
-      const nextAction = `The owned tunnel is closing; cancellation was ${cancelOutcome === 'cancelled' ? 'requested' : 'attempted'} for ${closing.join(' ')}. Inspect with testsprite test cancel ${closing.join(' ')}. Start a new run with ${retry}.`;
+    if (failure instanceof InterruptError && closing.length && (!session?.adopted || ownerGone)) {
+      const cancelled = closing.every(id => cancellations.get(id) === 'cancelled');
+      const nextAction = cancelled
+        ? `The owned tunnel closed; cancellation was requested for runs ${closing.join(' ')}. Start a new run to test the local target again.`
+        : `The owned tunnel closed; cancellation was not confirmed. Stop the runs with testsprite run cancel ${closing.join(' ')}.`;
       Object.assign(failure, {
         runWaitContext: true,
-        tunnelDetach: { runId, cancel: cancelOutcome, nextAction },
+        tunnelDetach: {
+          runId: closing[0],
+          cancel: cancelled ? 'cancelled' : opts.cancelOnInterrupt === false ? 'skipped' : 'failed',
+          nextAction,
+        },
       });
     }
     try {
@@ -566,8 +531,7 @@ function shutdownAwareTunnelClient(
 /** Keep each dispatch on one verbatim loopback URL; public runs omit tunnel fields. */
 export function groupEnvironmentTargets(
   ids: string[],
-  targets: ReadonlyMap<string, ResolvedRunTarget>,
-  maxLocalGroupSize = Infinity,
+  targets: ReadonlyMap<string, { targetUrl: string }>,
 ): string[][] {
   const groups = new Map<string | undefined, string[]>();
   for (const id of ids) {
@@ -576,13 +540,7 @@ export function groupEnvironmentTargets(
     group.push(id);
     groups.set(key, group);
   }
-  return [...groups.values()].flatMap(group => {
-    if (!targets.has(group[0]!) || !Number.isFinite(maxLocalGroupSize)) return [group];
-    const chunks: string[][] = [];
-    for (let index = 0; index < group.length; index += maxLocalGroupSize)
-      chunks.push(group.slice(index, index + maxLocalGroupSize));
-    return chunks;
-  });
+  return [...groups.values()];
 }
 
 export function quoteEnvironmentName(name: string): string {
@@ -590,12 +548,7 @@ export function quoteEnvironmentName(name: string): string {
 }
 
 export async function emitEnvironmentDispatchPartial(
-  responses: Array<{
-    accepted: Array<{ testId: string; runId: string }>;
-    conflicts: Array<{ testId: string }>;
-    deferred: Array<{ testId: string }>;
-    notFound?: string[];
-  }>,
+  responses: readonly CliTestListRunResponse[],
   testIds: string[],
   opts: CommonOptions & {
     report?: 'junit';
@@ -606,11 +559,12 @@ export async function emitEnvironmentDispatchPartial(
   },
   deps: ClientFactoryDeps & {
     stdout?: (line: string) => void;
-    deprecations?: readonly DeprecationEntry[];
   },
   label: string,
   error: unknown,
   context: EnvironmentTunnelContext,
+  /** The reason a `notFound` id was not dispatched (`run --testlist`: not a member of the list). */
+  notFoundNote?: string,
 ): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
   const timedOut =
@@ -618,11 +572,12 @@ export async function emitEnvironmentDispatchPartial(
     (error instanceof ApiError && error.code === 'UNSUPPORTED' && message.startsWith('Timed out'));
   const accepted = responses
     .flatMap(response => response.accepted)
+    .map(listResultReceipt)
     .map(row => ({
       ...row,
       status:
-        context.cancellation(row.runId) ??
-        context.terminalRun(row.runId)?.status ??
+        (row.runId ? context.cancellation(row.runId) : undefined) ??
+        context.resultStatus(row.resultId) ??
         (timedOut ? 'timeout' : 'running'),
     }));
   const conflicts = responses.flatMap(response => response.conflicts);
@@ -631,30 +586,37 @@ export async function emitEnvironmentDispatchPartial(
   const seen = new Set([...accepted, ...conflicts, ...deferred].map(row => row.testId));
   for (const id of notFound) seen.add(id);
   const notRunTestIds = testIds.filter(id => !seen.has(id));
-  const partial = {
-    accepted,
+  const buckets = {
     conflicts,
     deferred,
     ...(context.skipped?.length ? { skipped: context.skipped } : {}),
-    notRunTestIds,
     ...(responses.some(response => response.notFound) ? { notFound } : {}),
   };
-  const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
-  new Output(
-    opts.output,
-    { stdout: deps.stdout, stderr: deps.stderr },
-    { deprecations: deps.deprecations },
-  ).print(partial, () => accepted.map(row => `${row.runId}  ${row.status}`).join('\n'));
-  const summary = summarizeAcceptedPayload(JSON.stringify(partial));
-  summary.runs.push(
-    ...notRunTestIds.map(testId => ({
-      testId,
-      status: 'skipped',
-      error: 'not dispatched before the owned tunnel closed',
-    })),
+  const { output, summary } = buildRunOutput({
+    receipts: launchIds(accepted).map(runId => ({ runId })),
+    dispatched: accepted,
+    wait: true,
+    failure: error,
+    requestTimedOut: timedOut,
+    incompleteDispatch: true,
+    cancellation: context.cancellation,
+    buckets: {
+      ...buckets,
+      skipped: [
+        ...(context.skipped ?? []),
+        ...notRunTestIds.map(testId => ({
+          testId,
+          reason: 'not dispatched before the owned tunnel closed',
+        })),
+      ],
+    },
+    notFoundNote,
+  });
+  const stderr = terminalSafeWriter(deps.stderr);
+  new Output(opts.output, { stdout: deps.stdout, stderr: deps.stderr }).print(
+    { ...output, ...buckets, notRunTestIds },
+    () => renderRunResults(output.runs, output.results, summary),
   );
-  summary.total += notRunTestIds.length;
-  summary.skipped += notRunTestIds.length;
   emitCiArtifacts(
     summary,
     opts,
@@ -672,12 +634,21 @@ export async function emitEnvironmentDispatchPartial(
         buildJUnitReport({
           suiteName: opts.reportSuiteName ?? `testsprite:${label}`,
           classname: label,
-          results: summary.runs.map(row => ({
-            testId: row.testId,
-            runId: row.runId,
-            status: row.status,
-            error: { code: error instanceof ApiError ? error.code : 'UNSUPPORTED', message },
-          })),
+          // A test that never dispatched is skipped with its own reason. A
+          // dispatched one keeps the status it reached (running, timeout, a
+          // verdict) and names the error that closed the tunnel, which is why
+          // this is not `junitRowsFromSummary`.
+          results: summary.results.map(row =>
+            isNonDispatchedStatus(row.status)
+              ? skippedRowFromSummary(row)
+              : {
+                  testId: row.testId ?? row.resultId ?? '(unknown)',
+                  resultId: row.resultId,
+                  runId: row.runId,
+                  status: row.status,
+                  error: { code: error instanceof ApiError ? error.code : 'UNSUPPORTED', message },
+                },
+          ),
         }),
       );
     } catch (err) {

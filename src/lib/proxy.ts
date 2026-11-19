@@ -16,6 +16,7 @@
  */
 import type { Dispatcher } from 'undici';
 import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+import { terminalSafeWriter } from './terminal-text.js';
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
 
@@ -44,10 +45,9 @@ export interface ProxyDeps {
  */
 export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
   const env = deps.env ?? process.env;
-  const hasProxy = [env.HTTPS_PROXY, env.https_proxy, env.HTTP_PROXY, env.http_proxy].some(
-    value => typeof value === 'string' && value.length > 0,
-  );
-  if (!hasProxy) return false;
+  const httpProxy = withDefaultScheme(pickProxyValue(env.http_proxy, env.HTTP_PROXY));
+  const httpsProxy = withDefaultScheme(pickProxyValue(env.https_proxy, env.HTTPS_PROXY));
+  if (httpProxy === '' && httpsProxy === '') return false;
   const install = deps.install ?? setGlobalDispatcher;
   // The values are passed explicitly, as strings even when unset, so that
   // `deps.env` is the only input: undici falls back to `process.env` for an
@@ -60,14 +60,14 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
   try {
     install(
       new EnvHttpProxyAgent({
-        httpProxy: withDefaultScheme(pickProxyValue(env.http_proxy, env.HTTP_PROXY)),
-        httpsProxy: withDefaultScheme(pickProxyValue(env.https_proxy, env.HTTPS_PROXY)),
+        httpProxy,
+        httpsProxy,
         noProxy: env.no_proxy ?? env.NO_PROXY ?? '',
       }),
     );
     return true;
   } catch (error) {
-    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    const stderr = terminalSafeWriter(deps.stderr);
     stderr(
       `warning: ignoring proxy environment (could not initialize proxy agent): ${
         error instanceof Error ? error.message : String(error)

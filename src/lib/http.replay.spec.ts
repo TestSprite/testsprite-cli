@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { HttpClient } from './http.js';
 
 const RUN = {
-  runId: 'run_1',
+  resultId: 'run_1',
   testId: 'test_1',
   projectId: 'p_1',
   userId: 'u_1',

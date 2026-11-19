@@ -2,7 +2,7 @@
  * Wire shapes for the `/api/cli/v1/testlist/*` surface (CRUD).
  *
  * `testId` on a case IS the test's logical id (`test_case.key`) — the same id
- * `test list` / `test get` return and `test run` accepts, so a case can be added
+ * `test list` / `test get` return and `run` accepts, so a case can be added
  * to a list with no translation.
  */
 
@@ -20,7 +20,7 @@ export interface CliTestList {
   orgId: string;
   caseCount: number;
   projectEnvironments: CliProjectEnvironment[];
-  lastExecutionId: string | null;
+  lastRunId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -43,7 +43,7 @@ export interface CliTestListCase {
 export interface CliTestListDetail extends CliTestList {
   cases: CliTestListCase[];
   stats: { total: number; passed: number; failed: number; blocked: number; running: number };
-  lastExecutionCreated: string | null;
+  lastRunCreated: string | null;
 }
 
 export interface CliTestListListResponse {
@@ -54,23 +54,31 @@ export interface CliDeleteTestListResponse {
   listId: string;
 }
 
-/** One dispatched run from `testlist run` — `runId` polls via `GET /runs/{runId}`. */
+/** One dispatched result from `run --testlist`; wait by runId through GET /results?run=. */
 export interface CliTestListRunAccepted {
   testId: string;
-  runId: string;
+  /** The result id (wire name). Printed as `resultId`. */
+  resultId: string;
+  /** The launch this result belongs to (wire name); required for whole-run waiting. */
+  runId?: string;
   enqueuedAt: string;
+  testTitle?: string | null;
+  dashboardUrl?: string | null;
+  executionUrl?: string | null;
 }
 
 /**
- * `testlist run` result. Mirrors the batch-run-fresh envelope so `--wait` reuses
- * the same poll/summary tail. `conflicts[]` carry the in-flight `currentRunId`
- * (poll it instead of retrying). `deferred[]` carries the cases the per-key
+ * `run --testlist` result. Mirrors the batch-run-fresh envelope so `--wait` reuses
+ * the execution wait and summary tail. `conflicts[]` carry the in-flight `currentResultId`
+ * (inspect it instead of retrying). `deferred[]` carries the cases the per-key
  * run-rate budget could not admit this call (retry after ~60s). `notFound[]` is
  * present on a PARTIAL `--case` miss — ids not in this list, skipped (a FULL miss
  * is a 404). `reason` is set only when nothing dispatched (empty list).
  */
 export interface CliTestListRunResponse {
   tunnelClientId?: string;
+  /** Maximum effective server concurrency across frontend project executions. */
+  maxConcurrency?: number;
   accepted: CliTestListRunAccepted[];
   conflicts: RunConflict[];
   deferred: Array<{ testId: string }>;

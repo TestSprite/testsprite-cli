@@ -15,6 +15,7 @@ import {
   runTunnelStatus,
   runTunnelStop,
 } from './tunnel.js';
+import { onFakeTimers } from '../../test/helpers/fake-timers.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 
@@ -79,7 +80,7 @@ describe('tunnel help', () => {
   it('describes automatic environment tunnels and adopting an existing tunnel', () => {
     const text = helpFor();
     expect(text).toContain('automatically');
-    expect(text).toContain('test run <test-id> --env <name> --tunnel-client <client-id>');
+    expect(text).toContain('run <test-id> --env <name> --tunnel-client <client-id>');
   });
 
   it('start help suggests a built server for a heavy development server', () => {
@@ -137,6 +138,61 @@ function fakeTunnel() {
 }
 
 describe('tunnel start', () => {
+  it('retries tunnel DELETE after ECONNRESET during Ctrl-C cleanup', async () => {
+    const shutdown = new ShutdownController();
+    const tunnel = fakeTunnel();
+    let deleteAttempts = 0;
+    let signalOnline: () => void = () => {};
+
+    const online = new Promise<void>(resolve => {
+      signalOnline = resolve;
+    });
+
+    const baseFetch = makeFetch(method =>
+      method === 'POST' ? { status: 201, body: MINT_BODY } : { status: 204 },
+    );
+
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+
+      if (method === 'DELETE' && String(input).includes('/tunnel/')) {
+        deleteAttempts += 1;
+
+        if (deleteAttempts === 1) {
+          throw new Error('ECONNRESET');
+        }
+      }
+
+      return baseFetch(input, init);
+    };
+
+    const running = runTunnelStart(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        shutdown,
+        stdout: () => signalOnline(),
+        stderr: () => {},
+        createTunnelClient: tunnel.factory,
+      },
+    );
+
+    await Promise.race([
+      online,
+      running.then(() => {
+        throw new Error('Tunnel exited before reaching online state');
+      }),
+    ]);
+
+    shutdown.interrupt('SIGINT');
+    await running;
+
+    expect(deleteAttempts).toBe(2);
+    expect(tunnel.calls.start).toBe(1);
+    expect(tunnel.calls.stop).toBe(1);
+  });
+
   it('prints the minted id on stderr before constructing the tunnel client in JSON mode', async () => {
     const events: string[] = [];
     const stdout: string[] = [];
@@ -1090,25 +1146,27 @@ describe('tunnel status', () => {
     const lines: string[] = [];
     let thrown: unknown;
     try {
-      await runTunnelStatus(
-        { profile: 'default', output: 'text', debug: false, clientId: VALID_CLIENT_ID },
-        {
-          ...makeCreds(),
-          fetchImpl: makeFetch(() => ({
-            status: 503,
-            body: {
-              error: {
-                code: 'UNAVAILABLE',
-                message: 'upstream down',
-                nextAction: 'retry',
-                requestId: 'r1',
-                details: {},
+      await onFakeTimers(() =>
+        runTunnelStatus(
+          { profile: 'default', output: 'text', debug: false, clientId: VALID_CLIENT_ID },
+          {
+            ...makeCreds(),
+            fetchImpl: makeFetch(() => ({
+              status: 503,
+              body: {
+                error: {
+                  code: 'UNAVAILABLE',
+                  message: 'upstream down',
+                  nextAction: 'retry',
+                  requestId: 'r1',
+                  details: {},
+                },
               },
-            },
-          })),
-          stdout: line => lines.push(line),
-          stderr: line => lines.push(line),
-        },
+            })),
+            stdout: line => lines.push(line),
+            stderr: line => lines.push(line),
+          },
+        ),
       );
     } catch (err) {
       thrown = err;

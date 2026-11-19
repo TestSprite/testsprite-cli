@@ -34,8 +34,11 @@ describe('billing refusal classifier', () => {
   ] as const)('reads details.reason %s as the gate refusal %s', (wire, refusalName) => {
     const result = classifyBillingRefusal(refusal('FEATURE_GATED', { reason: wire }));
     expect(result?.reason).toBe(refusalName);
-    expect(result?.links).toEqual({ pricing: '/pricing', billing: '/dashboard/settings/billing' });
-    expect(result?.nextAction).toContain('/dashboard/settings/billing');
+    expect(result?.links).toEqual({
+      pricing: '/pricing',
+      billing: '/dashboard-v3/settings/billing',
+    });
+    expect(result?.nextAction).toContain('/dashboard-v3/settings/billing');
   });
 
   it('adds only links — the server message already says what was refused and why', () => {
@@ -91,7 +94,7 @@ describe('billing refusal classifier', () => {
     expect(result?.nextAction).toBe(action);
     expect(result?.links).toEqual({
       pricing: 'https://dev.portal.example/pricing',
-      billing: 'https://dev.portal.example/dashboard/settings/billing',
+      billing: 'https://dev.portal.example/dashboard-v3/settings/billing',
     });
   });
 
@@ -144,7 +147,10 @@ describe('billing refusal classifier', () => {
         billingUrl: 'https://undefined/dashboard-v3/o/null/settings/billing',
       }),
     );
-    expect(result?.links).toEqual({ pricing: '/pricing', billing: '/dashboard/settings/billing' });
+    expect(result?.links).toEqual({
+      pricing: '/pricing',
+      billing: '/dashboard-v3/settings/billing',
+    });
     expect(JSON.stringify(result?.links)).not.toMatch(/undefined|null/);
   });
 
@@ -175,7 +181,7 @@ describe('billing refusal classifier', () => {
         refusal('FEATURE_GATED', { reason: 'billing_hold', ...(state ? { state } : {}) }),
       );
       expect(result?.nextAction).toBe(
-        'See /dashboard/settings/billing to resume this workspace, then retry.',
+        'See /dashboard-v3/settings/billing to resume this workspace, then retry.',
       );
       expect(result?.lines).toEqual(['  upgrade:   /pricing']);
     }
@@ -199,5 +205,20 @@ describe('billing refusal classifier', () => {
     const action = 'Upgrade at `https://dev.portal.example/pricing`, then retry.';
     const result = classifyBillingRefusal(refusal('FEATURE_GATED', { reason: 'plan' }, action));
     expect(result?.links.pricing).toBe('https://dev.portal.example/pricing');
+  });
+});
+
+describe('the link lines text mode prints', () => {
+  it('carry no escape sequence from a billing URL the server sent', () => {
+    const billingUrl =
+      'https://www.testsprite.com/dashboard-v3/settings/billing?x=\u001b]0;pwned\u0007\u001b[2J';
+    const result = classifyBillingRefusal(
+      refusal('FEATURE_GATED', { reason: 'plan', billingUrl }, 'Ask your workspace owner.'),
+    );
+    const printed = result?.lines.join('\n') ?? '';
+    expect(printed).toContain('billing:');
+    expect(printed).not.toContain('\u001b');
+    expect(printed).not.toContain('\u0007');
+    expect(printed).not.toContain('pwned');
   });
 });

@@ -5,6 +5,8 @@
  * while the workspace is paused, already worded — it is null while the
  * workspace can be written to.
  */
+
+import { terminalSafeLine } from './terminal-text.js';
 export interface WorkspaceStatus {
   state: 'ok' | 'pending' | 'paused';
   tier: string;
@@ -24,8 +26,8 @@ export interface WorkspaceStatus {
 export function formatWorkspaceStatus(ws: WorkspaceStatus | undefined): string | undefined {
   if (!ws || ws.state === 'ok') return undefined;
   if (ws.notice)
-    return `${ws.state} — ${ws.notice.message} ${ws.notice.cta}: ${ws.notice.billingUrl}`;
+    return `${terminalSafeLine(ws.state)} — ${terminalSafeLine(ws.notice.message)} ${terminalSafeLine(ws.notice.cta)}: ${terminalSafeLine(ws.notice.billingUrl)}`;
   if (ws.state === 'pending')
     return 'pending — a scheduled plan change or a payment retry is in progress; the workspace keeps working meanwhile';
-  return ws.state;
+  return terminalSafeLine(ws.state);
 }

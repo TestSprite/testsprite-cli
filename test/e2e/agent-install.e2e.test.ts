@@ -199,9 +199,11 @@ describe('content integrity', () => {
       }
 
       // (c) Load-bearing command strings
-      expect(content, `${target}: missing 'testsprite test run'`).toContain('testsprite test run');
+      expect(content, `${target}: missing 'testsprite run'`).toContain('testsprite run');
       expect(content, `${target}: missing '--wait'`).toContain('--wait');
-      expect(content, `${target}: missing 'test artifact get'`).toContain('test artifact get');
+      expect(content, `${target}: missing 'testsprite result get'`).toContain(
+        'testsprite result get',
+      );
     });
 
     it(`${target} testsprite-onboard file lands and has correct structure`, () => {
@@ -295,9 +297,9 @@ describe('content integrity', () => {
 
     // (b) Verify content: branding heading + load-bearing command strings
     expect(content).toContain('TestSprite Verification Loop');
-    expect(content).toContain('testsprite test run');
+    expect(content).toContain('testsprite run');
     expect(content).toContain('--wait');
-    expect(content).toContain('test artifact get');
+    expect(content).toContain('testsprite result get');
 
     // (c) Onboard content: the one-liner must be inside the managed section
     expect(content).toContain('First-time setup');
@@ -661,7 +663,7 @@ describe('managed-section (codex target)', () => {
     // new section content present
     expect(content).toContain(MANAGED_SECTION_BEGIN);
     expect(content).toContain(MANAGED_SECTION_END);
-    expect(content).toContain('testsprite test run');
+    expect(content).toContain('testsprite run');
   });
 
   it('unchanged: re-running on identical sentinels → no write, action: section-unchanged', () => {
@@ -957,15 +959,6 @@ describe('matrix coverage guard', () => {
       'testsprite-ci',
     ]);
   });
-});
-
-// ---------------------------------------------------------------------------
-// Bootstrap tip — SKIPPED in e2e
-// Note: tip coverage lives in src/commands/auth.test.ts. Wiring a /me stub
-// for `auth configure` is disproportionate here; the unit tests cover the tip.
-// ---------------------------------------------------------------------------
-it.skip('bootstrap tip after auth configure — see auth.test.ts for tip coverage', () => {
-  // No-op: unit tests in src/commands/auth.test.ts cover the tip.
 });
 
 // ---------------------------------------------------------------------------

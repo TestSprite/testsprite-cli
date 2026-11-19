@@ -78,6 +78,12 @@ jobs:
       #    above). The next step then reads the URL from the deployment event.
       # B. You deploy in this workflow: replace the run lines with your deploy
       #    commands and end with:  echo "url=<preview address>" >> "$GITHUB_OUTPUT"
+      # C. Your platform only posts a commit status or check on the PR (no deployment
+      #    event): delete this step, keep the pull_request trigger, and in the step below
+      #    replace the PREVIEW_URL env and the --target-url "$PREVIEW_URL" line with
+      #      --wait-for-status "<its name on the PR>" --target-url-template "<pattern>"
+      #    (placeholders {pr} {branch-slug} {sha} …, e.g. https://app-git-{branch-slug}-team.vercel.app),
+      #    then add  statuses: read  and  checks: read  under permissions: above.
       - name: Get this PR's preview URL
         id: preview
         run: |
@@ -184,6 +190,12 @@ jobs:
       #    above). The next step then reads the URL from the deployment event.
       # B. You deploy in this workflow: replace the run lines with your deploy
       #    commands and end with:  echo "url=<preview address>" >> "$GITHUB_OUTPUT"
+      # C. Your platform only posts a commit status or check on the PR (no deployment
+      #    event): delete this step, keep the pull_request trigger, and in the step below
+      #    replace the PREVIEW_URL env and the --target-url "$PREVIEW_URL" line with
+      #      --wait-for-status "<its name on the PR>" --target-url-template "<pattern>"
+      #    (placeholders {pr} {branch-slug} {sha} …, e.g. https://app-git-{branch-slug}-team.vercel.app),
+      #    then add  statuses: read  and  checks: read  under permissions: above.
       - name: Get this PR's preview URL
         id: preview
         run: |

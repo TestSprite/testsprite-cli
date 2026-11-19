@@ -22,9 +22,11 @@ vi.mock('node:fs', async importOriginal => {
 describe('formatInterruptMessage', () => {
   it('defaults to SIGINT and explains the run continues server-side', () => {
     const message = formatInterruptMessage();
-    expect(message).toContain('Interrupted (SIGINT)');
-    expect(message).toContain('test wait');
-    expect(message).toContain('test list');
+    expect(message).toBe(
+      'Interrupted (SIGINT). Any run already started keeps executing on the server; ' +
+        'check it with `testsprite run wait <run-id>` or `testsprite result list --run <run-id>`, ' +
+        'or, with no run id printed yet, find it with `testsprite result list --test <test-id>`.',
+    );
   });
 
   it('names the specific signal when given one', () => {

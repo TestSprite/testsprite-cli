@@ -89,6 +89,54 @@ describe('makeHttpClient — dry-run path', () => {
     resetDryRunBannerForTesting();
   });
 
+  it('does not emit the banner at construction — only on the first dry-run response', async () => {
+    // Issue #360: the banner used to fire during client construction, so a
+    // command that failed local validation afterwards announced a "sample
+    // response" before the error. It is now lazy: building the client is
+    // silent; the banner prints when the first dry-run response is produced.
+    const stderrLines: string[] = [];
+    const client = makeHttpClient(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+      },
+      {
+        env: {} as NodeJS.ProcessEnv,
+        credentialsPath: NO_CREDS_PATH,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines).not.toContain(DRY_RUN_BANNER);
+    await client.get<{ userId: string }>('/me');
+    expect(stderrLines).toContain(DRY_RUN_BANNER);
+  });
+
+  it('wraps an injected fetch so it announces the dry-run the same way', async () => {
+    // Issue #360 scope update: the lazy banner must fire for an injected
+    // test fetch too, not just the default canned fetch.
+    const stderrLines: string[] = [];
+    const injected = async () => new Response('{"ok":true}', { status: 200 });
+    const client = makeHttpClient(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+      },
+      {
+        env: {} as NodeJS.ProcessEnv,
+        credentialsPath: NO_CREDS_PATH,
+        fetchImpl: injected as typeof fetch,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines).not.toContain(DRY_RUN_BANNER);
+    expect(await client.get<{ ok: boolean }>('/me')).toEqual({ ok: true });
+    expect(stderrLines.filter(l => l === DRY_RUN_BANNER)).toHaveLength(1);
+  });
+
   it('does not require a credentials file or env var', async () => {
     const stderrLines: string[] = [];
     // Real path would throw AUTH_REQUIRED here; dry-run should succeed.
@@ -208,31 +256,9 @@ describe('makeHttpClient — dry-run path', () => {
   });
 });
 
-// M3.3 piece-4 — getRunFailure dry-run path
-describe('makeHttpClient — getRunFailure dry-run path (M3.3 piece-4)', () => {
+describe('makeHttpClient — GET /runs/{runId} dry-run path', () => {
   afterEach(() => {
     resetDryRunBannerForTesting();
-  });
-
-  it('GET /runs/{runId}/failure returns a FailureContext-shaped body in dry-run', async () => {
-    const client = makeHttpClient(
-      { profile: 'default', output: 'json', debug: false, dryRun: true },
-      {
-        env: {} as NodeJS.ProcessEnv,
-        credentialsPath: NO_CREDS_PATH,
-        stderr: () => {},
-      },
-    );
-    const result = await client.get<{
-      snapshotId: string;
-      testId: string;
-      result: { snapshotId: string; runIdIfAvailable: string };
-    }>('/runs/run_abc/failure');
-    expect(result.snapshotId).toBeTruthy();
-    expect(result.testId).toBeTruthy();
-    expect(result.result.snapshotId).toBe(result.snapshotId);
-    // Run-scoped bundle must have runIdIfAvailable set
-    expect(result.result.runIdIfAvailable).toBe('run_abc');
   });
 
   it('GET /runs/{runId} returns a run-status-shaped body in dry-run', async () => {
@@ -248,7 +274,7 @@ describe('makeHttpClient — getRunFailure dry-run path (M3.3 piece-4)', () => {
       runId: string;
       testId: string;
       status: string;
-    }>('/runs/run_abc');
+    }>('/runs/res_dryrun0001');
     expect(result.runId).toBeTruthy();
     expect(result.testId).toBeTruthy();
     expect(result.status).toBeTruthy();

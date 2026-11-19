@@ -174,7 +174,7 @@ function frequencyClause(runs: number): string {
 
 /**
  * Advisory shown before a schedule is created: how often it will run, and that
- * each run is a full test run.
+ * each run is a full run.
  *
  * States frequency only. Credit cost is deliberately not quoted — the API does
  * not expose a per-action rate for the workspace wallet, and a figure derived
@@ -186,7 +186,7 @@ function frequencyClause(runs: number): string {
  * schedule we are about to create would be worse than saying less.
  */
 export function formatScheduleFrequencyAdvisory(cron: string): string {
-  const tail = 'Each run is a full test run. Check your balance with `testsprite usage`.';
+  const tail = 'Each run is a full run. Check your balance with `testsprite usage`.';
   const runs = runsPerMonth(cron);
 
   if (runs === null) {

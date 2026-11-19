@@ -4,7 +4,7 @@
  * Termination signals: without a handler, Node terminates the process abruptly
  * with no output, so a user (Ctrl+C), a CI runner or `docker stop` (SIGTERM), or
  * a closed terminal/SSH session (SIGHUP) that interrupts a long
- * `test run --wait` is left unsure whether the run was cancelled or is still
+ * `run --wait` is left unsure whether the run was cancelled or is still
  * executing server-side (it is: the CLI only polls; the run lives on the
  * backend). The handler prints a one-line explanation plus how to resume, then
  * exits with the conventional `128 + signal` code.
@@ -68,7 +68,7 @@ export interface ShutdownHandle {
  * Two modes, chosen by whether a graceful-detach scope is armed when the
  * signal arrives:
  *
- * - **Armed** (inside `pollRunUntilTerminal` or a tunnel lifetime): the handler only aborts
+ * - **Armed** (inside `waitForRun` or a tunnel lifetime): the handler only aborts
  *   `signal` with an `InterruptError` — no I/O, no exit. The in-flight fetch
  *   and every backoff sleep bail immediately; the `--wait` catch blocks own
  *   the cleanup (finalize the ticker, print the honest partial envelope +
@@ -189,7 +189,9 @@ export const globalShutdown = new ShutdownController();
 export function formatInterruptMessage(signal: TerminationSignal = 'SIGINT'): string {
   return (
     `Interrupted (${signal}). Any run already started keeps executing on the server; ` +
-    'check it with `testsprite test list` or `testsprite test wait <runId>`.'
+    'check it with `testsprite run wait <run-id>` or `testsprite result list --run <run-id>`, ' +
+    // This line is printed before a command had a run id to print, usually.
+    'or, with no run id printed yet, find it with `testsprite result list --test <test-id>`.'
   );
 }
 

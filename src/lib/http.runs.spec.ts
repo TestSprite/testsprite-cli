@@ -52,7 +52,7 @@ describe('HttpClient.triggerRun', () => {
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {
       capturedUrl = input.toString();
       return jsonResponse({
-        runId: 'run_1',
+        resultId: 'run_1',
         status: 'queued',
         enqueuedAt: '2026-05-15T10:00:00.000Z',
         codeVersion: 'v1',
@@ -70,7 +70,7 @@ describe('HttpClient.triggerRun', () => {
       const headers = new Headers(init?.headers);
       capturedIdempotencyKey = headers.get('idempotency-key') ?? '';
       return jsonResponse({
-        runId: 'run_1',
+        resultId: 'run_1',
         status: 'queued',
         enqueuedAt: '2026-05-15T10:00:00.000Z',
         codeVersion: 'v1',
@@ -87,7 +87,7 @@ describe('HttpClient.triggerRun', () => {
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       capturedBody = (init?.body as string) ?? '';
       return jsonResponse({
-        runId: 'run_1',
+        resultId: 'run_1',
         status: 'queued',
         enqueuedAt: '2026-05-15T10:00:00.000Z',
         codeVersion: 'v1',
@@ -107,7 +107,7 @@ describe('HttpClient.triggerRun', () => {
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       capturedBody = (init?.body as string) ?? '';
       return jsonResponse({
-        runId: 'run_1',
+        resultId: 'run_1',
         status: 'queued',
         enqueuedAt: '2026-05-15T10:00:00.000Z',
         codeVersion: 'v1',
@@ -123,7 +123,7 @@ describe('HttpClient.triggerRun', () => {
 
   it('returns the TriggerRunResponse shape', async () => {
     const triggerResp: TriggerRunResponse = {
-      runId: 'run_xyz',
+      resultId: 'run_xyz',
       status: 'queued',
       enqueuedAt: '2026-05-15T10:00:00.000Z',
       codeVersion: 'v3',
@@ -169,7 +169,7 @@ describe('HttpClient.triggerRun', () => {
       if (callCount === 1) return errorEnvelopeResponse(409, 'CONFLICT');
       // This success response must never be reached for triggerRun.
       return jsonResponse({
-        runId: 'run_should_not_be_returned',
+        resultId: 'run_should_not_be_returned',
         status: 'queued',
         enqueuedAt: '2026-05-15T10:00:00.000Z',
         codeVersion: 'v1',
@@ -199,7 +199,7 @@ describe('HttpClient.triggerRun', () => {
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {
       capturedUrl = input.toString();
       return jsonResponse({
-        runId: 'run_1',
+        resultId: 'run_1',
         status: 'queued',
         enqueuedAt: '2026-05-15T10:00:00.000Z',
         codeVersion: 'v1',
@@ -218,7 +218,7 @@ describe('HttpClient.triggerRun', () => {
 
 describe('HttpClient.getRun', () => {
   const SAMPLE_RUN: RunResponse = {
-    runId: 'run_1',
+    resultId: 'run_1',
     testId: 'test_abc',
     testTitle: null,
     projectId: 'project_xyz',
@@ -327,7 +327,7 @@ describe('HttpClient.getRun', () => {
 describe('HttpClient.triggerRunWithMeta', () => {
   it('returns requestId alongside the body', async () => {
     const triggerResp = {
-      runId: 'run_withMeta',
+      resultId: 'run_withMeta',
       status: 'queued' as const,
       enqueuedAt: '2026-05-21T00:00:00.000Z',
       codeVersion: 'v1',
@@ -379,7 +379,7 @@ describe('HttpClient — onTransition callback', () => {
         );
       }
       return jsonResponse({
-        runId: 'run_ok',
+        resultId: 'run_ok',
         status: 'queued',
         enqueuedAt: '2026-05-21T00:00:00Z',
         codeVersion: 'v1',
@@ -532,7 +532,7 @@ describe('HttpClient.triggerRun — INSUFFICIENT_CREDITS vs RATE_LIMITED retry',
 
 describe('HttpClient.triggerBatchRunFresh — whole-request 429', () => {
   const okBody = {
-    accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-10-22T00:00:00Z' }],
+    accepted: [{ testId: 't1', resultId: 'run_1', enqueuedAt: '2026-10-22T00:00:00Z' }],
     conflicts: [],
     deferred: [],
     skippedFrontend: [],

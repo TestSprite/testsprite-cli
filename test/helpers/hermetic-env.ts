@@ -12,6 +12,9 @@
  *    recipe never isolated Windows runs. Both vars are redirected to a
  *    throwaway dir so no test can read or write `~/.testsprite`.
  *
+ * The GitHub Actions job variables are unset by `no-github-job-env.ts`,
+ * which the e2e config loads too.
+ *
  * Tests that need these vars set them explicitly (on `process.env` or via
  * injected `env` deps) after this runs.
  */

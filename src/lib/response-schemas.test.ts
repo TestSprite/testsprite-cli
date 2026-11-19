@@ -8,19 +8,16 @@ import { describe, expect, it } from 'vitest';
 import * as v from 'valibot';
 import { HttpClient } from './http.js';
 import {
-  BATCH_RERUN_RESPONSE_SCHEMA,
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
-  LIST_RUNS_RESPONSE_SCHEMA,
   ME_IDENTITY_SCHEMA,
   ME_RESPONSE_SCHEMA,
-  RERUN_RESPONSE_SCHEMA,
   RUN_RESPONSE_SCHEMA,
   TRIGGER_RUN_RESPONSE_SCHEMA,
   USAGE_RESPONSE_SCHEMA,
 } from './response-schemas.js';
 
 const VALID_RUN = {
-  runId: 'run_1',
+  resultId: 'run_1',
   testId: 'test_1',
   projectId: 'p_1',
   userId: 'u_1',
@@ -116,7 +113,7 @@ describe('RUN_RESPONSE_SCHEMA', () => {
     }
   });
 
-  it('accepts dashboardUrl: null without failing validation (a null must never take down `test wait`)', () => {
+  it('accepts dashboardUrl: null without failing validation (a null must never take down `run wait`)', () => {
     const parsed = v.safeParse(RUN_RESPONSE_SCHEMA, { ...VALID_RUN, dashboardUrl: null });
     expect(parsed.success).toBe(true);
     if (parsed.success) {
@@ -181,7 +178,7 @@ describe('HttpClient schema hook', () => {
 
 describe('TRIGGER_RUN_RESPONSE_SCHEMA', () => {
   const QUEUED = {
-    runId: 'run_1',
+    resultId: 'run_1',
     status: 'queued',
     enqueuedAt: '2026-06-01T10:00:00.000Z',
     codeVersion: 'v1',
@@ -220,225 +217,6 @@ describe('TRIGGER_RUN_RESPONSE_SCHEMA', () => {
     // must not slip through as "no link".
     const nulled = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, { ...QUEUED, dashboardUrl: null });
     expect(nulled.success).toBe(false);
-  });
-});
-
-describe('RERUN_RESPONSE_SCHEMA — portal links', () => {
-  const base = {
-    runId: 'run_1',
-    status: 'queued',
-    enqueuedAt: '2026-06-01T10:00:00.000Z',
-    codeVersion: 'v1',
-    autoHeal: false,
-  };
-
-  it('carries the portal links through and keeps an omitted one absent', () => {
-    const linked = v.safeParse(RERUN_RESPONSE_SCHEMA, {
-      ...base,
-      dashboardUrl: 'https://portal.example.com/dashboard-v3/o/org/projects/p/test-cases/c',
-    });
-    expect(linked.success).toBe(true);
-    if (linked.success) {
-      expect(linked.output.dashboardUrl).toBe(
-        'https://portal.example.com/dashboard-v3/o/org/projects/p/test-cases/c',
-      );
-      expect('executionUrl' in linked.output).toBe(false);
-    }
-    const bare = v.safeParse(RERUN_RESPONSE_SCHEMA, base);
-    expect(bare.success).toBe(true);
-    if (bare.success) expect('dashboardUrl' in bare.output).toBe(false);
-  });
-});
-
-describe('LIST_RUNS_RESPONSE_SCHEMA', () => {
-  const HISTORY_ROW = {
-    runId: 'run_1',
-    status: 'passed',
-    source: 'cli',
-    isRerun: false,
-    createdFrom: null,
-    createdAt: '2026-06-01T10:00:00.000Z',
-    startedAt: null,
-    finishedAt: '2026-06-01T10:00:30.000Z',
-    codeVersion: 'v1',
-    failureKind: null,
-  };
-
-  it('accepts optional plan metadata including unlimited retention and preserves it', () => {
-    const meta = {
-      testKind: 'frontend',
-      tier: 'Pro',
-      retentionDays: null,
-      hiddenCount: 0,
-      billingUrl: 'https://portal.example/dashboard-v3/o/org-1/settings/billing',
-    };
-    const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
-      runs: [HISTORY_ROW],
-      nextCursor: null,
-      meta,
-    });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) expect(parsed.output.meta).toEqual(meta);
-  });
-
-  it('accepts a history row with codeVersion: null (pre-M3.2 rows, tests with no code body)', () => {
-    const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
-      runs: [{ ...HISTORY_ROW, codeVersion: null }],
-      nextCursor: null,
-      meta: {},
-    });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.runs[0]?.codeVersion).toBeNull();
-    }
-  });
-
-  it('accepts a history row with targetUrl: null + targetUrlSource: null', () => {
-    const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
-      runs: [{ ...HISTORY_ROW, targetUrl: null, targetUrlSource: null }],
-      nextCursor: null,
-      meta: {},
-    });
-    expect(parsed.success).toBe(true);
-  });
-});
-
-const VALID_RERUN = {
-  runId: 'run_rerun_1',
-  status: 'queued',
-  enqueuedAt: '2026-06-01T10:00:00.000Z',
-  codeVersion: 'v1',
-  autoHeal: false,
-};
-
-describe('RERUN_RESPONSE_SCHEMA — advisories (optional additive field)', () => {
-  it('accepts a response with no advisories field (every V2 response, older backends)', () => {
-    const parsed = v.safeParse(RERUN_RESPONSE_SCHEMA, VALID_RERUN);
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect((parsed.output as { advisories?: unknown }).advisories).toBeUndefined();
-    }
-  });
-
-  it('accepts and preserves advisories when present (V3-routed rerun with autoHeal:false)', () => {
-    const parsed = v.safeParse(RERUN_RESPONSE_SCHEMA, {
-      ...VALID_RERUN,
-      advisories: [
-        {
-          feature: 'autoHeal',
-          message:
-            'The auto-heal opt-out was forwarded to the execution engine but is not yet enforced there.',
-        },
-      ],
-    });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.advisories).toEqual([
-        {
-          feature: 'autoHeal',
-          message:
-            'The auto-heal opt-out was forwarded to the execution engine but is not yet enforced there.',
-        },
-      ]);
-    }
-  });
-
-  it('accepts an empty advisories array', () => {
-    const parsed = v.safeParse(RERUN_RESPONSE_SCHEMA, { ...VALID_RERUN, advisories: [] });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.advisories).toEqual([]);
-    }
-  });
-});
-
-const VALID_BATCH_RERUN = {
-  accepted: [{ testId: 'test_1', runId: 'run_1', enqueuedAt: '2026-06-01T10:00:00.000Z' }],
-  deferred: [],
-  conflicts: [],
-  closure: { byProject: [] },
-};
-
-describe('BATCH_RERUN_RESPONSE_SCHEMA — advisories (optional additive field)', () => {
-  it('accepts a response with no advisories field', () => {
-    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, VALID_BATCH_RERUN);
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect((parsed.output as { advisories?: unknown }).advisories).toBeUndefined();
-    }
-  });
-
-  it('accepts and preserves advisories when present', () => {
-    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, {
-      ...VALID_BATCH_RERUN,
-      advisories: [{ feature: 'autoHeal', message: 'not yet enforced' }],
-    });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.advisories).toEqual([
-        { feature: 'autoHeal', message: 'not yet enforced' },
-      ]);
-    }
-  });
-});
-
-describe('BATCH_RERUN_RESPONSE_SCHEMA — conflicts without a currentRunId', () => {
-  // A refusal that never started a run has no id to report. Requiring one
-  // failed the whole command, including the runs it had already dispatched.
-  it('accepts a conflict entry carrying no currentRunId', () => {
-    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, {
-      ...VALID_BATCH_RERUN,
-      conflicts: [{ testId: 'test_2' }],
-    });
-    expect(parsed.success).toBe(true);
-  });
-
-  it('accepts and preserves a no_producer conflict with its reason and message', () => {
-    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, {
-      ...VALID_BATCH_RERUN,
-      conflicts: [
-        {
-          testId: 'test_2',
-          reason: 'no_producer',
-          message: 'Missing upstream variable(s): "project_id" (no producer declared)',
-        },
-      ],
-    });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.conflicts[0]?.currentRunId).toBeUndefined();
-      expect(parsed.output.conflicts[0]?.reason).toBe('no_producer');
-      expect(parsed.output.conflicts[0]?.message).toContain('no producer declared');
-    }
-  });
-
-  it('still accepts an in-flight conflict that DOES carry currentRunId', () => {
-    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, {
-      ...VALID_BATCH_RERUN,
-      conflicts: [{ testId: 'test_2', currentRunId: 'run_9', reason: 'in_flight' }],
-    });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.conflicts[0]?.currentRunId).toBe('run_9');
-    }
-  });
-
-  // The three run-shaped responses answer the same question, so a client that
-  // handles one conflict entry should handle all three.
-  it('matches the fresh-run and test-list schemas, which already allowed this', () => {
-    const bare = { testId: 'test_2' };
-    expect(
-      v.safeParse(BATCH_RUN_FRESH_RESPONSE_SCHEMA, {
-        accepted: [],
-        conflicts: [bare],
-        deferred: [],
-        skippedFrontend: [],
-        skippedIntegration: [],
-      }).success,
-    ).toBe(true);
-    expect(
-      v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, { ...VALID_BATCH_RERUN, conflicts: [bare] }).success,
-    ).toBe(true);
   });
 });
 
@@ -492,7 +270,7 @@ describe('ME_IDENTITY_SCHEMA', () => {
 
 describe('BATCH_RUN_FRESH_RESPONSE_SCHEMA — project-level dashboardUrl contract', () => {
   const VALID_BATCH = {
-    accepted: [{ testId: 't1', runId: 'r1', enqueuedAt: '2026-09-02T00:00:00.000Z' }],
+    accepted: [{ testId: 't1', resultId: 'r1', enqueuedAt: '2026-09-02T00:00:00.000Z' }],
     conflicts: [],
     deferred: [],
     skippedFrontend: [],
@@ -528,42 +306,22 @@ describe('BATCH_RUN_FRESH_RESPONSE_SCHEMA — project-level dashboardUrl contrac
 });
 
 describe('environment stamp — optional on every run-shaped payload', () => {
-  const HISTORY_ROW_BASE = {
-    runId: 'run_1',
-    status: 'passed',
-    source: 'cli',
-    isRerun: false,
-    createdFrom: null,
-    createdAt: '2026-06-01T10:00:00.000Z',
-    startedAt: null,
-    finishedAt: '2026-06-01T10:00:30.000Z',
-    codeVersion: 'v1',
-    failureKind: null,
-  };
-
-  it('history row: accepts environment, with a null targetUrlSource on a V3 row', () => {
-    const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
-      runs: [
-        {
-          ...HISTORY_ROW_BASE,
-          targetUrl: 'http://127.0.0.1:55015',
-          // V3: the environment IS the target — there is no separate provenance.
-          targetUrlSource: null,
-          environment: { id: 'env_1', name: 'local-dev' },
-        },
-        { ...HISTORY_ROW_BASE, environment: null },
-        HISTORY_ROW_BASE,
+  it('run: accepts environment and null, and keeps an absent environment absent', () => {
+    for (const [environment, expected] of [
+      [
+        { id: 'env_1', name: 'local-dev' },
+        { id: 'env_1', name: 'local-dev' },
       ],
-      nextCursor: null,
-      meta: {},
-    });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.runs[0]!.environment).toEqual({ id: 'env_1', name: 'local-dev' });
-      expect(parsed.output.runs[1]!.environment).toBeNull();
-      // Absent stays absent — no default materialised.
-      expect('environment' in parsed.output.runs[2]!).toBe(false);
+      [null, null],
+    ] as const) {
+      const parsed = v.safeParse(RUN_RESPONSE_SCHEMA, { ...VALID_RUN, environment });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.output.environment).toEqual(expected);
     }
+    const absent = v.safeParse(RUN_RESPONSE_SCHEMA, VALID_RUN);
+    expect(absent.success).toBe(true);
+    // Absent stays absent — no default materialised.
+    if (absent.success) expect('environment' in absent.output).toBe(false);
   });
 
   it('GET /runs/{id} and POST /runs accept `environment` and stay valid without it', () => {
@@ -575,7 +333,7 @@ describe('environment stamp — optional on every run-shaped payload', () => {
     expect(v.safeParse(RUN_RESPONSE_SCHEMA, VALID_RUN).success).toBe(true);
 
     const trigger = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, {
-      runId: 'run_1',
+      resultId: 'run_1',
       status: 'queued',
       enqueuedAt: '2026-06-01T10:00:00.000Z',
       codeVersion: 'v1',
@@ -636,46 +394,36 @@ describe('ME_IDENTITY_SCHEMA', () => {
     expect(v.safeParse(ME_IDENTITY_SCHEMA, { userId: 'u-doc', keyId: 'k-doc' }).success).toBe(true);
   });
 
-  it('carries v3Enabled through so the routing advisory still fires', () => {
-    const parsed = v.safeParse(ME_IDENTITY_SCHEMA, { ...VALID_ME, v3Enabled: true });
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.v3Enabled).toBe(true);
-    }
-  });
-
   it('rejects a wrongly-typed identity field', () => {
     expect(v.safeParse(ME_IDENTITY_SCHEMA, { userId: 42 }).success).toBe(false);
   });
 });
 
 describe('USAGE_RESPONSE_SCHEMA', () => {
-  it("accepts today's /me body, which carries no credits fields at all", () => {
-    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, VALID_ME);
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.output.credits).toBeUndefined();
-      // `scopes` is not part of the usage projection but must survive as an
-      // unknown extra key so `--output json` stays byte-faithful.
-      expect((parsed.output as { scopes?: string[] }).scopes).toEqual(VALID_ME.scopes);
-    }
-  });
-
-  it('accepts the future body with credits, plan and per-run cost', () => {
-    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, {
+  it('accepts the identity core and preserves wire extras for --output json', () => {
+    const wire = {
       ...VALID_ME,
       credits: 100,
       subPlan: 'Standard',
       creditsPerRun: 2,
-    });
+      v3Enabled: true,
+    };
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, wire);
     expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      // Not part of the usage projection, but must survive as unknown extra
+      // keys so `--output json` stays byte-faithful.
+      expect(parsed.output).toEqual(wire);
+    }
   });
 
-  it('rejects a non-numeric credit balance instead of rendering NaN math', () => {
-    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, { ...VALID_ME, credits: '100' });
+  it('rejects a /me body without its identity core, naming the path', () => {
+    const withoutKeyId: Record<string, unknown> = { ...VALID_ME };
+    delete withoutKeyId.keyId;
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, withoutKeyId);
     expect(parsed.success).toBe(false);
     if (!parsed.success) {
-      expect(parsed.issues.some(issue => v.getDotPath(issue) === 'credits')).toBe(true);
+      expect(parsed.issues.some(issue => v.getDotPath(issue) === 'keyId')).toBe(true);
     }
   });
 });

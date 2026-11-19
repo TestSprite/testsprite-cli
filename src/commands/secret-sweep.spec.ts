@@ -14,7 +14,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { runCreate, runUpdate, type ProjectDeps } from './project.js';
+import type { ProjectDeps } from './project.js';
 import { runEnvCreate, runEnvUpdate } from './project-env.js';
 
 const FIXTURE_PASSWORD = 'hunter2-FIXTURE-SWEEP-DO-NOT-PRINT';
@@ -22,9 +22,9 @@ const FIXTURE_PASSWORD = 'hunter2-FIXTURE-SWEEP-DO-NOT-PRINT';
 function makeCreds(): { credentialsPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'cli-secret-sweep-'));
   const credentialsPath = join(dir, 'credentials');
-  // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture: `dir` comes from this function's own mkdtempSync() call.
+
   mkdirSync(dir, { recursive: true });
-  // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture: `credentialsPath` is inside that mkdtempSync() directory.
+
   writeFileSync(
     credentialsPath,
     `[default]\napi_url = http://localhost:13599\napi_key = sk-user-test\n`,
@@ -67,24 +67,6 @@ const ENV_RESPONSE = {
     enableOtp: false,
     updatedAt: '2026-09-09T00:00:00.000Z',
   },
-};
-
-const PROJECT_CREATE_RESPONSE = {
-  projectId: 'p_1',
-  id: 'p_1',
-  name: 'Secret Sweep Project',
-  type: 'frontend' as const,
-  createdFrom: 'cli' as const,
-  createdAt: '2026-09-09T00:00:00.000Z',
-  updatedAt: '2026-09-09T00:00:00.000Z',
-  targetUrl: 'https://example.com',
-};
-
-const PROJECT_UPDATE_RESPONSE = {
-  projectId: 'p_1',
-  id: 'p_1',
-  updatedFields: ['password'],
-  updatedAt: '2026-09-09T00:00:00.000Z',
 };
 
 describe('fixture-password sweep — never appears in stdout, stderr, or --debug output', () => {
@@ -135,50 +117,7 @@ describe('fixture-password sweep — never appears in stdout, stderr, or --debug
     },
   );
 
-  it.each(outputs.flatMap(output => dryRuns.map(dryRun => [output, dryRun] as const)))(
-    'project create --output %s --dry-run=%s',
-    async (output, dryRun) => {
-      const { credentialsPath } = makeCreds();
-      const { deps, all } = capture();
-      await runCreate(
-        {
-          profile: 'default',
-          output,
-          debug: true,
-          dryRun,
-          type: 'frontend',
-          name: 'Secret Sweep Project',
-          targetUrl: 'https://example.com',
-          username: 'qa@example.com',
-          password: FIXTURE_PASSWORD,
-        },
-        { credentialsPath, fetchImpl: fetchReturning(PROJECT_CREATE_RESPONSE), ...deps },
-      );
-      expect(all()).not.toContain(FIXTURE_PASSWORD);
-    },
-  );
-
-  it.each(outputs.flatMap(output => dryRuns.map(dryRun => [output, dryRun] as const)))(
-    'project update --output %s --dry-run=%s',
-    async (output, dryRun) => {
-      const { credentialsPath } = makeCreds();
-      const { deps, all } = capture();
-      await runUpdate(
-        {
-          profile: 'default',
-          output,
-          debug: true,
-          dryRun,
-          projectId: 'p_1',
-          password: FIXTURE_PASSWORD,
-        },
-        { credentialsPath, fetchImpl: fetchReturning(PROJECT_UPDATE_RESPONSE), ...deps },
-      );
-      expect(all()).not.toContain(FIXTURE_PASSWORD);
-    },
-  );
-
-  // NOTE on scope: these four commands never print or catch a thrown
+  // NOTE on scope: these commands never print or catch a thrown
   // ApiError themselves — a server error just rejects the returned promise
   // for the CLI's top-level handler (`index.ts`) to render. So a server
   // that echoed the password back in an error envelope's `details` would

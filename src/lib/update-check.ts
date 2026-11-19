@@ -39,6 +39,7 @@ import { dirname, join } from 'node:path';
 import * as v from 'valibot';
 import { VERSION } from '../version.js';
 import type { FetchImpl } from './http.js';
+import { terminalSafeLine, terminalSafeWriter } from './terminal-text.js';
 
 /** Re-check interval: 24 hours, expressed in milliseconds. */
 export const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
@@ -112,7 +113,7 @@ function resolveUpdateCheckDeps(deps: UpdateCheckDeps): ResolvedUpdateCheckDeps 
         mkdirSync(dir, { recursive: true });
       }),
     isTTY: deps.isTTY ?? process.stderr.isTTY === true,
-    stderr: deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)),
+    stderr: terminalSafeWriter(deps.stderr),
     currentVersion: deps.currentVersion ?? VERSION,
   };
 }
@@ -274,7 +275,7 @@ export async function maybeNotifyUpdate(deps: UpdateCheckDeps = {}): Promise<voi
     // User-facing advisory copy (exact format specified by issue #122), not a
     // diagnostic log line; stderr keeps stdout parseable for scripts.
     resolved.stderr(
-      `A new version of testsprite-cli is available: ${resolved.currentVersion} -> ${latest}. ` +
+      `A new version of testsprite-cli is available: ${resolved.currentVersion} -> ${terminalSafeLine(latest)}. ` +
         `Run npm install -g @testsprite/testsprite-cli to update. ` +
         `(Disable with ${UPDATE_CHECK_OPT_OUT_ENV}=1)`,
     );

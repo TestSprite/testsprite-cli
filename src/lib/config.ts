@@ -76,7 +76,7 @@ export function loadConfig(options: LoadConfigOptions = {}): Config {
   // also avoids a confusing VALIDATION_ERROR: an empty name fails the INI
   // section-name guard, so without normalization a blank env var would break
   // every command instead of falling back to the default profile. Matches the
-  // normalization in auth configure and init/setup.
+  // normalization in setup.
   const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   const envApiKey = normalizeEnvVar(env.TESTSPRITE_API_KEY);
   const explicitApiUrl = options.endpointUrl ?? envApiUrl;

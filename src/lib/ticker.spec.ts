@@ -571,3 +571,54 @@ describe('createTicker — note() (standalone lines while the ticker is live)', 
     expect(lines.join('')).not.toContain('\x1b');
   });
 });
+
+describe('createTicker — server text', () => {
+  /** A status line carrying a window title, a clear screen, an 8-bit CSI and a line break. */
+  const EVIL = 'Result r1\u001b]0;pwned\u0007\u001b[2J\u009b31m\nforged — running';
+
+  it('the in-place line keeps only its own clear-line escape', () => {
+    const raw: string[] = [];
+    // Wide enough that the line is not cut.
+    withStderrColumns(120, () => {
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+      ticker.update(EVIL);
+      ticker.finalize(EVIL);
+    });
+    const writes = raw.filter(text => text !== '\n');
+    // The update and the final line, each checked below.
+    expect(writes).toHaveLength(2);
+    for (const write of writes) {
+      // eslint-disable-next-line no-control-regex -- the ticker's own clear-line escape.
+      const content = write.replace(/^\u001b\[2K\r/, '');
+      expect(content).toMatch(/Result r1 forged — running$/);
+      // eslint-disable-next-line no-control-regex -- finding control characters is the point.
+      expect(content).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+    }
+  });
+
+  it('a note keeps its line breaks and loses its escapes', () => {
+    const raw: string[] = [];
+    const lines: string[] = [];
+    const tty = createTicker(
+      () => {},
+      true,
+      text => raw.push(text),
+      false,
+    );
+    tty.note(EVIL);
+    expect(raw).toEqual(['Result r1\nforged — running\n']);
+    const plain = createTicker(
+      line => lines.push(line),
+      false,
+      () => {},
+      false,
+    );
+    plain.note(EVIL);
+    expect(lines).toEqual(['Result r1\nforged — running']);
+  });
+});

@@ -29,15 +29,26 @@ describe('describeConflict', () => {
     expect(describeConflict({ testId: 't', reason: 'error' })).toBe('dispatch failed');
   });
 
-  it('in_flight names the run id when present', () => {
-    expect(describeConflict({ testId: 't', reason: 'in_flight', currentRunId: 'run-1' })).toBe(
-      'already in flight (run run-1)',
-    );
+  it('in_flight names the launch holding the test when the backend sends it', () => {
+    expect(
+      describeConflict({
+        testId: 't',
+        reason: 'in_flight',
+        currentResultId: 'result-1',
+        currentRunId: 'run-1',
+      }),
+    ).toBe('already in flight (run run-1)');
+  });
+
+  it('in_flight from an older backend names the result, never as a run', () => {
+    expect(
+      describeConflict({ testId: 't', reason: 'in_flight', currentResultId: 'result-1' }),
+    ).toBe('already in flight (result result-1)');
   });
 
   it('absent reason (legacy backend) renders as the historical "already in flight"', () => {
-    expect(describeConflict({ testId: 't', currentRunId: 'run-1' })).toBe(
-      'already in flight (run run-1)',
+    expect(describeConflict({ testId: 't', currentResultId: 'result-1' })).toBe(
+      'already in flight (result result-1)',
     );
     expect(describeConflict({ testId: 't' })).toBe('already in flight');
   });
@@ -46,8 +57,8 @@ describe('describeConflict', () => {
 describe('summarizeConflicts', () => {
   it('groups by reason with counts', () => {
     const summary = summarizeConflicts([
-      { testId: 'a', reason: 'in_flight', currentRunId: 'r1' },
-      { testId: 'b', reason: 'in_flight', currentRunId: 'r2' },
+      { testId: 'a', reason: 'in_flight', currentResultId: 'r1' },
+      { testId: 'b', reason: 'in_flight', currentResultId: 'r2' },
       { testId: 'c', reason: 'local_address' },
     ]);
     expect(summary).toContain('2 already in flight');
@@ -73,8 +84,8 @@ describe('summarizeConflicts', () => {
     expect(
       summarizeConflicts([
         { testId: 'a', reason: 'no_producer' },
-        { testId: 'b', reason: 'producer_in_flight', currentRunId: 'r1' },
-        { testId: 'c', reason: 'producer_in_flight', currentRunId: 'r2' },
+        { testId: 'b', reason: 'producer_in_flight', currentResultId: 'r1' },
+        { testId: 'c', reason: 'producer_in_flight', currentResultId: 'r2' },
       ]),
     ).toBe('1 no producer for its variables, 2 producer running in another run');
   });
@@ -99,12 +110,12 @@ describe('dependency conflict reasons', () => {
       describeConflict({
         testId: 't',
         reason: 'producer_in_flight',
-        currentRunId: 'run-9',
+        currentResultId: 'run-9',
         message: '"token" — producer: "Login" is running in another run (run run-9)',
       }),
     ).toContain('producer: "Login"');
     expect(
-      describeConflict({ testId: 't', reason: 'producer_in_flight', currentRunId: 'run-9' }),
+      describeConflict({ testId: 't', reason: 'producer_in_flight', currentResultId: 'run-9' }),
     ).toBe('its producer is running in another run');
     expect(describeConflict({ testId: 't', reason: 'producer_in_flight' })).toBe(
       'its producer is running in another run',
@@ -207,7 +218,7 @@ describe('paused-workspace batch refusal', () => {
     expect(err.code).toBe('FEATURE_GATED');
     expect(err.exitCode).toBe(13);
     expect(err.message).toBe('Workspace paused.');
-    expect(err.nextAction).toContain('https://www.testsprite.com/dashboard/settings/billing');
+    expect(err.nextAction).toContain('https://www.testsprite.com/dashboard-v3/settings/billing');
     expect(err.details).toEqual({ reason: 'paused', conflicts: ['a', 'b'] });
   });
 
@@ -233,7 +244,7 @@ describe('insufficientCreditsConflictError', () => {
     expect(err.code).toBe('INSUFFICIENT_CREDITS');
     expect(err.exitCode).toBe(12);
     expect(err.message).toBe('Insufficient credits — nothing was queued (2 tests refused).');
-    expect(err.nextAction).toContain('dashboard/settings/billing');
+    expect(err.nextAction).toContain('dashboard-v3/settings/billing');
     expect(err.nextAction).toContain('testsprite usage');
     expect(err.requestId).toBe('local');
     expect(err.details).toEqual({ reason: 'insufficient_credits', conflicts: ['a', 'b'] });
@@ -246,6 +257,6 @@ describe('insufficientCreditsConflictError', () => {
     ]);
     expect(err.message).toBe('Insufficient credits: need 1.');
     // Unknown API host → route-only hint (no fabricated domain).
-    expect(err.nextAction).toContain('/dashboard/settings/billing');
+    expect(err.nextAction).toContain('/dashboard-v3/settings/billing');
   });
 });

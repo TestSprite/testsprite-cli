@@ -1,4 +1,4 @@
-import { TunnelLostError } from '../lib/tunnel-session.js';
+import { waitForRun, resolveRunWaitFailure, type RunWaitOutcome } from '../lib/run-wait.js';
 import {
   resolveEnvironmentRunTarget,
   readEnvironmentPreflight,
@@ -10,7 +10,7 @@ import {
 } from '../lib/environment-tunnel.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
-import type { TunnelClientHandle } from '../lib/tunnel-session.js';
+import { TunnelLostError, type TunnelClientHandle } from '../lib/tunnel-session.js';
 import { randomUUID } from 'node:crypto';
 import { Command } from 'commander';
 import {
@@ -34,8 +34,13 @@ import {
 } from '../lib/http.js';
 import { resolveProfileName } from '../lib/config.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
-import { pollRunUntilTerminal, TimeoutError } from '../lib/poll.js';
-import { emitCiArtifacts, summarizeAcceptedPayload } from '../lib/gh-output.js';
+import { emitCiArtifacts } from '../lib/gh-output.js';
+import {
+  buildRunOutput,
+  listResultReceipt,
+  previewRun,
+  renderRunResults,
+} from '../lib/run-output.js';
 import {
   billingConflictLink,
   describeConflict,
@@ -44,33 +49,35 @@ import {
   isPausedRefusal,
   pausedConflictError,
   summarizeConflicts,
+  type RunConflict,
 } from '../lib/conflict-reason.js';
 import { recordBatchOutcome } from '../lib/telemetry.js';
-import { formatRunProgressLine } from '../lib/run-progress.js';
-import { createTicker } from '../lib/ticker.js';
+import { markRunWaitInterrupt } from '../lib/render-error.js';
+import { interruptDetachMessage, launchIds, waitCommand } from '../lib/run-render.js';
 import {
   assertJUnitReportOptions,
   buildJUnitReport,
-  durationSecondsBetween,
   parseJUnitReportFormat,
   skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
+  writeReportOwing,
   assertArtifactPath,
   type JUnitReportFormat,
-  type JUnitTestResult,
 } from '../lib/junit-report.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
-import { resolveWaitFailure, waitMemberError } from '../lib/wait-exit.js';
 import type {
   CliDeleteTestListResponse,
   CliProjectEnvironment,
   CliTestList,
   CliTestListDetail,
   CliTestListListResponse,
-  CliTestListRunAccepted,
   CliTestListRunResponse,
 } from '../lib/testlist.types.js';
+import { terminalSafeLine, terminalSafeWriter } from '../lib/terminal-text.js';
+
+/** Why a `--case` id the server reports as not found was not dispatched. */
+const NOT_A_MEMBER_NOTE = 'not a member of this list (not dispatched)';
 
 export interface TestListDeps {
   shutdown?: ShutdownHandle;
@@ -88,22 +95,6 @@ export interface TestListDeps {
 type CommonOptions = FactoryCommonOptions;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Explain that interrupting a remote wait leaves unfinished runs executing and
- * billing, and name the commands to re-attach or cancel those specific runs.
- */
-function interruptDetachMessage(err: InterruptError, runIds: string[]): string {
-  const subject =
-    runIds.length === 1
-      ? `Run ${runIds[0]} is still executing on the server and will keep running (and billing) until it finishes.`
-      : `${runIds.length} runs are still executing on the server and will keep running (and billing) until they finish.`;
-  return (
-    `Interrupted (${err.signal}). ${subject}\n` +
-    `  Re-attach with: testsprite test wait ${runIds.join(' ')}\n` +
-    `  Cancel with:    testsprite test cancel ${runIds.join(' ')}`
-  );
-}
 
 function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const g = command.optsWithGlobals() as Partial<CommonOptions> & { requestTimeout?: string };
@@ -138,7 +129,7 @@ function emitIdempotencyKey(
   supplied?: string,
 ) {
   if (supplied === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
+    const stderr = terminalSafeWriter(deps.stderr);
     stderr(`idempotency-key: ${key}`);
   }
 }
@@ -163,18 +154,19 @@ function parseProjectEnvs(pairs: string[] | undefined): CliProjectEnvironment[] 
 const collectRepeatable = (value: string, acc: string[]): string[] => [...acc, value];
 
 function dryRunStderr(deps: TestListDeps): (line: string) => void {
-  return deps.stderr ?? (line => process.stderr.write(`${line}\n`));
+  return terminalSafeWriter(deps.stderr);
 }
 
 // Canned `--dry-run` samples (offline, no network) — the global `--dry-run`
-// contract promises a shape-accurate sample for every command.
+// contract promises a shape-accurate sample for every command. They are wire
+// shapes, printed under the output names like a real response.
 const DRY_RUN_LIST: CliTestList = {
   id: 'tl_dryrun',
   name: 'dry-run test list',
   orgId: 'org_dryrun',
   caseCount: 0,
   projectEnvironments: [],
-  lastExecutionId: null,
+  lastRunId: null,
   createdAt: '2026-05-16T00:00:00.000Z',
   updatedAt: '2026-05-16T00:00:00.000Z',
 };
@@ -182,7 +174,7 @@ const DRY_RUN_DETAIL: CliTestListDetail = {
   ...DRY_RUN_LIST,
   cases: [],
   stats: { total: 0, passed: 0, failed: 0, blocked: 0, running: 0 },
-  lastExecutionCreated: null,
+  lastRunCreated: null,
 };
 
 // ── run functions (called directly by tests) ─────────────────────────────────
@@ -197,12 +189,12 @@ export async function runTestlistList(
   }
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
-    out.print([DRY_RUN_LIST], data => renderTestListListText(data as CliTestList[], opts));
+    printTestLists(out, [DRY_RUN_LIST], opts);
     return [DRY_RUN_LIST];
   }
   const client = makeClient(opts, deps);
   const resp = await client.get<CliTestListListResponse>('/testlist');
-  out.print(resp.items, data => renderTestListListText(data as CliTestList[], opts));
+  printTestLists(out, resp.items, opts);
   return resp.items;
 }
 
@@ -213,14 +205,14 @@ export async function runTestlistGet(
   const out = makeOutput(opts.output, deps);
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
-    out.print(DRY_RUN_DETAIL, data => renderTestListDetailText(data as CliTestListDetail));
+    printTestListDetail(out, DRY_RUN_DETAIL);
     return DRY_RUN_DETAIL;
   }
   const client = makeClient(opts, deps);
   const detail = await client.get<CliTestListDetail>(
     `/testlist/${encodeURIComponent(opts.listId)}`,
   );
-  out.print(detail, data => renderTestListDetailText(data as CliTestListDetail));
+  printTestListDetail(out, detail);
   return detail;
 }
 
@@ -245,7 +237,7 @@ export async function runTestlistCreate(
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
     const sample = { ...DRY_RUN_DETAIL, name: opts.name };
-    out.print(sample, data => renderTestListDetailText(data as CliTestListDetail));
+    printTestListDetail(out, sample);
     return sample;
   }
 
@@ -254,7 +246,7 @@ export async function runTestlistCreate(
     body: { name: opts.name, ...(projectEnvironments ? { projectEnvironments } : {}) },
     headers: { 'idempotency-key': idempotencyKey },
   });
-  out.print(detail, data => renderTestListDetailText(data as CliTestListDetail));
+  printTestListDetail(out, detail);
   return detail;
 }
 
@@ -278,7 +270,7 @@ export async function runTestlistUpdate(
   }
   if (opts.idempotencyKey !== undefined) assertIdempotencyKey(opts.idempotencyKey);
   // `[]` (clear) vs the parsed array vs `undefined` (leave untouched) — the
-  // three cases the V3 update contract distinguishes.
+  // three cases the update contract distinguishes.
   const projectEnvironments = opts.clearProjectEnv ? [] : parseProjectEnvs(opts.projectEnv);
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-testlist-update-${randomUUID()}`;
@@ -287,7 +279,7 @@ export async function runTestlistUpdate(
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
     const sample = { ...DRY_RUN_DETAIL, ...(opts.name !== undefined ? { name: opts.name } : {}) };
-    out.print(sample, data => renderTestListDetailText(data as CliTestListDetail));
+    printTestListDetail(out, sample);
     return sample;
   }
 
@@ -302,7 +294,7 @@ export async function runTestlistUpdate(
       headers: { 'idempotency-key': idempotencyKey },
     },
   );
-  out.print(detail, data => renderTestListDetailText(data as CliTestListDetail));
+  printTestListDetail(out, detail);
   return detail;
 }
 
@@ -330,7 +322,10 @@ export async function runTestlistDelete(
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
     const sample: CliDeleteTestListResponse = { listId: opts.listId };
-    out.print(sample, data => `Deleted test list ${(data as CliDeleteTestListResponse).listId}`);
+    out.print(
+      sample,
+      data => `Deleted test list ${terminalSafeLine((data as CliDeleteTestListResponse).listId)}`,
+    );
     return sample;
   }
 
@@ -339,7 +334,10 @@ export async function runTestlistDelete(
     `/testlist/${encodeURIComponent(opts.listId)}`,
     { headers: { 'idempotency-key': idempotencyKey } },
   );
-  out.print(resp, data => `Deleted test list ${(data as CliDeleteTestListResponse).listId}`);
+  out.print(
+    resp,
+    data => `Deleted test list ${terminalSafeLine((data as CliDeleteTestListResponse).listId)}`,
+  );
   return resp;
 }
 
@@ -358,7 +356,7 @@ async function mutateCases(
 
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
-    out.print(DRY_RUN_DETAIL, data => renderTestListDetailText(data as CliTestListDetail));
+    printTestListDetail(out, DRY_RUN_DETAIL);
     return DRY_RUN_DETAIL;
   }
 
@@ -372,7 +370,7 @@ async function mutateCases(
     body: { testIds: opts.testIds },
     headers: { 'idempotency-key': idempotencyKey },
   });
-  out.print(detail, data => renderTestListDetailText(data as CliTestListDetail));
+  printTestListDetail(out, detail);
   return detail;
 }
 
@@ -397,7 +395,7 @@ const WAIT_REQUEST_TIMEOUT_CUSHION_MS = 5_000;
  * Under `--wait`, raise the per-request HTTP timeout to cover `--timeout` so a
  * slow trigger / long-poll on a large list isn't cut short by the default 120s
  * request deadline and mis-reported as a member timeout. Mirrors
- * `test run`'s `resolveWaitRequestTimeoutMs` (reimplemented locally to keep this
+ * `run`'s `resolveWaitRequestTimeoutMs` (reimplemented locally to keep this
  * file off the `test.ts` module — see the security-lint note on `run`).
  */
 export function waitRequestTimeoutMs(opts: {
@@ -414,7 +412,7 @@ export function waitRequestTimeoutMs(opts: {
   return Math.max(base, cover);
 }
 
-/** Parse `--timeout <s>` (1–3600, default 600). Mirrors `test run`'s bounds. */
+/** Parse `--timeout <s>` (1–3600, default 600). Mirrors `run`'s bounds. */
 function parseTestlistTimeoutFlag(raw: string | undefined): number {
   if (raw === undefined) return DEFAULT_TESTLIST_RUN_TIMEOUT_SECONDS;
   const n = Number(raw);
@@ -445,7 +443,7 @@ export interface RunTestlistRunOptions extends CommonOptions {
   wait: boolean;
   /** Shared poll deadline in seconds. */
   timeoutSeconds: number;
-  /** --max-concurrency: bounds the --wait poll fan-out. */
+  /** --max-concurrency: server dispatch limit per project execution. */
   maxConcurrency: number;
   idempotencyKey?: string;
   report?: JUnitReportFormat;
@@ -458,19 +456,8 @@ export interface RunTestlistRunOptions extends CommonOptions {
 }
 
 /**
- * One member of the `--wait` poll — shape shared with the JUnit builder, plus
- * the run's dashboard link so the CI annotations / summary table are clickable
- * (the JUnit report ignores the extra field).
- */
-type TestlistRunMemberResult = JUnitTestResult & {
-  dashboardUrl?: string;
-  executionUrl?: string;
-  testTitle?: string | null;
-};
-
-/**
  * Rate-deferred members were never dispatched → the batch is incomplete (exit 7),
- * mirroring `test run --all`. The backend applies the same per-key run-rate
+ * mirroring `run --project`. The backend applies the same per-key run-rate
  * soft-fold as `POST /tests/batch/run` and returns the overflow here, so a
  * partial dispatch surfaces as a non-zero exit instead of silently passing CI.
  */
@@ -494,15 +481,15 @@ function assertNoDeferred(resp: CliTestListRunResponse): void {
 function assertNoNotFound(resp: CliTestListRunResponse): void {
   if (!resp.notFound || resp.notFound.length === 0) return;
   throw new CLIError(
-    `${resp.notFound.length} --case id(s) not in this list: ${resp.notFound.join(' ')}`,
+    `${resp.notFound.length} test ID(s) not in this list: ${resp.notFound.join(' ')}`,
     4,
   );
 }
 
 /**
- * `testlist run` — dispatch the list's cases (optionally a `--case` subset) and,
- * with `--wait`, poll every returned runId to a verdict, optionally writing a
- * JUnit XML report (`--report junit`). testlist run is V3-only.
+ * `run --testlist` — dispatch the list's cases (optionally a `--case` subset) and,
+ * with `--wait`, poll every returned resultId to a verdict, optionally writing a
+ * JUnit XML report (`--report junit`).
  */
 function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
   if (opts.idempotencyKey !== undefined) assertIdempotencyKey(opts.idempotencyKey);
@@ -516,15 +503,15 @@ function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
       `must be an integer between 1 and ${MAX_TESTLIST_RUN_CONCURRENCY}`,
     );
   }
-  // Same report-flag rules as `test run` / `test rerun` via the shared
+  // Same report-flag rules as `run` via the shared
   // validator: orphan --report-file / --report-suite-name and --report junit
   // without --wait are refused before anything is dispatched (#569).
   assertJUnitReportOptions({ ...opts, wait: opts.wait === true, batchPath: true });
   // --gh-output / --summary-file reduce a --wait run's per-member results into the
   // CI summary. They require --wait (without it the command returns after dispatch,
   // before any terminal result exists) — reject loudly, same rule as --report junit
-  // above and the sibling `test run` flags. Gate only the EXPLICIT flags; the
-  // GITHUB_ACTIONS auto-enable must stay silent without --wait, same as `test run`.
+  // above and the sibling `run` flags. Gate only the EXPLICIT flags; the
+  // GITHUB_ACTIONS auto-enable must stay silent without --wait, same as `run`.
   if (opts.ghOutput === true && !opts.wait) {
     throw localValidationError(
       'gh-output',
@@ -543,10 +530,7 @@ function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
   if (opts.summaryFile !== undefined) assertArtifactPath('summary-file', opts.summaryFile);
 }
 
-export async function runTestlistRun(
-  opts: RunTestlistRunOptions,
-  deps: TestListDeps = {},
-): Promise<CliTestListRunResponse> {
+export async function runTestlistRun(opts: RunTestlistRunOptions, deps: TestListDeps = {}) {
   validateTestlistRunOptions({ ...opts, wait: opts.wait || (!opts.dryRun && !opts.noWait) });
   if (opts.dryRun || deps.environmentTunnel) return runTestlistRunCore(opts, deps);
   let client: HttpClient;
@@ -556,7 +540,7 @@ export async function runTestlistRun(
     validateTestlistRunOptions(opts);
     throw err;
   }
-  const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
+  const stderr = terminalSafeWriter(deps.stderr);
   let list: CliTestListDetail;
   try {
     list = await readEnvironmentPreflight<CliTestListDetail>(
@@ -613,7 +597,7 @@ export async function runTestlistRun(
     { ...opts, maxConcurrency, requestTimeoutMs: waitRequestTimeoutMs({ ...opts, wait: true }) },
     deps,
     [...targets.values()],
-    'testlist run',
+    'run',
     context => {
       context.targets = targets;
       context.skipped = backend;
@@ -630,22 +614,34 @@ export async function runTestlistRun(
  * On interruption, emit acknowledged runs and settled outcomes before rethrowing;
  * tunnel execution retains its separate cancellation and partial-output handling.
  */
-async function runTestlistRunCore(
-  opts: RunTestlistRunOptions,
-  deps: TestListDeps = {},
-): Promise<CliTestListRunResponse> {
+async function runTestlistRunCore(opts: RunTestlistRunOptions, deps: TestListDeps = {}) {
   validateTestlistRunOptions(opts);
   const out = makeOutput(opts.output, deps);
-  const stderrFn = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
+  const stderrFn = terminalSafeWriter(deps.stderr);
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-testlist-run-${randomUUID()}`;
   emitIdempotencyKey(opts, deps, idempotencyKey, opts.idempotencyKey);
 
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
-    const sample: CliTestListRunResponse = { accepted: [], conflicts: [], deferred: [] };
-    out.print(sample, () => 'dry-run: no runs dispatched');
-    return sample;
+    const path = `/api/cli/v1/testlist/${encodeURIComponent(opts.listId)}/run`;
+    const preview = previewRun(
+      [
+        {
+          method: 'POST',
+          path,
+          body: {
+            ...(opts.cases?.length ? { testIds: opts.cases } : {}),
+            maxConcurrency: opts.maxConcurrency,
+          },
+          idempotencyKey,
+        },
+      ],
+      opts.wait,
+      opts.wait,
+    );
+    out.print(preview, () => `dry-run: POST ${path}`);
+    return preview;
   }
 
   // Under --wait, raise the per-request timeout to cover --timeout (see helper).
@@ -655,21 +651,17 @@ async function runTestlistRunCore(
   let resp: CliTestListRunResponse;
   if (deps.environmentTunnel) {
     const targets = deps.environmentTunnel.targets!;
-    const groups = groupEnvironmentTargets(
-      opts.cases ?? [...targets.keys()],
-      targets,
-      deps.environmentTunnel.maxConcurrency,
-    );
+    const groups = groupEnvironmentTargets(opts.cases ?? [...targets.keys()], targets);
     const responses: CliTestListRunResponse[] = [];
     try {
       for (const [index, testIds] of groups.entries()) {
         const target = targets.get(testIds[0]!);
         const suffix = groups.length > 1 ? `:group${index}` : '';
-        if (target) await deps.environmentTunnel.waitForCapacity(testIds.length);
         const response = await client.triggerTestListRun(
           opts.listId,
           {
             testIds,
+            maxConcurrency: target ? deps.environmentTunnel.maxConcurrency : opts.maxConcurrency,
             ...(target
               ? { targetUrl: target.targetUrl, tunnelClientId: deps.environmentTunnel.clientId }
               : {}),
@@ -677,11 +669,28 @@ async function runTestlistRunCore(
           { idempotencyKey: `${idempotencyKey.slice(0, 256 - suffix.length)}${suffix}` },
         );
         responses.push(response);
-        if (target)
+        if (target) {
+          // The response also tells the tunnel which launch each result is in.
           await deps.environmentTunnel.confirm(
             response,
-            response.accepted.map(row => row.runId),
+            response.accepted.flatMap(row => (row.runId ? [row.runId] : [])),
           );
+          if (
+            response.accepted.some(row => row.runId) &&
+            (!Number.isInteger(response.maxConcurrency) ||
+              response.maxConcurrency! < 1 ||
+              response.maxConcurrency! > deps.environmentTunnel.maxConcurrency)
+          ) {
+            await deps.environmentTunnel.cancelActive();
+            throw new ApiError({
+              code: 'UNSUPPORTED',
+              message: 'The server did not confirm the requested local concurrency limit.',
+              nextAction: 'Upgrade the backend before retrying this local test-list run.',
+              requestId: 'local',
+              details: { field: 'maxConcurrency' },
+            });
+          }
+        }
       }
     } catch (err) {
       if (responses.length)
@@ -693,6 +702,7 @@ async function runTestlistRunCore(
           'testlist',
           err,
           deps.environmentTunnel,
+          NOT_A_MEMBER_NOTE,
         );
       throw err;
     }
@@ -711,7 +721,10 @@ async function runTestlistRunCore(
   } else {
     resp = await client.triggerTestListRun(
       opts.listId,
-      opts.cases && opts.cases.length > 0 ? { testIds: opts.cases } : {},
+      {
+        ...(opts.cases?.length ? { testIds: opts.cases } : {}),
+        maxConcurrency: opts.maxConcurrency,
+      },
       { idempotencyKey },
     );
   }
@@ -722,7 +735,7 @@ async function runTestlistRunCore(
   // also carried on `resp.notFound`).
   if (resp.notFound && resp.notFound.length > 0) {
     stderrFn(
-      `warning: ${resp.notFound.length} --case id(s) not in this list, skipped: ${resp.notFound.join(' ')}`,
+      `warning: ${resp.notFound.length} test ID(s) not in this list, skipped: ${terminalSafeLine(resp.notFound.join(' '))}`,
     );
   }
   if (resp.accepted.length > 0) {
@@ -730,13 +743,34 @@ async function runTestlistRunCore(
     if (link) stderrFn(`[advisory] Billing refusal for some tests.${link}`);
   }
 
+  const { accepted, ...dispatchMetadata } = resp;
+  const runIds = launchIds(accepted);
+  const receipts = runIds.map(runId => ({ runId }));
+  const dispatched = accepted.map(listResultReceipt);
+  const outputOptions = {
+    receipts,
+    dispatched,
+    wait: opts.wait,
+    buckets: dispatchMetadata,
+    notFoundNote: NOT_A_MEMBER_NOTE,
+    cancellation: deps.environmentTunnel?.cancellation,
+  };
+
   // All-conflict: nothing new dispatched because every targeted case is already
   // in flight → exit 6, for BOTH --wait and non-wait (a --wait over zero accepted
   // would otherwise no-op straight to exit 0). Distinct from the empty/no-match
   // case (accepted AND conflicts both empty), which is a legitimate success and
   // flows through the tail below so its CI artifacts are still emitted.
   if (resp.accepted.length === 0 && resp.conflicts.length > 0) {
-    out.print(resp, () => renderRunAcceptedText(resp));
+    const { output, summary } = buildRunOutput(outputOptions);
+    out.print({ ...output, ...dispatchMetadata }, () =>
+      renderRunResults(
+        output.runs,
+        output.results,
+        opts.wait ? summary : undefined,
+        conflictRows(resp.conflicts),
+      ),
+    );
     recordBatchOutcome({
       accepted: 0,
       conflicts: resp.conflicts,
@@ -749,28 +783,22 @@ async function runTestlistRunCore(
     // into the summary as non-passed rows. The non-wait path never emits CI
     // artifacts, matching the main tail below.
     if (opts.wait) {
-      const summary = summarizeAcceptedPayload(
-        JSON.stringify({
-          accepted: [],
-          conflicts: resp.conflicts,
-          deferred: resp.deferred,
-          // Include notFound too: a mixed `--case` selection can be
-          // all-conflict on its matched ids AND carry not-in-list ids, and the
-          // CI summary must report the whole requested set (same reason the
-          // main --wait envelope threads it). Undefined ⇒ JSON.stringify drops it.
-          notFound: resp.notFound,
-        }),
-        { notFoundNote: 'not a member of this list (not dispatched)' },
-      );
       if (opts.report === 'junit' && opts.reportFile !== undefined) {
+        const file = opts.reportFile;
         const suiteName = opts.reportSuiteName ?? `testsprite:testlist:${opts.listId}`;
-        await writeJUnitReportFile(
-          opts.reportFile,
-          buildJUnitReport({
-            suiteName,
-            classname: `testlist:${opts.listId}`,
-            results: skippedJUnitResultsFromSummary(summary),
-          }),
+        await writeReportOwing(
+          true,
+          () =>
+            writeJUnitReportFile(
+              file,
+              buildJUnitReport({
+                suiteName,
+                classname: `testlist:${opts.listId}`,
+                results: skippedJUnitResultsFromSummary(summary),
+              }),
+            ),
+          stderrFn,
+          { label: 'run' },
         );
       }
       emitCiArtifacts(
@@ -781,7 +809,7 @@ async function runTestlistRunCore(
           stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
           stderr: stderrFn,
         },
-        'testlist run',
+        'run',
       );
     }
     // Every case refused for credits → exit 12, the same INSUFFICIENT_CREDITS
@@ -793,9 +821,11 @@ async function runTestlistRunCore(
     if (isPausedRefusal(resp)) {
       throw pausedConflictError(resp.conflicts, client.resolvedBaseUrl);
     }
-    const pollIds = resp.conflicts
-      .map(c => c.currentRunId)
-      .filter((id): id is string => Boolean(id));
+    // `run wait` takes the launch holding each in-flight case; a conflict the
+    // backend named no launch for has no command to offer.
+    const poll = waitCommand(
+      resp.conflicts.map(c => ({ resultId: c.currentResultId, runId: c.currentRunId })),
+    );
     // Name the causes instead of blanket "already in flight" — a list pinned to
     // a local env or a view-only project is not something to poll. The poll hint
     // is emitted only for the cases that actually have an in-flight run. A
@@ -805,9 +835,7 @@ async function runTestlistRunCore(
     // printed earlier (guarded on `accepted.length > 0`) never showed it.
     throw new CLIError(
       `Nothing dispatched — ${resp.conflicts.length} conflict(s): ${summarizeConflicts(resp.conflicts)}` +
-        (pollIds.length > 0
-          ? `. Poll in-flight runs: testsprite test wait ${pollIds.join(' ')}`
-          : '') +
+        (poll ? `. Poll in-flight runs: ${poll}` : '') +
         billingConflictLink(resp.conflicts, client.resolvedBaseUrl),
       6,
     );
@@ -815,10 +843,12 @@ async function runTestlistRunCore(
 
   if (!opts.wait) {
     // Print what dispatched, or the empty/no-match reason. Exit 0.
-    out.print(resp, () =>
+    const { output } = buildRunOutput(outputOptions);
+    const launch = { ...output, ...dispatchMetadata };
+    out.print(launch, () =>
       resp.accepted.length > 0
-        ? renderRunAcceptedText(resp)
-        : `No runs dispatched${resp.reason ? ` (${resp.reason})` : ''}.`,
+        ? renderRunResults(output.runs, output.results, undefined, conflictRows(resp.conflicts))
+        : `No runs dispatched${resp.reason ? ` (${terminalSafeLine(resp.reason)})` : ''}.`,
     );
     recordBatchOutcome({
       accepted: resp.accepted.length,
@@ -828,298 +858,173 @@ async function runTestlistRunCore(
     });
     assertNoDeferred(resp);
     assertNoNotFound(resp);
-    return resp;
+    return launch;
   }
 
-  // --wait beyond this point. An empty/no-match run (zero accepted, zero
-  // conflicts) is NOT short-circuited: it flows through the fan-out (a no-op) and
-  // the report tail so an explicitly-requested --report junit still emits an
-  // empty-suite report rather than nothing.
-
-  // --- --wait fan-out ---
-  const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
-  const batchDeadlineMs =
-    deps.environmentTunnel?.deadlineMs ?? Date.now() + opts.timeoutSeconds * 1000;
-  const results: TestlistRunMemberResult[] = [];
-  const reportDurations = new Map<string, number | undefined>();
-
-  async function pollOne(entry: CliTestListRunAccepted): Promise<TestlistRunMemberResult> {
-    const remainingMs = batchDeadlineMs - Date.now();
-    if (remainingMs <= 0) {
-      return {
-        testId: entry.testId,
-        runId: entry.runId,
-        status: 'timeout',
-        error: {
-          code: 'UNSUPPORTED',
-          message: `Timed out after ${opts.timeoutSeconds}s`,
-          exitCode: 7,
-        },
-      };
-    }
-    try {
-      // testlist run is V3-only; V3 run rows (FE and BE) finalize via the
-      // execution completion path, so the run-surface poll resolves without the
-      // V2 BE-orphan-row fallback that `test run` needs.
-      const finalRun = await pollRunUntilTerminal(client, entry.runId, {
-        timeoutSeconds: Math.ceil(remainingMs / 1000),
-        sleep: deps.sleep,
-        onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
-        shutdown: deps.shutdown ?? globalShutdown,
-        onTick: (run, elapsedMs) => {
-          deps.environmentTunnel?.onPoll(run);
-          ticker.update(formatRunProgressLine(run, elapsedMs, `(${entry.testId})`));
-        },
-      });
-      reportDurations.set(
-        entry.runId,
-        durationSecondsBetween(finalRun.startedAt, finalRun.finishedAt, finalRun.createdAt),
-      );
-      return {
-        testId: entry.testId,
-        testTitle: finalRun.testTitle ?? null,
-        // Give the JUnit `<testcase name>` the human title too (testlist has no
-        // separate name sweep like `test run --all`, so this is its only source;
-        // renderTestcase falls back to the id when name is absent).
-        ...(finalRun.testTitle ? { name: finalRun.testTitle } : {}),
-        runId: entry.runId,
-        projectId: finalRun.projectId,
-        status: finalRun.status,
-        // Carry both SERVER-built links so the ::error:: annotations and the
-        // job-summary are clickable (parity with `test run --all`): the test-case
-        // page anchors the Test column title, the execution-result page anchors
-        // the Run column. Never a client-built resolvePortalUrl — testlist run is
-        // V3-only and the client helper emits the V2 route shape which 404s.
-        ...(typeof finalRun.dashboardUrl === 'string'
-          ? { dashboardUrl: finalRun.dashboardUrl }
-          : {}),
-        ...(typeof finalRun.executionUrl === 'string'
-          ? { executionUrl: finalRun.executionUrl }
-          : {}),
-      };
-    } catch (err) {
-      if (deps.environmentTunnel && err instanceof TunnelLostError) throw err;
-      if (err instanceof TimeoutError) {
-        return {
-          testId: entry.testId,
-          runId: entry.runId,
-          status: 'timeout',
-          error: {
-            code: 'UNSUPPORTED',
-            message: `Timed out after ${opts.timeoutSeconds}s`,
-            exitCode: 7,
-          },
-        };
-      }
-      // Interrupt must reject the whole fan-out (never flatten to a per-member
-      // outcome that would swallow the 128+signum exit).
-      if (err instanceof InterruptError) throw err;
-      if (err instanceof RequestTimeoutError) {
-        return {
-          testId: entry.testId,
-          runId: entry.runId,
-          status: 'timeout',
-          error: { code: 'UNSUPPORTED', message: err.message, exitCode: err.exitCode },
-        };
-      }
-      if (err instanceof ApiError) {
-        // Preserve the real code/exit (AUTH_INVALID=3, NOT_FOUND=4, …) rather
-        // than flattening every member failure to a generic 1.
-        return {
-          testId: entry.testId,
-          runId: entry.runId,
-          status: 'error',
-          error: waitMemberError(err),
-        };
-      }
-      throw err;
-    }
-  }
-
-  // Bounded-concurrency fan-out (self-contained; deliberately kept separate from
-  // `runTestRunAll`'s inline driver rather than extracting a shared helper).
-  let pollIdx = 0;
-  let inFlight = 0;
-  try {
-    await new Promise<void>((resolve, reject) => {
-      function startNext(): void {
-        while (inFlight < opts.maxConcurrency && pollIdx < resp.accepted.length) {
-          const entry = resp.accepted[pollIdx++]!;
-          inFlight++;
-          pollOne(entry)
-            .then(r => {
-              results.push(r);
-              inFlight--;
-              startNext();
-              if (inFlight === 0 && pollIdx >= resp.accepted.length) resolve();
-            })
-            .catch(reject);
+  for (const runId of runIds) stderrFn(`Run ${terminalSafeLine(runId)}`);
+  const deadline = deps.environmentTunnel?.deadlineMs ?? Date.now() + opts.timeoutSeconds * 1000;
+  const outcomes = new Map<string, RunWaitOutcome>();
+  let failure: unknown;
+  let requestTimedOut = false;
+  if (resp.accepted.some(row => !row.runId))
+    failure = new ApiError({
+      code: 'UNSUPPORTED',
+      message: 'The test-list response did not identify every execution.',
+      nextAction: 'Update the server before waiting on this test list.',
+      requestId: 'local',
+      details: {},
+    });
+  if (!failure) {
+    const stopped = new AbortController();
+    await Promise.all(
+      runIds.map(async runId => {
+        if (stopped.signal.aborted) return;
+        try {
+          const outcome = await waitForRun(client, runId, {
+            deadline,
+            signal: stopped.signal,
+            shutdown: deps.shutdown ?? globalShutdown,
+            sleep: deps.sleep,
+            onRead: async (snapshot, signal) => {
+              outcomes.set(runId, { ...snapshot, runId, timedOut: false, missingResultIds: [] });
+              await deps.environmentTunnel?.onRead(snapshot, signal);
+            },
+          });
+          outcomes.set(runId, outcome);
+        } catch (err) {
+          if (err instanceof ApiError)
+            outcomes.set(runId, {
+              ...(outcomes.get(runId) ?? {
+                runId,
+                run: null,
+                results: [],
+                timedOut: false,
+                missingResultIds: [],
+              }),
+              error: err,
+            });
+          else {
+            if (failure === undefined || err instanceof InterruptError) failure = err;
+            if (err instanceof RequestTimeoutError) requestTimedOut = true;
+            else stopped.abort(err);
+          }
+          if (err instanceof TunnelLostError) stopped.abort(err);
         }
-      }
-      startNext();
-      if (resp.accepted.length === 0) resolve();
-    });
-  } catch (err) {
-    ticker.finalize();
-    if (deps.environmentTunnel)
-      await emitEnvironmentDispatchPartial(
-        [resp],
-        resp.accepted.map(row => row.testId),
-        opts,
-        deps,
-        'testlist',
-        err,
-        deps.environmentTunnel,
-      );
-    else if (err instanceof InterruptError) {
-      // Keep settled outcomes intact and retain every dispatched run ID,
-      // including members that had not acquired a polling slot yet.
-      const settled = new Map(results.map(result => [result.runId, result] as const));
-      const partialResults = resp.accepted.map(
-        (entry): TestlistRunMemberResult =>
-          settled.get(entry.runId) ?? {
-            testId: entry.testId,
-            runId: entry.runId,
-            status: 'running',
-          },
-      );
-      out.print(
-        {
-          accepted: partialResults,
-          conflicts: resp.conflicts,
-          deferred: resp.deferred,
-          ...(resp.notFound && resp.notFound.length > 0 ? { notFound: resp.notFound } : {}),
-          ...(resp.reason ? { reason: resp.reason } : {}),
-          summary: {
-            passed: results.filter(result => result.status === 'passed').length,
-            failed: results.filter(
-              result => result.status !== 'passed' && result.status !== 'timeout',
-            ).length,
-            timedOut: results.filter(result => result.status === 'timeout').length,
-            deferred: resp.deferred.length,
-            conflicts: resp.conflicts.length,
-            total: resp.accepted.length,
-          },
-        },
-        () => partialResults.map(result => `${result.runId}  ${result.status}`).join('\n'),
-      );
-      const unfinished = resp.accepted
-        .filter(entry => !settled.has(entry.runId))
-        .map(entry => entry.runId);
-      if (unfinished.length > 0) {
-        err.runWaitContext = true;
-        stderrFn(interruptDetachMessage(err, unfinished));
-      }
-    }
-    throw err;
+      }),
+    );
   }
-
-  ticker.finalize();
-
-  const passed = results.filter(r => r.status === 'passed').length;
-  const failed = results.filter(r => r.status !== 'passed' && r.status !== 'timeout').length;
-  const timedOut = results.filter(r => r.status === 'timeout').length;
-  stderrFn(
-    `Test-list run complete: ${passed}/${resp.accepted.length} passed, ${failed} failed/blocked, ${timedOut} timed out`,
+  // Keep launch order even when independent reads finish in a different order.
+  const observed = new Map(outcomes);
+  outcomes.clear();
+  for (const runId of runIds) {
+    const outcome = observed.get(runId);
+    if (outcome) outcomes.set(runId, outcome);
+  }
+  if (failure === undefined || failure instanceof RequestTimeoutError) {
+    failure =
+      resolveRunWaitFailure(
+        [...outcomes.values()],
+        { timeoutSeconds: opts.timeoutSeconds },
+        failure,
+      ) ?? undefined;
+  }
+  const tunnel = deps.environmentTunnel;
+  if (failure && tunnel) await tunnel.cancelActive();
+  const {
+    output,
+    members: results,
+    summary,
+    diagnosticRows,
+    unfinishedRuns,
+  } = buildRunOutput({
+    ...outputOptions,
+    outcomes,
+    failure,
+    requestTimedOut,
+  });
+  const launch = { ...output, ...dispatchMetadata };
+  out.print(launch, () =>
+    renderRunResults(output.runs, output.results, summary, conflictRows(resp.conflicts)),
   );
-
-  const jsonPayload = {
-    ...(deps.environmentTunnel?.skipped?.length ? { skipped: deps.environmentTunnel.skipped } : {}),
-    accepted: results,
-    conflicts: resp.conflicts,
-    deferred: resp.deferred,
-    // Not members of this list (partial `--case` miss). Threaded into the
-    // envelope so `summarizeAcceptedPayload` folds them as non-passed rows
-    // (gh-output.ts) — without this a `1 accepted passed + 1 not-found` run
-    // read as "1/1 passed" in the CI summary while the command exits 4.
-    ...(resp.notFound && resp.notFound.length > 0 ? { notFound: resp.notFound } : {}),
-    // Present only on a nothing-dispatched run (empty list / no-match --case);
-    // surfaced here so the --wait envelope explains a zero-run report.
-    ...(resp.reason ? { reason: resp.reason } : {}),
-    summary: {
-      passed,
-      failed,
-      timedOut,
-      deferred: resp.deferred.length,
-      conflicts: resp.conflicts.length,
-      total: resp.accepted.length,
-    },
-  };
-
-  if (opts.report === 'junit' && opts.reportFile !== undefined) {
-    // Multi-project list: name the suite/classname by the LIST, not one project
-    // (`resolveBatchReportProjectId`'s single-project assumption doesn't hold).
-    const suiteName = opts.reportSuiteName ?? `testsprite:testlist:${opts.listId}`;
-    const summary = summarizeAcceptedPayload(JSON.stringify(jsonPayload), {
-      notFoundNote: 'not a member of this list (not dispatched)',
-    });
-    const xml = buildJUnitReport({
-      suiteName,
-      classname: `testlist:${opts.listId}`,
-      results: [
-        ...results.map(r => ({
-          ...r,
-          durationSeconds: r.runId ? reportDurations.get(r.runId) : undefined,
-        })),
-        ...skippedJUnitResultsFromSummary(summary, results),
-      ],
-    });
-    await writeJUnitReportFile(opts.reportFile, xml);
-  }
-
-  out.print(jsonPayload, () => results.map(r => `${r.runId}  ${r.status}`).join('\n'));
   recordBatchOutcome({
     accepted: resp.accepted.length,
     conflicts: resp.conflicts,
     deferred: resp.deferred.length,
-    skipped: 0,
+    skipped: tunnel?.skipped?.length ?? 0,
     results,
   });
-
-  // CI-native output parity with `test run` (--gh-output / --summary-file):
-  // auto-enable under GITHUB_ACTIONS. Emit BEFORE the exit-code gates below so a
-  // failing/timed-out/deferred run still gets its ::error:: annotations + the
-  // job-summary table. `emitCiArtifacts` is the shared helper the sibling run
-  // paths use, keyed off the identical reduced envelope.
   emitCiArtifacts(
-    summarizeAcceptedPayload(JSON.stringify(jsonPayload), {
-      notFoundNote: 'not a member of this list (not dispatched)',
-    }),
+    summary,
     opts,
     {
       env: deps.env ?? process.env,
-      stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+      stdout: deps.stdout ?? (line => process.stdout.write(`${line}\n`)),
       stderr: stderrFn,
     },
-    'testlist run',
+    'run',
   );
-
-  // Rate-deferred → incomplete batch (exit 7), checked before the timeout/failed
-  // gates so the operator learns to retry the deferred set (mirrors test run --all).
-  assertNoDeferred(resp);
-
-  // Shared exit-code precedence (auth 3 → typed operational ApiError → timeout 7
-  // → generic fail 1) so `testlist run` and `test run` can't drift.
-  const failure = resolveWaitFailure(results, { timeoutSeconds: opts.timeoutSeconds });
+  const owesExit =
+    failure !== undefined || resp.deferred.length > 0 || (resp.notFound?.length ?? 0) > 0;
+  if (opts.report === 'junit' && opts.reportFile) {
+    const file = opts.reportFile;
+    await writeReportOwing(
+      owesExit,
+      () =>
+        writeJUnitReportFile(
+          file,
+          buildJUnitReport({
+            suiteName: opts.reportSuiteName ?? `testsprite:testlist:${opts.listId}`,
+            classname: `testlist:${opts.listId}`,
+            results: [
+              ...results,
+              ...diagnosticRows,
+              ...skippedJUnitResultsFromSummary(summary, results),
+            ],
+          }),
+        ),
+      stderrFn,
+      { label: 'run' },
+    );
+  }
+  if (failure instanceof InterruptError && unfinishedRuns.length) {
+    markRunWaitInterrupt(failure, unfinishedRuns);
+    if (!tunnel || tunnel.session.adopted)
+      stderrFn(interruptDetachMessage(failure, unfinishedRuns));
+  }
   if (failure) throw failure;
-
+  assertNoDeferred(resp);
   assertNoNotFound(resp);
-  return resp;
+  return launch;
 }
 
-function renderRunAcceptedText(resp: CliTestListRunResponse): string {
-  const lines: string[] = [];
-  for (const a of resp.accepted) lines.push(`${a.runId}  ${a.testId}  dispatched`);
-  for (const c of resp.conflicts) {
-    // Reason-aware: a view-only / un-runnable / not-found case is no longer
-    // mislabelled "already-in-flight" (see describeConflict).
-    lines.push(`${c.currentRunId ?? '(none)'}  ${c.testId}  ${describeConflict(c)}`);
-  }
-  if (lines.length === 0) return 'No runs dispatched.';
-  return lines.join('\n');
+/** One line per refused member: `<in-flight result or (none)>  <testId>  <reason>`. */
+function conflictRows(conflicts: readonly RunConflict[]): string[] {
+  // Reason-aware: a view-only / un-runnable / not-found case is no longer
+  // mislabelled "already-in-flight" (see describeConflict).
+  return conflicts.map(
+    c =>
+      `${terminalSafeLine(c.currentResultId ?? '(none)')}  ${terminalSafeLine(c.testId)}  ${terminalSafeLine(describeConflict(c))}`,
+  );
 }
 
 // ── text renderers ───────────────────────────────────────────────────────────
+
+/**
+ * Print test lists under the output names (`lastRunId`). The caller keeps the
+ * lists as the backend sent them.
+ */
+function printTestLists(
+  out: Output,
+  lists: CliTestList[],
+  options: { columns?: string; noHeader?: boolean },
+): void {
+  out.print(lists, data => renderTestListListText(data as Array<CliTestList>, options));
+}
+
+/** Print one list's detail under the output names; see {@link printTestLists}. */
+function printTestListDetail(out: Output, detail: CliTestListDetail): void {
+  out.print(detail, data => renderTestListDetailText(data as CliTestListDetail));
+}
 
 const TESTLIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTestList>> = [
   { header: 'ID', width: rows => Math.max(2, ...rows.map(r => r.id.length)), render: r => r.id },
@@ -1130,14 +1035,14 @@ const TESTLIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTestList>> = [
   },
   { header: 'CASES', width: 5, render: r => String(r.caseCount) },
   // Fixed 36 (a UUID); `width: 0` (skip-padding) is only valid on the LAST
-  // column, and UPDATED is last — a `width: 0` here would leave LAST_EXEC
+  // column, and UPDATED is last — a `width: 0` here would leave LAST RUN
   // unpadded and drift UPDATED per row (UUID 36 chars vs "(none)" 6 chars).
-  { header: 'LAST_EXEC', width: 36, render: r => r.lastExecutionId ?? '(none)' },
+  { header: 'LAST RUN', width: 36, render: r => r.lastRunId ?? '(none)' },
   { header: 'UPDATED', width: 0, render: r => r.updatedAt },
 ];
 
 function renderTestListListText(
-  items: CliTestList[],
+  items: Array<CliTestList>,
   options: { columns?: string; noHeader?: boolean } = {},
 ): string {
   if (items.length === 0) return 'No test lists.';
@@ -1149,17 +1054,19 @@ function renderTestListListText(
 
 function renderTestListDetailText(d: CliTestListDetail): string {
   const lines: string[] = [
-    `ID:        ${d.id}`,
-    `Name:      ${d.name}`,
+    `ID:        ${terminalSafeLine(d.id)}`,
+    `Name:      ${terminalSafeLine(d.name)}`,
     `Cases:     ${d.stats.total} (passed ${d.stats.passed}, failed ${d.stats.failed}, blocked ${d.stats.blocked}, running ${d.stats.running})`,
   ];
   if (d.projectEnvironments.length > 0) {
     lines.push(
-      `Envs:      ${d.projectEnvironments.map(e => `${e.projectId}:${e.environmentName}`).join(', ')}`,
+      `Envs:      ${d.projectEnvironments
+        .map(e => `${terminalSafeLine(e.projectId)}:${terminalSafeLine(e.environmentName)}`)
+        .join(', ')}`,
     );
   }
-  lines.push(`Last exec: ${d.lastExecutionId ?? '(none)'}`);
-  lines.push(`Updated:   ${d.updatedAt}`);
+  lines.push(`Last run:  ${terminalSafeLine(d.lastRunId ?? '(none)')}`);
+  lines.push(`Updated:   ${terminalSafeLine(d.updatedAt)}`);
   if (d.cases.length > 0) {
     lines.push('');
     const caseTable = renderTextTable(d.cases, [
@@ -1350,95 +1257,46 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
       },
     );
 
-  testlist
-    .command('run <list-id>')
-    .summary('Run a test list')
-    .description(
-      "Run a test list (dispatch its cases and return pollable run ids). Environments come from the list's --project-env mapping; loopback ones open one tunnel and wait (backend cases are skipped).\n" +
-        '\nExit codes:\n' +
-        '  0  dispatched (or all passed with --wait)\n' +
-        '  1  a run failed / blocked / cancelled\n' +
-        '  3  auth error\n' +
-        '  4  a --case id is not in the list\n' +
-        '  6  nothing dispatched: every case conflicted (already running, or cannot run here)\n' +
-        '  7  timeout, or some cases were rate-deferred (retry the printed ids)\n' +
-        ' 12  insufficient credits (non-retriable; top up)\n' +
-        ' 13  feature gated / workspace paused',
-    )
-    .option(
-      '--case <test-id>',
-      'run only this case (repeatable; default: every case in the list)',
-      collectRepeatable,
-      [] as string[],
-    )
-    .option('--wait', 'poll every dispatched run until terminal or --timeout', false)
-    .option('--no-wait', 'detach without opening an automatic environment tunnel')
-    .option('--skip-preflight', 'skip the loopback port probe before opening a tunnel')
-    .option('--timeout <s>', 'with --wait, max seconds to wait (1–3600, default 600)')
-    .option(
-      '--max-concurrency <n>',
-      `with a tunnel, max runs in flight (1-10, default 5); otherwise with --wait, max polls (1-${MAX_TESTLIST_RUN_CONCURRENCY}, default ${DEFAULT_TESTLIST_RUN_CONCURRENCY})`,
-    )
-    .option('--idempotency-key <key>', 'caller-supplied idempotency key (1-256 chars)')
-    .option(
-      '--report <format>',
-      'with --wait: write a JUnit XML sidecar after polling (accepted: junit)',
-    )
-    .option('--report-file <path>', 'output path for --report (atomic write)')
-    .option(
-      '--report-suite-name <name>',
-      'JUnit <testsuite name=...> override (default: testsprite:testlist:<listId>)',
-    )
-    .option(
-      '--gh-output',
-      'with --wait: emit GitHub annotations (::error:: failed/timed-out, ::warning:: never dispatched) and a job-summary table when $GITHUB_STEP_SUMMARY is set; auto-enabled when GITHUB_ACTIONS=true',
-    )
-    .option(
-      '--summary-file <path>',
-      'with --wait: also write summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
-    )
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(
-      async (
-        listId: string,
-        cmdOpts: {
-          case?: string[];
-          wait?: boolean;
-          skipPreflight?: boolean;
-          timeout?: string;
-          maxConcurrency?: string;
-          idempotencyKey?: string;
-          report?: string;
-          reportFile?: string;
-          reportSuiteName?: string;
-          ghOutput?: boolean;
-          summaryFile?: string;
-        },
-        command: Command,
-      ) => {
-        const wait = cmdOpts.wait === true;
-        await runTestlistRun(
-          {
-            ...resolveCommonOptions(command, deps.env),
-            listId,
-            cases: cmdOpts.case,
-            wait,
-            noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
-            skipPreflight: cmdOpts.skipPreflight === true,
-            concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
-            timeoutSeconds: parseTestlistTimeoutFlag(cmdOpts.timeout),
-            maxConcurrency: parseTestlistConcurrencyFlag(cmdOpts.maxConcurrency),
-            idempotencyKey: cmdOpts.idempotencyKey,
-            report: parseJUnitReportFormat(cmdOpts.report),
-            reportFile: cmdOpts.reportFile,
-            reportSuiteName: cmdOpts.reportSuiteName,
-            ghOutput: cmdOpts.ghOutput,
-            summaryFile: cmdOpts.summaryFile,
-          },
-          deps,
-        );
-      },
-    );
-
   return testlist;
+}
+
+/** Root run's list mode keeps this module's parsers and native list receipt. */
+export async function runTestlistRunFromCommand(
+  command: Command,
+  listId: string,
+  testIds: string[],
+  deps: TestListDeps = {},
+): Promise<void> {
+  const opts = command.opts<{
+    wait?: boolean;
+    skipPreflight?: boolean;
+    timeout?: string;
+    maxConcurrency?: string;
+    idempotencyKey?: string;
+    report?: string;
+    reportFile?: string;
+    reportSuiteName?: string;
+    ghOutput?: boolean;
+    summaryFile?: string;
+  }>();
+  await runTestlistRun(
+    {
+      ...resolveCommonOptions(command, deps.env),
+      listId,
+      cases: testIds.length ? testIds : undefined,
+      wait: opts.wait === true,
+      noWait: command.getOptionValueSource('wait') === 'cli' && opts.wait === false,
+      skipPreflight: opts.skipPreflight === true,
+      concurrencyIsDefault: opts.maxConcurrency === undefined,
+      timeoutSeconds: parseTestlistTimeoutFlag(opts.timeout),
+      maxConcurrency: parseTestlistConcurrencyFlag(opts.maxConcurrency),
+      idempotencyKey: opts.idempotencyKey,
+      report: parseJUnitReportFormat(opts.report),
+      reportFile: opts.reportFile,
+      reportSuiteName: opts.reportSuiteName,
+      ghOutput: opts.ghOutput,
+      summaryFile: opts.summaryFile,
+    },
+    deps,
+  );
 }

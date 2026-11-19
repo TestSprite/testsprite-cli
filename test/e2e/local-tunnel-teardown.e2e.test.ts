@@ -179,10 +179,16 @@ beforeAll(async () => {
       return;
     }
 
-    if (method === 'POST' && url === `/api/cli/v1/tests/${TEST_ID}/runs`) {
+    if (method === 'POST' && url === '/api/cli/v1/projects/prj-e2e/runs') {
       respondJson(res, 202, {
         runId: RUN_ID,
-        status: 'queued',
+        projectId: 'prj-e2e',
+        total: 1,
+        autoHeal: true,
+        blocked: [],
+        held: [],
+        environment: null,
+        tunnelClientId: CLIENT_ID,
         enqueuedAt: new Date().toISOString(),
         codeVersion: 'v1',
         targetUrl: `http://127.0.0.1:${localAppPort}`,
@@ -190,7 +196,7 @@ beforeAll(async () => {
       return;
     }
 
-    if (method === 'GET' && url === `/api/cli/v1/runs/${RUN_ID}`) {
+    if (method === 'GET' && url === '/api/cli/v1/results') {
       // Hang forever — same long-poll-stall simulation as signal.e2e.test.ts.
       // The CLI's own abort (on SIGINT) or --timeout is what must cut this.
       // Held through `delayedResponses`: otherwise the `'close'` guard above
@@ -205,7 +211,12 @@ beforeAll(async () => {
     if (method === 'POST' && url === `/api/cli/v1/runs/${RUN_ID}/cancel`) {
       cancelReceived = true;
       landingOrder.push('cancel');
-      respondJson(res, 200, { runId: RUN_ID, status: 'cancelled' });
+      respondJson(res, 200, {
+        runId: RUN_ID,
+        alreadyCancelled: false,
+        alreadyFinished: false,
+        results: [],
+      });
       return;
     }
 
@@ -316,7 +327,7 @@ function spawnLocalRun(extraArgs: string[]): {
 } {
   const child = spawn(
     process.execPath,
-    [BIN_PATH, 'test', 'run', TEST_ID, '--local', String(localAppPort), ...extraArgs],
+    [BIN_PATH, 'run', TEST_ID, '--local', String(localAppPort), ...extraArgs],
     {
       env: {
         ...process.env,
@@ -378,7 +389,7 @@ describe.skipIf(isWindows)('local-tunnel teardown e2e — the process must exit 
 
     // The existing, already-correct UX must be unchanged by this fix. A
     // --local run's interrupt message is the TUNNEL-specific one (no
-    // "keeps running/billing" claim, no `test wait` hint — re-attaching
+    // "keeps running/billing" claim, no `run wait` hint — re-attaching
     // cannot revive a closed tunnel) rather than the ordinary non-tunnel
     // detach message.
     expect(outcome.stderr).toContain('Interrupted by SIGINT');
@@ -389,7 +400,7 @@ describe.skipIf(isWindows)('local-tunnel teardown e2e — the process must exit 
     expect(outcome.stderr).toContain("a cancelled run's verdict is discarded");
     expect(outcome.stderr).not.toMatch(/guaranteed failure|no further credits/i);
     expect(outcome.stderr).not.toContain('keeps running (and billing)');
-    expect(outcome.stderr).not.toContain('testsprite test wait');
+    expect(outcome.stderr).not.toContain('testsprite run wait');
   }, 15_000);
 
   // `landingOrder` proves the two teardown calls were RECEIVED in order — the
@@ -449,6 +460,6 @@ describe.skipIf(isWindows)('local-tunnel teardown e2e — the process must exit 
     expect(outcome.elapsedMs).toBeLessThan(6_000);
 
     expect(outcome.stderr).not.toContain('keeps running (and billing)');
-    expect(outcome.stderr).not.toContain('testsprite test wait');
+    expect(outcome.stderr).not.toContain('testsprite run wait');
   }, 15_000);
 });

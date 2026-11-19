@@ -1,5 +1,5 @@
 /**
- * `testsprite init` — one-shot onboarding orchestrator.
+ * `testsprite setup` — one-shot onboarding orchestrator.
  *
  * Chains, in order:
  *   0. Agent-target resolution + confirmation prompt — the chosen install
@@ -20,7 +20,6 @@ import {
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { normalizeEnvVar, resolveProfileName } from '../lib/config.js';
-import { emitDeprecationNotice } from '../lib/deprecate.js';
 import { ApiError, CLIError, InterruptError, localValidationError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { AuthDeps, ConfigureResult, MeResponse } from './auth.js';
@@ -44,6 +43,7 @@ import {
   isInsideGitRepoAsync,
   type GitUtilsDeps,
 } from '../lib/git-utils.js';
+import { terminalSafeLine, terminalSafeWriter } from '../lib/terminal-text.js';
 
 /** Mirrors auth.ts's DEFAULT_API_URL (kept in sync; auth.ts owns the canonical value). */
 const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -96,7 +96,7 @@ export interface InitDeps {
   // AuthDeps-specific
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
-  /** Injected for auth configure: { secret: (q) => Promise<string> } */
+  /** Injected for the key prompt: { secret: (q) => Promise<string> } */
   prompt?: AuthDeps['prompt'];
   preludeWrite?: (chunk: string) => void;
 
@@ -407,7 +407,7 @@ async function confirmDetectedTargets(
 // ---------------------------------------------------------------------------
 
 export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<void> {
-  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderrFn = terminalSafeWriter(deps.stderr);
   const out = new Output(opts.output, { stdout: deps.stdout, stderr: deps.stderr });
 
   // An unknown --agent is refused here, before credentials are written. Left
@@ -766,9 +766,9 @@ function renderInitText(data: unknown): string {
   lines.push('');
   lines.push(`  profile:  ${s.profile}`);
   lines.push(`  endpoint: ${s.apiUrl}`);
-  lines.push(`  env:      ${s.env}`);
-  if (s.email) lines.push(`  email:    ${s.email}`);
-  if (s.scopes.length > 0) lines.push(`  scopes:   ${s.scopes.join(', ')}`);
+  lines.push(`  env:      ${terminalSafeLine(s.env)}`);
+  if (s.email) lines.push(`  email:    ${terminalSafeLine(s.email)}`);
+  if (s.scopes.length > 0) lines.push(`  scopes:   ${terminalSafeLine(s.scopes.join(', '))}`);
   if (s.credentials?.persisted === false) {
     lines.push('  credentials: session-only (TESTSPRITE_API_KEY; not saved)');
   }
@@ -798,23 +798,24 @@ function renderInitText(data: unknown): string {
     lines.push('');
   }
   lines.push('Next steps:');
-  lines.push('  # 1. Create your first project (frontend example) — prints a projectId');
+  lines.push('  # 1. Create your first project and say where it runs — prints a projectId');
+  lines.push('  testsprite project create --type frontend --name "My App"');
   lines.push(
-    '  testsprite project create --type frontend --name "My App" --url https://your-app.com',
+    '  testsprite project env create <projectId> --name default --url https://your-app.com',
   );
   lines.push('');
   if (s.agent) {
     lines.push(
-      '  # 2. Generate tests: ask your coding agent (the testsprite-onboard skill is installed),',
+      '  # 2. Get tests: ask your coding agent (the testsprite-onboard skill is installed),',
     );
     lines.push(
-      '  #    or have TestSprite propose them directly (uses credits), review them, then accept:',
+      "  #    or ask the project's agent directly, review what it proposes, then apply it:",
     );
-    lines.push('  testsprite test plan generate --project <projectId>');
-    lines.push('  testsprite test plan accept --project <projectId>');
+    lines.push('  testsprite plan --project <projectId>');
+    lines.push('  testsprite apply');
     lines.push('');
     lines.push('  # 3. Run them (use the projectId from step 1):');
-    lines.push('  testsprite test run --all --project <projectId>');
+    lines.push('  testsprite run --project <projectId>');
     lines.push('');
     lines.push('  # Manage installed agent skills');
     lines.push('  testsprite agent list');
@@ -822,21 +823,17 @@ function renderInitText(data: unknown): string {
       '  testsprite agent install --target=<t>   # re-install or install additional targets',
     );
   } else {
-    // Without an agent, this is the only place a new user learns that
-    // TestSprite can propose the first suite. Printing this runs and charges
-    // nothing; generating does use credits, which the line says. The
-    // hand-authored path stays visible as the fallback.
+    // Without a coding agent, this is the only place a new user learns that
+    // the project's agent writes the first suite.
     lines.push(
-      '  # 2. Let TestSprite propose your first tests (uses credits), review them, then accept:',
+      "  # 2. Ask the project's agent for your first tests, review what it proposes, then apply it:",
     );
-    lines.push('  #    Backend project? Upload your API spec first:');
-    lines.push('  #    testsprite project docs upload ./openapi.yaml --project <projectId>');
-    lines.push('  testsprite test plan generate --project <projectId>');
-    lines.push('  testsprite test plan accept --project <projectId>');
-    lines.push('  #    Prefer to write one yourself: testsprite test create --plan-template');
+    lines.push('  #    Backend project? Attach your API spec: --file ./openapi.yaml');
+    lines.push('  testsprite plan --project <projectId>');
+    lines.push('  testsprite apply');
     lines.push('');
     lines.push('  # 3. Run them (use the projectId from step 1):');
-    lines.push('  testsprite test run --all --project <projectId>');
+    lines.push('  testsprite run --project <projectId>');
     lines.push(
       '  # Tip: `testsprite agent install` sets up the onboarding skill for your coding agent',
     );
@@ -870,8 +867,8 @@ function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): Common
 const SETUP_DESCRIPTION =
   'Set up TestSprite: configure your API key and install the TestSprite agent skills for your coding agent';
 
-/** Raw Commander options shared by `setup` and the deprecated `init`/`auth configure` aliases. */
-export interface SetupCmdOpts {
+/** Raw Commander options of `setup`. */
+interface SetupCmdOpts {
   apiKey?: string;
   fromEnv?: boolean;
   /**
@@ -890,12 +887,11 @@ export interface SetupCmdOpts {
 }
 
 /**
- * Attach the onboarding flags shared by `setup` and the `init`/`auth configure`
- * aliases. `--agent` deliberately carries NO default: its absence is the signal
+ * Attach the onboarding flags of `setup`. `--agent` deliberately carries NO default: its absence is the signal
  * that setup should detect the agent, and a default value here is
  * indistinguishable from the caller naming that same target.
  */
-export function addSetupOptions(
+function addSetupOptions(
   cmd: Command,
   validTargets: AgentTarget[],
   defaultAgent: AgentTarget,
@@ -972,7 +968,7 @@ function buildSetupOptions(
   };
 }
 
-/** Shared action for `setup` and the deprecated `init` alias. */
+/** The `setup` action. */
 async function runSetupAction(
   cmdOpts: SetupCmdOpts,
   command: Command,
@@ -1010,42 +1006,4 @@ export function createSetupCommand(deps: InitDeps = {}): Command {
     .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
       await runSetupAction(cmdOpts, command, deps);
     });
-}
-
-/**
- * Hidden, deprecated `init` alias → runs `setup`. Kept so existing scripts and
- * agents trained on the old command keep working; registered with
- * `{ hidden: true }` in index.ts (invisible to `--help`) and prints a
- * deprecation notice. (Setup consolidation.)
- */
-export function createDeprecatedInitCommand(deps: InitDeps = {}): Command {
-  const validTargets = Object.keys(TARGETS) as AgentTarget[];
-  const defaultAgent: AgentTarget = 'claude';
-
-  return addSetupOptions(new Command('init'), validTargets, defaultAgent)
-    .description('(deprecated) alias for `setup`')
-    .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
-      emitDeprecationNotice('init', 'setup', deps.stderr);
-      await runSetupAction(cmdOpts, command, deps);
-    });
-}
-
-/**
- * Entry for the hidden, deprecated `auth configure` alias. Per the setup
- * consolidation, `auth configure` now runs FULL setup (configure + install)
- * so an agent that reaches for the old command still ends up with the skill.
- * `setup` is the ONLY path that writes credentials.
- *
- * Accepts the SAME `SetupCmdOpts` shape `setup` does — the alias previously
- * only wired up `--from-env`, so README's "runs the full setup" claim didn't
- * hold: `--yes`/`--agent`/`--api-key`/`--force`/`--dir`/`--no-agent` were all
- * rejected as unknown options. `index.ts` attaches the full flag set via
- * `addSetupOptions` before wiring this action.
- */
-export async function runConfigureViaSetup(
-  command: Command,
-  deps: InitDeps,
-  cmdOpts: SetupCmdOpts,
-): Promise<void> {
-  await runSetupAction(cmdOpts, command, deps);
 }

@@ -9,12 +9,13 @@
 import * as fs from 'node:fs';
 import { chmodSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError } from '../lib/errors.js';
 import { loadConfig } from '../lib/config.js';
 import { writeProfile } from '../lib/credentials.js';
+import { buildSkillMarker, pathFor, renderOwnFileWithMarker } from '../lib/agent-targets.js';
 import type { DoctorDeps, DoctorReport } from './doctor.js';
 import { createDoctorCommand, runDoctor } from './doctor.js';
 
@@ -126,8 +127,8 @@ describe('runDoctor — healthy environment', () => {
   });
 
   // Confirms `doctor` never sends X-CLI-Command — it must stay a plain,
-  // untagged /me call (only `runInit`'s configure-validate step and
-  // `test run --target-url`'s v3Enabled probe tag this header).
+  // untagged /me call (only `runInit`'s configure-validate step tags this
+  // header).
   it('sends no X-CLI-Command header on either of its checks', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { deps } = makeCapture();
@@ -162,51 +163,27 @@ describe('runDoctor — healthy environment', () => {
     for (const call of sent) expect(call.headers?.['x-cli-command']).toBeUndefined();
   });
 
-  it('adds a Routing check (v3) and the gap advisory when /me reports v3Enabled', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const report = await runDoctor(
-      { profile: 'default', output: 'text', debug: false },
-      {
-        ...healthyDeps(credentialsPath, {
-          fetchImpl: makeFetch({ ...OK_ME, v3Enabled: true }),
-        }),
-        ...deps,
-      },
-    );
-    expect(report.failures).toBe(0);
-    expect(report.checks.some(c => c.name === 'Routing' && c.detail.includes('v3'))).toBe(true);
-    expect(capture.stderr.join('\n')).toContain('[advisory]');
-    expect(capture.stderr.join('\n')).toContain('rerun');
-    expect(capture.stderr.join('\n')).not.toContain('--target-url');
-  });
-
-  it('shows Routing v2 and no advisory when v3Enabled is false', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const report = await runDoctor(
-      { profile: 'default', output: 'text', debug: false },
-      {
-        ...healthyDeps(credentialsPath, {
-          fetchImpl: makeFetch({ ...OK_ME, v3Enabled: false }),
-        }),
-        ...deps,
-      },
-    );
-    expect(report.checks.some(c => c.name === 'Routing' && c.detail.includes('v2'))).toBe(true);
-    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
-  });
-
-  it('omits the Routing check when /me does not report v3Enabled', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { deps } = makeCapture();
-    const report = await runDoctor(
-      { profile: 'default', output: 'text', debug: false },
-      { ...healthyDeps(credentialsPath), ...deps }, // OK_ME has no v3Enabled
-    );
-    expect(report.checks.some(c => c.name === 'Routing')).toBe(false);
-    expect(report.warnings).toBe(0);
-  });
+  // Every account is served by V3, so `doctor` no longer reads `v3Enabled`.
+  it.each([true, false, undefined])(
+    'adds no Routing check (v3Enabled on the wire: %s)',
+    async v3Enabled => {
+      writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+      const { capture, deps } = makeCapture();
+      const report = await runDoctor(
+        { profile: 'default', output: 'text', debug: false },
+        {
+          ...healthyDeps(credentialsPath, {
+            fetchImpl: makeFetch({ ...OK_ME, v3Enabled }),
+          }),
+          ...deps,
+        },
+      );
+      expect(report.failures).toBe(0);
+      expect(report.warnings).toBe(0);
+      expect(report.checks.some(c => c.name === 'Routing')).toBe(false);
+      expect(capture.stdout.join('\n')).not.toContain('Routing');
+    },
+  );
 
   it('adds Organizations and Org binding checks when /me reports them', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
@@ -498,6 +475,37 @@ describe('runDoctor — failing checks exit non-zero', () => {
     const out = capture.stdout.join('\n');
     expect(out).toContain('Node.js');
     expect(out).toContain('outside the supported Node range 20.19+, 22.13+, or 24+');
+  });
+});
+
+describe('runDoctor — a verify skill written by an earlier CLI', () => {
+  it('warns, naming the target to re-install, rather than reporting it installed', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const project = mkdtempSync(join(tmpdir(), 'doctor-stale-skill-'));
+    // A marker that hashes an older body: what `agent status` reports as stale.
+    const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+    const file = join(project, pathFor('claude', 'testsprite-verify'));
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtempSync project dir.
+    fs.mkdirSync(dirname(file), { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- a skill file in this test's own mkdtempSync project dir.
+    fs.writeFileSync(
+      file,
+      renderOwnFileWithMarker(
+        'claude',
+        'testsprite-verify',
+        buildSkillMarker('testsprite-verify', oldBody),
+        oldBody,
+      ),
+    );
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath, { cwd: project }), ...deps },
+    );
+    expect(report.failures).toBe(0);
+    const line = capture.stdout.find(l => l.includes('Verify skill'));
+    expect(line).toContain('[WARN]');
+    expect(line).toContain('testsprite agent install claude --force');
   });
 });
 

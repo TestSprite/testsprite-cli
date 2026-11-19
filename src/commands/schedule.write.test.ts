@@ -1,17 +1,14 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
-import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
+import { describe, expect, it } from 'vitest';
 import { runsPerMonth } from '../lib/cron.js';
 import { ApiError } from '../lib/errors.js';
 import {
   type CliSchedule,
-  type CliScheduleRun,
   createScheduleCommand,
   runDelete,
   runGet,
-  runRunList,
   runUpdate,
 } from './schedule.js';
 
@@ -70,40 +67,24 @@ const SCHEDULE: CliSchedule = {
   updatedAt: '2026-05-02T00:00:00.000Z',
 };
 
-const RUN: CliScheduleRun = {
-  runId: 'exec_1',
-  scheduleId: 'sch_1',
-  status: 'passed',
-  projectId: 'project_1',
-  testListId: null,
-  stats: { total: 3, passed: 3, failed: 0, blocked: 0, running: 0, cancelled: 0 },
-  createdAt: '2026-06-01T03:00:00.000Z',
-  updatedAt: '2026-06-01T03:04:00.000Z',
-};
-
 const BASE = { profile: 'default', debug: false } as const;
 const sink = { stdout: () => {}, stderr: () => {} };
 
 describe('createScheduleCommand — full surface', () => {
-  it('exposes every verb, with run history under `run list`', () => {
+  it('exposes schedule CRUD verbs', () => {
     const schedule = createScheduleCommand();
     expect(schedule.commands.map(c => c.name()).sort()).toEqual([
       'create',
       'delete',
       'get',
       'list',
-      'run',
       'update',
     ]);
-
-    const run = schedule.commands.find(c => c.name() === 'run')!;
-    expect(run.commands.map(c => c.name())).toEqual(['list']);
   });
 
   it('exposes no run-now verb', () => {
     const schedule = createScheduleCommand();
-    const run = schedule.commands.find(c => c.name() === 'run')!;
-    expect(run.commands.map(c => c.name())).not.toContain('now');
+    expect(schedule.commands.map(c => c.name())).not.toContain('run');
     expect(schedule.commands.map(c => c.name())).not.toContain('trigger');
   });
 
@@ -518,142 +499,5 @@ describe('runDelete', () => {
     );
 
     expect(out.join('\n')).toContain('deleted: sch_1');
-  });
-});
-
-describe('runRunList', () => {
-  it('requests the runs of one schedule', async () => {
-    const { credentialsPath } = makeCreds();
-    const urls: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      urls.push(url);
-      return { body: { runs: [RUN] } };
-    });
-
-    const result = await runRunList(
-      { ...BASE, output: 'json', scheduleId: 'sch_1' },
-      { credentialsPath, fetchImpl, ...sink },
-    );
-
-    expect(urls[0]).toContain('/schedules/sch_1/runs');
-    expect(result.runs).toEqual([RUN]);
-  });
-
-  it('renders the run id, status and per-status counts', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: { runs: [RUN] } }));
-
-    const out: string[] = [];
-    await runRunList(
-      { ...BASE, output: 'text', scheduleId: 'sch_1' },
-      { credentialsPath, fetchImpl, stdout: l => out.push(l), stderr: () => {} },
-    );
-
-    const text = out.join('\n');
-    expect(text).toContain('exec_1');
-    expect(text).toContain('passed');
-    expect(text).toContain('RUN ID');
-  });
-
-  it('says there are no runs yet, which is not the same as no schedule', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: { runs: [] } }));
-
-    const out: string[] = [];
-    await runRunList(
-      { ...BASE, output: 'text', scheduleId: 'sch_1' },
-      { credentialsPath, fetchImpl, stdout: l => out.push(l), stderr: () => {} },
-    );
-
-    expect(out.join('\n')).toBe('No runs yet.');
-  });
-
-  it('surfaces a 404 for an unknown schedule', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      status: 404,
-      body: { error: { code: 'NOT_FOUND', message: 'Resource not found.', requestId: 'r' } },
-    }));
-
-    await expect(
-      runRunList(
-        { ...BASE, output: 'json', scheduleId: 'sch_missing' },
-        { credentialsPath, fetchImpl, ...sink },
-      ),
-    ).rejects.toBeInstanceOf(ApiError);
-  });
-
-  it('tolerates a response with no runs key', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: {} }));
-
-    const result = await runRunList(
-      { ...BASE, output: 'json', scheduleId: 'sch_1' },
-      { credentialsPath, fetchImpl, ...sink },
-    );
-
-    expect(result.runs).toEqual([]);
-  });
-
-  it('text output rejects unknown columns with VALIDATION_ERROR before auth/network access', async () => {
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not make network calls on invalid columns');
-    });
-
-    await expect(
-      runRunList(
-        { ...BASE, output: 'text', scheduleId: 'sch_1', columns: 'bogus' },
-        { stdout: () => undefined, fetchImpl: fetchImpl as unknown as typeof fetch },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: { field: 'columns' },
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('text output rejects unknown columns with VALIDATION_ERROR even when server returns empty list', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: { runs: [] } }));
-    await expect(
-      runRunList(
-        { ...BASE, output: 'text', scheduleId: 'sch_1', columns: 'bogus' },
-        { credentialsPath, fetchImpl, stdout: () => undefined },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: { field: 'columns' },
-    });
-  });
-
-  it('text output rejects unknown columns with VALIDATION_ERROR before dry-run banner emission', async () => {
-    resetDryRunBannerForTesting();
-    const stderr: string[] = [];
-
-    await expect(
-      runRunList(
-        { ...BASE, output: 'text', scheduleId: 'sch_1', dryRun: true, columns: 'bogus' },
-        { stdout: () => undefined, stderr: line => stderr.push(line) },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: { field: 'columns' },
-    });
-    expect(stderr).toEqual([]);
-  });
-
-  it('json output ignores text-only column flags', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: { runs: [RUN] } }));
-
-    const out: string[] = [];
-    const result = await runRunList(
-      { ...BASE, output: 'json', scheduleId: 'sch_1', columns: 'bogus', noHeader: true },
-      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
-    );
-    expect(result.runs).toEqual([RUN]);
   });
 });

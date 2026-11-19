@@ -221,7 +221,7 @@ describe('in-flight request tracking', () => {
 });
 
 describe('default retry timer lifecycle', () => {
-  it('forwards a caller abort signal to a single-attempt history request', async () => {
+  it('forwards a caller abort signal to a single-attempt list request', async () => {
     vi.useFakeTimers();
     try {
       const controller = new AbortController();
@@ -237,7 +237,7 @@ describe('default retry timer lifecycle', () => {
       });
       let settled = false;
       const pending = client
-        .listTestRuns('test_abc', { pageSize: 20 }, { signal: controller.signal, retry: false })
+        .get('/results', { query: { test: 'test_abc' }, signal: controller.signal, retry: false })
         .catch((error: unknown) => {
           settled = true;
           return error;
@@ -665,29 +665,6 @@ describe('HttpClient — connection reset while reading a 200 body', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it('reports the mid-body retry wait through onRetryWait just before it sleeps', async () => {
-    const events: string[] = [];
-    let calls = 0;
-    const fetchImpl: typeof fetch = async () =>
-      calls++ === 0 ? resetResponse() : jsonResponse({ ok: true });
-    const client = new HttpClient({
-      baseUrl: 'https://api.example.com/api/cli/v1',
-      apiKey: 'sk-test',
-      fetchImpl,
-      random: () => 0,
-      sleep: ms => {
-        events.push(`sleep ${ms}`);
-        return Promise.resolve();
-      },
-    });
-
-    await client.get('/projects', { onRetryWait: delayMs => events.push(`wait ${delayMs}`) });
-
-    // The run poll's stall guard restarts its budget on this call, so the
-    // backoff after a dropped body is never counted as silence.
-    expect(events).toEqual(['wait 250', 'sleep 250']);
-  });
-
   it('retries a write that carries an Idempotency-Key', async () => {
     const fetchImpl = vi
       .fn()
@@ -892,58 +869,6 @@ describe('HttpClient error mapping', () => {
     const client = makeClient(fetchImpl as unknown as typeof fetch);
     await expect(client.get('/me')).rejects.toBeInstanceOf(TransportError);
     expect(fetchImpl).toHaveBeenCalledTimes(4);
-  });
-
-  it('reports each retry wait through onRetryWait just before it sleeps', async () => {
-    const events: string[] = [];
-    const responses: Array<() => Response> = [
-      () => errorEnvelopeResponse(429, 'RATE_LIMITED', { headers: { 'retry-after': '2' } }),
-      () => {
-        throw new Error('ECONNRESET');
-      },
-      () => errorEnvelopeResponse(503, 'UNAVAILABLE'),
-      () => jsonResponse({ ok: true }),
-    ];
-    let calls = 0;
-    const fetchImpl: typeof fetch = async () => responses[calls++]!();
-    const client = new HttpClient({
-      baseUrl: 'https://api.example.com/api/cli/v1',
-      apiKey: 'sk-test',
-      fetchImpl,
-      random: () => 0,
-      sleep: ms => {
-        events.push(`sleep ${ms}`);
-        return Promise.resolve();
-      },
-    });
-
-    await client.get('/me', { onRetryWait: delayMs => events.push(`wait ${delayMs}`) });
-
-    // 429 honours Retry-After (2s); the transport and 503 retries back off 500ms, then 1s.
-    expect(events).toEqual([
-      'wait 2000',
-      'sleep 2000',
-      'wait 500',
-      'sleep 500',
-      'wait 1000',
-      'sleep 1000',
-    ]);
-  });
-
-  it('getRun passes onRetryWait through to the request', async () => {
-    const waits: number[] = [];
-    let calls = 0;
-    const fetchImpl: typeof fetch = async () =>
-      calls++ === 0
-        ? errorEnvelopeResponse(503, 'UNAVAILABLE')
-        : jsonResponse({ runId: 'run_1', status: 'running' });
-    const client = makeClient(fetchImpl);
-
-    await client
-      .getRun('run_1', { waitSeconds: 25, onRetryWait: delayMs => waits.push(delayMs) })
-      .catch(() => undefined);
-
-    expect(waits).toEqual([250]);
   });
 
   it('does not retry transport errors for keyless writes', async () => {
@@ -1633,54 +1558,53 @@ describe('HttpClient retry-delay sleep bails on shutdown', () => {
     expect((err as InterruptError).signal).toBe('SIGTERM');
     expect(calls).toBe(1);
   });
-});
 
-describe('rerun deprecation advisories', () => {
-  const rerunBody = {
-    runId: 'run_1',
-    status: 'queued',
-    enqueuedAt: '2026-10-20T00:00:00Z',
-    codeVersion: 'v1',
-    autoHeal: true,
-  };
-  const batchBody = {
-    accepted: [],
-    conflicts: [],
-    deferred: [],
-    closure: { byProject: [] },
-  };
-  const heal = { feature: 'autoHeal', message: 'not honored yet' };
-  const dep = { feature: 'deprecation', message: 'use test run' };
-  const clientFor = (body: unknown): HttpClient =>
-    makeClient((async () => jsonResponse(body)) as unknown as typeof fetch);
-  const opts = { idempotencyKey: 'k1' };
-
-  it('drops a server deprecation advisory but keeps the autoHeal one', async () => {
-    const r = await clientFor({ ...rerunBody, advisories: [heal, dep] }).triggerRerun(
-      't1',
-      { source: 'cli' },
-      opts,
-    );
-    expect(r.advisories).toEqual([heal]);
+  it("the caller's own signal ends a Retry-After sleep too, with its reason", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return errorEnvelopeResponse(429, 'RATE_LIMITED', {
+        headers: { 'content-type': 'application/json', 'retry-after': '60' },
+      });
+    }) as unknown as typeof fetch;
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      sleep: () => new Promise<void>(() => {}), // never resolves
+      random: () => 0,
+      shutdownSignal: new AbortController().signal,
+    });
+    const deadline = new AbortController();
+    const pending = client.get('/me', { signal: deadline.signal });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const reason = new DOMException('Wait deadline', 'AbortError');
+    deadline.abort(reason);
+    expect(await pending.catch(e => e)).toBe(reason);
+    expect(calls).toBe(1);
   });
 
-  it('removes the advisories key when only a deprecation advisory was sent', async () => {
-    const r = await clientFor({ ...rerunBody, advisories: [dep] }).triggerRerun(
-      't1',
-      { source: 'cli' },
-      opts,
-    );
-    expect('advisories' in r).toBe(false);
-  });
-
-  it('leaves a response without advisories untouched', async () => {
-    const r = await clientFor(rerunBody).triggerRerun('t1', { source: 'cli' }, opts);
-    expect(r).toEqual(rerunBody);
-  });
-
-  it('applies the same filter to the batch rerun response', async () => {
-    const client = clientFor({ ...batchBody, advisories: [dep, heal] });
-    const r = await client.triggerBatchRerun({ testIds: ['a'], source: 'cli' } as never, opts);
-    expect(r.advisories).toEqual([heal]);
+  it('an interrupt outranks the caller signal when both have fired', async () => {
+    const shutdown = new AbortController();
+    const deadline = new AbortController();
+    const interruption = new InterruptError('SIGINT');
+    // Both fire, the deadline first, while the throttled answer is on its way.
+    const fetchImpl = vi.fn(async () => {
+      deadline.abort();
+      shutdown.abort(interruption);
+      return errorEnvelopeResponse(429, 'RATE_LIMITED', {
+        headers: { 'content-type': 'application/json', 'retry-after': '60' },
+      });
+    }) as unknown as typeof fetch;
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      sleep: () => new Promise<void>(() => {}), // never resolves
+      random: () => 0,
+      shutdownSignal: shutdown.signal,
+    });
+    const err = await client.get('/me', { signal: deadline.signal }).catch(e => e);
+    expect(err).toBe(interruption);
   });
 });

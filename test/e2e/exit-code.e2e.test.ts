@@ -1,3 +1,4 @@
+import { projectRun, runListing } from '../helpers/project-run.js';
 /**
  * Local e2e regression tests for the error-path exit contract.
  *
@@ -27,6 +28,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { resultLine } from '../helpers/result-list.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '../..');
@@ -55,17 +57,63 @@ beforeAll(async () => {
   );
 
   // Stub routes:
-  //   - anything under /runs/run_failed_e2e → a terminal FAILED run (drives
-  //     the CLIError branch: `test wait` exits 1 after printing the card)
+  //   - /results?run=exec_failed_e2e        → the run's one result, run_failed_e2e,
+  //     listed as still running
+  //   - anything under /runs/run_failed_e2e → that result, now FAILED (drives
+  //     the CLIError branch: `run wait` exits 1 after printing the results)
   //   - anything mentioning "hang"          → never answers (drives the
   //     RequestTimeoutError branch under --request-timeout 1)
   //   - everything else                     → 404 error envelope, connection
   //     closed, mimicking how the real backend ends an error exchange.
   server = createServer((req, res) => {
     const url = req.url ?? '';
+    const path = new URL(url, 'http://localhost').pathname.replace('/api/cli/v1', '');
+    const fixtures: Record<string, unknown> = {
+      'GET /tests/test_e2e': { id: 'test_e2e', type: 'frontend', projectId: 'project_1' },
+      'GET /projects/project_1': { id: 'project_1', type: 'frontend' },
+      'GET /projects/project_1/env': { environments: [] },
+      'POST /projects/project_1/runs': projectRun({ runId: 'exec_failed_e2e' }),
+      'GET /testlist/list_e2e': { id: 'list_e2e', cases: [] },
+      'POST /testlist/list_e2e/run': {
+        accepted: [
+          {
+            runId: 'exec_failed_e2e',
+            testId: 'test_e2e',
+            resultId: 'run_failed_e2e',
+            enqueuedAt: '2026-05-15T10:00:00Z',
+          },
+        ],
+        conflicts: [],
+        deferred: [],
+      },
+    };
+    const fixture = fixtures[`${req.method} ${path}`];
+    if (fixture) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(fixture));
+      return;
+    }
+    if (url.includes('/results') && url.includes('run=exec_failed_e2e')) {
+      const line = resultLine({
+        resultId: 'run_failed_e2e',
+        runId: 'exec_failed_e2e',
+        caseKey: 'test_e2e',
+        testStatus: 'FAILED',
+      });
+      const list = JSON.stringify(
+        runListing({ runId: 'exec_failed_e2e', status: 'finished', cancelled: false }, [line]),
+      );
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(list),
+        connection: 'close',
+      });
+      res.end(list);
+      return;
+    }
     if (url.includes('/runs/run_failed_e2e')) {
       const run = JSON.stringify({
-        runId: 'run_failed_e2e',
+        resultId: 'run_failed_e2e',
         testId: 'test_e2e',
         projectId: 'proj_e2e',
         userId: 'user_e2e',
@@ -181,14 +229,49 @@ describe('exit-code e2e — error paths exit by draining, with the documented co
   }, 30_000);
 
   it('CLIError (failed run under wait): exit 1 exactly, natural drain', async () => {
-    // The everyday customer path: `test wait` sees a terminal non-passed run
-    // and throws CLIError(status, 1) — src/commands/test.ts "finished with
-    // status". Exit 1 must come from the drain, not a forced exit.
-    const result = await runCli(['test', 'wait', 'run_failed_e2e', '--endpoint-url', baseUrl]);
+    // The everyday customer path: `run wait` sees a terminal non-passed
+    // result and throws CLIError(1) — src/commands/test.ts "finished
+    // non-passed". Exit 1 must come from the drain, not a forced exit.
+    const result = await runCli(['run', 'wait', 'exec_failed_e2e', '--endpoint-url', baseUrl]);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain(DRAIN_MARKER);
     expect(result.stderr).not.toContain('Assertion failed');
   }, 30_000);
+
+  it.each(
+    Object.entries({
+      named: ['run', 'test_e2e', '--wait'],
+      project: ['run', '--project', 'project_1', '--wait'],
+      list: ['run', '--testlist', 'list_e2e', '--wait'],
+      resume: ['run', 'wait', 'exec_failed_e2e'],
+    }),
+  )('returns the same complete failed verdict for %s', async (_selection, args) => {
+    const result = await runCli([...args, '--endpoint-url', baseUrl, '--output', 'json']);
+    expect(result.code).toBe(1);
+    expect(result.stdout, result.stderr).not.toBe('');
+    const output = JSON.parse(result.stdout);
+    expect(output.runs).toMatchObject([{ runId: 'exec_failed_e2e', status: 'finished' }]);
+    expect(output.results).toMatchObject([
+      {
+        resultId: 'run_failed_e2e',
+        runId: 'exec_failed_e2e',
+        testId: 'test_e2e',
+        title: 'Test test_e2e',
+        status: 'failed',
+      },
+    ]);
+    expect(output.summary).toMatchObject({
+      total: 1,
+      failed: 1,
+      passed: 0,
+      skipped: 0,
+      timedOut: 0,
+    });
+    expect(output).not.toHaveProperty('partial');
+    expect(output).not.toHaveProperty('accepted');
+    expect(output.summary).not.toHaveProperty('results');
+    expect(output.runs[0]).not.toHaveProperty('results');
+  });
 
   it('RequestTimeoutError: exit 7 exactly, natural drain', async () => {
     // The stub accepts the request and never answers; --request-timeout 1

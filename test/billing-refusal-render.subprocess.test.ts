@@ -136,7 +136,7 @@ describe('billing refusal rendering in the built CLI', () => {
         (shape === 'plan'
           ? `Upgrade at ${billing} (plans: ${portal}/pricing), then retry.`
           : shape === 'credits'
-            ? `Top up credits at ${portal}/dashboard/settings/billing (personal keys) — ask an org admin if this key is organization-bound — or upgrade your plan at ${portal}/pricing. Run \`testsprite usage\` to check your current balance before the next run.`
+            ? `Top up credits at ${portal}/dashboard-v3/settings/billing (personal keys) — ask an org admin if this key is organization-bound — or upgrade your plan at ${portal}/pricing. Run \`testsprite usage\` to check your current balance before the next run.`
             : '');
       expect(textResult.stderr).toBe(
         `Error: ${entry.message}\n${action}\n${entry.lines.map(line => `${line}\n`).join('')}requestId: req_billing\n`,

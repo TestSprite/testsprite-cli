@@ -36,7 +36,7 @@ export interface TargetSpec {
    * No-op for cline (body verbatim) and codex (managed-section authors plain
    * Markdown with no frontmatter).
    */
-  wrap(name: string, description: string, body: string): string;
+  wrap(name: string, description: string, body: string, quote?: boolean): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ export interface SkillSpec {
  * (not in a `*.codex.md` asset) because it is one line; see {@link CodexContribution}.
  */
 export const ONBOARD_CODEX_LINE =
-  '**First-time setup:** if this repo has no TestSprite tests yet, seed a *broad* first suite across its main user flows — not just one test — each with a concrete, observable assertion, before reporting setup as done. Try `testsprite test plan generate --project <id>` then `test plan accept` first; author plans by hand only if generation is unavailable.';
+  '**First-time setup:** if this repo has no TestSprite tests yet, seed a *broad* first suite across its main user flows — not just one test — each with a concrete, observable assertion, before reporting setup as done. Ask the project\'s agent with `testsprite plan --project <id> "<the main user flows>"`, review what it proposes, then `testsprite apply`.';
 
 /**
  * `testsprite-ci` codex contribution — one always-on line; the full onboarding
@@ -92,14 +92,14 @@ export const SKILLS: Record<string, SkillSpec> = {
   'testsprite-verify': {
     name: 'testsprite-verify',
     description:
-      'TestSprite verification loop — after finishing a feature or fix in a TestSprite-tested repo, use the `testsprite` CLI to run the relevant TestSprite tests against the change and inspect any failure artifacts before reporting the work as done. Use whenever code has changed outside docs/config and is about to be reported complete — by running an existing test that covers the change, or by creating a new TestSprite test (a frontend plan, or a backend Python assertion) and running it to a terminal verdict.',
+      "TestSprite verification loop — after finishing a feature or fix in a TestSprite-tested repo, use the `testsprite` CLI to run the relevant TestSprite tests against the change and inspect any failure artifacts before reporting the work as done. Use whenever code has changed outside docs/config and is about to be reported complete — by running an existing test that covers the change, or by asking the project's agent for a new one (`testsprite plan`, then `testsprite apply`) and running it to a terminal verdict.",
     bodyFile: 'testsprite-verify.skill.md',
     codex: { kind: 'full', file: 'testsprite-verify.codex.md' },
   },
   'testsprite-onboard': {
     name: 'testsprite-onboard',
     description:
-      'Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), generate a coherent set of tests (or derive and batch-create them from the codebase), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.',
+      'Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), have the project\'s agent plan a coherent set of tests (`testsprite plan`, then `testsprite apply`), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.',
     bodyFile: 'testsprite-onboard.skill.md',
     codex: { kind: 'line', text: ONBOARD_CODEX_LINE },
   },
@@ -137,12 +137,54 @@ export const SKILL_DESCRIPTION = SKILLS['testsprite-verify']!.description;
 // Wrappers
 // ---------------------------------------------------------------------------
 
-function wrapSkill(name: string, description: string, body: string): string {
-  return `---\nname: ${name}\ndescription: ${description}\n---\n\n${body}\n`;
+/**
+ * True when `value` can be emitted as a YAML plain scalar without changing its
+ * meaning. Anything else (notably a `: ` sequence, as in
+ * `` `on: deployment_status` ``) must be quoted, or YAML readers parse it as
+ * nested mapping syntax and reject the whole frontmatter block.
+ */
+function isPlainScalarSafe(value: string): boolean {
+  if (value === '' || value !== value.trim()) return false;
+  // Leading indicators reserve a scalar's first character (also applies to
+  // characters YAML reserves only at the start, like backtick and `%`).
+  if (/^[-?:,[\]{}#&*!|>'"%@`]/.test(value)) return false;
+  // `: ` starts a mapping value, ` #` starts a comment, and a trailing `:`
+  // is read as an empty value.
+  if (/:\s/.test(value) || /\s#/.test(value) || value.endsWith(':')) return false;
+  // Control characters (newlines, tabs) cannot appear in a single-line scalar.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  // A plain scalar resolving to a non-string type (boolean, null, number,
+  // timestamp) would violate this helper's string contract, so quote it.
+  if (/^(?:~|null|true|false|yes|no|on|off)$/i.test(value)) return false;
+  if (
+    /^[-+]?(?:0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\d[\d_]*(?:\.[\d_]*)?(?:[eE][-+]?\d+)?|\.(?:inf|nan))$/i.test(
+      value,
+    )
+  ) {
+    return false;
+  }
+  if (/^\d{4}-\d{1,2}-\d{1,2}(?:$|[Tt ])/.test(value)) return false;
+  return true;
 }
 
-function wrapMdc(_name: string, description: string, body: string): string {
-  return `---\ndescription: ${description}\nalwaysApply: false\n---\n\n${body}\n`;
+/**
+ * Emit a frontmatter scalar: unchanged when a plain scalar is safe, otherwise a
+ * double-quoted YAML string (JSON escapes are a subset of YAML's). Keeps the
+ * verify/onboard renders byte-identical while making any description safe.
+ */
+export function yamlScalar(value: string): string {
+  return isPlainScalarSafe(value) ? value : JSON.stringify(value);
+}
+
+function wrapSkill(name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\nname: ${name}\ndescription: ${value}\n---\n\n${body}\n`;
+}
+
+function wrapMdc(_name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\ndescription: ${value}\nalwaysApply: false\n---\n\n${body}\n`;
 }
 
 /**
@@ -153,8 +195,9 @@ function wrapMdc(_name: string, description: string, body: string): string {
  * relevant — exactly the on-demand activation these skills want. (The other
  * triggers are `always_on`, `manual`, and `glob`.)
  */
-function wrapWindsurf(_name: string, description: string, body: string): string {
-  return `---\ntrigger: model_decision\ndescription: ${description}\n---\n\n${body}\n`;
+function wrapWindsurf(_name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\ntrigger: model_decision\ndescription: ${value}\n---\n\n${body}\n`;
 }
 
 /**
@@ -166,8 +209,9 @@ function wrapWindsurf(_name: string, description: string, body: string): string 
  * (there is no on-demand "model decides" mode for Copilot instruction files, so
  * always-apply is the correct idiom). `description` is surfaced in Copilot's UI.
  */
-function wrapCopilot(_name: string, description: string, body: string): string {
-  return `---\ndescription: ${description}\napplyTo: '**'\n---\n\n${body}\n`;
+function wrapCopilot(_name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\ndescription: ${value}\napplyTo: '**'\n---\n\n${body}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +562,50 @@ export function renderOwnFileWithMarker(
     spec.wrap(skillSpec.name, skillSpec.description, resolvedBody),
     markerLine,
   );
+}
+
+/**
+ * Render an own-file artifact the way v0.15.0 did: the description interpolated
+ * as an unquoted plain scalar. Kept only so install/status can recognise those
+ * files as pristine-but-outdated instead of user edits — never written.
+ */
+export function renderLegacyOwnFileWithMarker(
+  target: AgentTarget,
+  skill: string,
+  markerLine: string,
+  body?: string,
+): string {
+  const spec = TARGETS[target];
+  if (spec.mode !== 'own-file') {
+    throw new Error(`renderLegacyOwnFileWithMarker: ${target} is not an own-file target`);
+  }
+  const skillSpec = SKILLS[skill];
+  if (!skillSpec) throw new Error(`unknown skill: ${skill}`);
+  const resolvedBody = body !== undefined ? body : ownFileBodyFor(target, skill);
+  return injectMarkerLine(
+    spec.wrap(skillSpec.name, skillSpec.description, resolvedBody, false),
+    markerLine,
+  );
+}
+
+/**
+ * True when `content` is exactly what v0.15.0 wrote for this (target, skill):
+ * the marker's hash still matches the canonical body, but the bytes only match
+ * the legacy unquoted render. Such files are stale installs, not user edits, so
+ * a plain `agent install` may repair them without `--force`.
+ */
+export function isLegacyOwnFileRender(
+  target: AgentTarget,
+  skill: string,
+  content: string,
+  body?: string,
+): boolean {
+  if (TARGETS[target].mode !== 'own-file') return false;
+  const marker = parseSkillMarker(content);
+  if (marker === null) return false;
+  const resolvedBody = body !== undefined ? body : ownFileBodyFor(target, skill);
+  if (marker.hash12 !== bodyHash12(resolvedBody)) return false;
+  return content === renderLegacyOwnFileWithMarker(target, skill, marker.line, resolvedBody);
 }
 
 /**

@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { ApiError } from '../errors.js';
 import {
   buildDryRunPathPattern,
   DRY_RUN_SAMPLE_ENTRIES,
   findSample,
-  findSampleOrThrow,
   sampleJUnitReportXml,
 } from './samples.js';
+import * as v from 'valibot';
+import { RESULT_DETAIL_SCHEMA, RESULT_LIST_SCHEMA } from '../response-schemas.js';
 
 describe('sampleJUnitReportXml', () => {
   it('returns well-formed JUnit XML with canned batch ids', () => {
@@ -44,28 +44,6 @@ describe('findSample skipDependencies echo', () => {
 });
 
 describe('findSample', () => {
-  it('provides password-free project sign-in get and set samples', () => {
-    const get = findSample('GET', '/projects/p_x/sign-in?environment=default');
-    const set = findSample('PUT', '/projects/p_x/sign-in', {
-      mode: 'account',
-      password: 'secret-example',
-    });
-    expect(get?.operationId).toBe('getProjectSignIn');
-    expect(set?.operationId).toBe('setProjectSignIn');
-    expect(set?.body()).toMatchObject({
-      signIn: { mode: 'account', account: { passwordSet: true } },
-      changed: true,
-    });
-    expect(JSON.stringify(set?.body())).not.toContain('secret-example');
-  });
-  it('previews setting an existing OTP environment as unchanged', () => {
-    const set = findSample('PUT', '/projects/p_x/sign-in', { mode: 'otp' });
-    expect(set?.body()).toMatchObject({
-      environment: { authMode: 'otp', enableOtp: true },
-      signIn: { mode: 'otp' },
-      changed: false,
-    });
-  });
   it('keeps tunnel collection and single-client samples distinct', () => {
     const list = findSample('GET', '/tunnel');
     const status = findSample('GET', '/tunnel/11111111-2222-4333-8444-555555555555');
@@ -93,98 +71,6 @@ describe('findSample', () => {
     expect(e?.operationId).toBe('getProject');
   });
 
-  it('GET /projects/{id}/plans resolves getPlans, NOT getProject (ordering)', () => {
-    // The plans entries are registered BEFORE getProject (first-match-wins);
-    // this proves both directions of the non-shadowing contract.
-    const plans = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/plans');
-    expect(plans?.operationId).toBe('getPlans');
-    const project = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x');
-    expect(project?.operationId).toBe('getProject');
-  });
-
-  it('POST /projects/{id}/plans/generate resolves generatePlans', () => {
-    const e = findSample(
-      'POST',
-      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/generate',
-    );
-    expect(e?.operationId).toBe('generatePlans');
-    const body = e?.body() as { status: string; stage: string | null };
-    expect(body.status).toBe('accepted');
-  });
-
-  it('getPlans sample stages two proposals WITH stable proposalIds (FE + BE shapes)', () => {
-    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/plans');
-    const body = e?.body() as {
-      generation: { status: string };
-      proposals: Array<{
-        proposalId: string;
-        type: string;
-        steps?: unknown[];
-        endpointPath?: string | null;
-        captures?: string[];
-        consumes?: string[];
-      }>;
-      credits: { charged: Array<{ action: string; amount: number }>; balance: number | null };
-    };
-    expect(body.generation.status).toBe('idle');
-    expect(body.proposals.map(p => p.proposalId)).toEqual(['prop_1', 'prop_2']);
-    const fe = body.proposals[0]!;
-    expect(fe.type).toBe('frontend');
-    expect(Array.isArray(fe.steps)).toBe(true);
-    const be = body.proposals[1]!;
-    expect(be.type).toBe('backend');
-    expect(be.endpointPath).toBe('/v1/orders');
-    expect(be.captures).toEqual(['orderId']);
-    expect(be.consumes).toEqual(['authToken']);
-    expect(body.credits.balance).not.toBeNull();
-  });
-
-  it('POST /projects/{id}/plans/accept is input-derived: echoes the explicit only list', () => {
-    const subset = findSample(
-      'POST',
-      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/accept',
-      { only: ['prop_2'] },
-    );
-    expect(subset?.operationId).toBe('acceptPlans');
-    const subsetBody = subset?.body() as { acceptedCount: number; caseKeys: string[] };
-    expect(subsetBody.acceptedCount).toBe(1);
-    expect(subsetBody.caseKeys).toEqual(['case_dryrun_prop_2']);
-    // No body context → the illustrative two-proposal shape.
-    const bare = findSample(
-      'POST',
-      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/accept',
-    );
-    const bareBody = bare?.body() as { acceptedCount: number };
-    expect(bareBody.acceptedCount).toBe(2);
-  });
-
-  it('GET /projects/{id}/plans/generate has no sample (trigger is POST-only)', () => {
-    const e = findSample(
-      'GET',
-      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/generate',
-    );
-    expect(e).toBeUndefined();
-  });
-
-  it('findSampleOrThrow returns the entry when matched, throws INTERNAL when not (F6)', () => {
-    const hit = findSampleOrThrow(
-      'GET',
-      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans',
-    );
-    expect(hit.operationId).toBe('getPlans');
-    // A registry entry lost in a merge must fail loudly with a typed error,
-    // not surface as a TypeError in a renderer.
-    let thrown: unknown;
-    try {
-      findSampleOrThrow('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/no-such-route');
-    } catch (e) {
-      thrown = e;
-    }
-    expect(thrown).toBeInstanceOf(ApiError);
-    expect((thrown as ApiError).code).toBe('INTERNAL');
-    expect((thrown as ApiError).message).toContain('/projects/p_x/no-such-route');
-  });
-
   it('resolves /tests (list) — must not collide with /tests/{id}', () => {
     const list = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests');
     expect(list?.operationId).toBe('listTests');
@@ -192,15 +78,18 @@ describe('findSample', () => {
     expect(detail?.operationId).toBe('getTest');
   });
 
-  it('resolves nested /tests/{id}/{code,steps,result,failure}', () => {
-    const code = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/t_x/code');
-    expect(code?.operationId).toBe('getTestCode');
-    const steps = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/t_x/steps');
-    expect(steps?.operationId).toBe('listTestSteps');
-    const result = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/t_x/result');
-    expect(result?.operationId).toBe('getTestResult');
-    const failure = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/t_x/failure');
-    expect(failure?.operationId).toBe('getTestFailure');
+  // `result list` / `result get` read results now; no command calls these.
+  it.each([
+    '/tests/t_x/code',
+    '/schedules/sch_1/runs',
+    '/tests/t_x/steps',
+    '/tests/t_x/result',
+    '/tests/t_x/failure',
+    '/tests/t_x/failure/summary',
+    '/tests/t_x/runs',
+    '/runs/run_x/failure',
+  ])('GET %s has no sample', path => {
+    expect(findSample('GET', `https://api.testsprite.com/api/cli/v1${path}`)).toBeUndefined();
   });
 
   it('resolves /tests/executions/{id}/report without the /tests/{testId} family catching it', () => {
@@ -213,19 +102,6 @@ describe('findSample', () => {
     expect(
       findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/executions')?.operationId,
     ).toBe('getTest');
-  });
-
-  it('resolves /tests/{id}/failure/summary distinct from /failure (M2.1 piece 3)', () => {
-    // The summary endpoint must match BEFORE the bundle endpoint so a
-    // dry-run user practising `failure summary` doesn't get the bundle
-    // shape back. Pattern order is significant inside the entry list.
-    const summary = findSample(
-      'GET',
-      'https://api.testsprite.com/api/cli/v1/tests/t_x/failure/summary',
-    );
-    expect(summary?.operationId).toBe('getTestFailureSummary');
-    const bundle = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/t_x/failure');
-    expect(bundle?.operationId).toBe('getTestFailure');
   });
 
   it('ignores query string when matching', () => {
@@ -264,145 +140,19 @@ describe('findSample', () => {
           break;
         case 'listProjects':
         case 'listTests':
-        case 'listTestSteps':
           expect(body).toMatchObject({ items: expect.any(Array), nextToken: null });
           break;
         case 'getProject':
-          expect(body).toMatchObject({ id: expect.any(String), name: expect.any(String) });
-          break;
-        case 'docsUploadUrl':
-          // CliDocsUploadUrlResponse wire shape.
           expect(body).toMatchObject({
-            uploadUrl: expect.any(String),
-            s3Key: expect.any(String),
-            expiresInSeconds: expect.any(Number),
-          });
-          break;
-        case 'docsRegister':
-          // CliDocsRegisterResponse wire shape.
-          expect(body).toMatchObject({
-            resourceId: expect.any(String),
-            displayName: expect.any(String),
-            docRole: expect.any(String),
-            processStatus: expect.any(String),
+            id: expect.any(String),
+            name: expect.any(String),
+            instruction: expect.any(String),
           });
           break;
         case 'getTest':
-          // G1a — priority must be present (truthy string or null).
-          expect(body).toMatchObject({ id: expect.any(String), name: expect.any(String) });
+          // The case alone: title, not name; priority present (string or null).
+          expect(body).toMatchObject({ id: expect.any(String), title: expect.any(String) });
           expect('priority' in body).toBe(true);
-          break;
-        case 'getTestCode':
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            language: expect.any(String),
-            code: expect.any(String),
-          });
-          break;
-        case 'getTestResult':
-          // verdict (outcome) + executionStatus (lifecycle) + semantic
-          // summary string, alongside the retained legacy `status`.
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            status: expect.any(String),
-            verdict: expect.any(String),
-            executionStatus: expect.any(String),
-            snapshotId: expect.any(String),
-            summary: expect.any(String),
-            targetUrlSource: 'run',
-          });
-          break;
-        case 'getTestFailure':
-          expect(body).toMatchObject({
-            snapshotId: expect.any(String),
-            testId: expect.any(String),
-            projectId: expect.any(String),
-            result: expect.any(Object),
-            steps: expect.any(Array),
-            code: expect.any(Object),
-            failure: expect.any(Object),
-          });
-          break;
-        case 'getTestFailureSummary':
-          // §5.2 / M2.1 piece 3 — flat shape, no bundle metadata.
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            status: expect.any(String),
-            snapshotId: expect.any(String),
-          });
-          break;
-        case 'createTestFromCode':
-          // M3.2 piece-2 — `CreateTestResponse` echoed from a POST.
-          // Piece-5 reuses the same sample for `--plan-from`; the
-          // sampler doesn't body-inspect, so the same body covers both.
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            type: expect.any(String),
-            codeVersion: expect.any(String),
-            createdAt: expect.any(String),
-          });
-          break;
-        case 'putPlanSteps':
-          // M3.2 piece-6 — `PutPlanStepsResponse` echoed from a PUT.
-          // FE-only; BE tests get a 400 from the server.
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            planStepsHash: expect.any(String),
-            stepCount: expect.any(Number),
-            updatedAt: expect.any(String),
-          });
-          break;
-        case 'putTestCode':
-          // M3.2 piece-4 — `PutTestCodeResponse` echoed from a PUT.
-          // The bumped codeVersion drives the next call's If-Match.
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            codeVersion: expect.any(String),
-            updatedAt: expect.any(String),
-          });
-          break;
-        case 'updateTest':
-          // M3.2 piece-3 — `UpdateTestResponse` echoed from a PUT.
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            updatedFields: expect.any(Array),
-            updatedAt: expect.any(String),
-          });
-          break;
-        case 'deleteTest':
-          // M3.2 piece-3 — `DeleteTestResponse` echoed from a DELETE
-          // (permanent hard-delete; no restore window).
-          expect(body).toMatchObject({
-            testId: expect.any(String),
-            deletedAt: expect.any(String),
-          });
-          break;
-        case 'deleteBatch':
-          // delete-batch dispatches DELETE /tests/{testId} per test (no batch
-          // endpoint). The canned sample shows CliBulkDeleteSummary shape with
-          // a mix of deleted + skipped results.
-          expect(body).toMatchObject({
-            results: expect.any(Array),
-            summary: expect.objectContaining({
-              total: expect.any(Number),
-              deleted: expect.any(Number),
-              skipped: expect.any(Number),
-              failed: expect.any(Number),
-            }),
-          });
-          break;
-        case 'createTestBatch':
-          // M3.2 piece-5 — batch create response (FE-only). Per-spec
-          // results preserve input order; mixed-status sample shows
-          // 2 created + 1 validation_error.
-          expect(body).toMatchObject({
-            results: expect.any(Array),
-            summary: expect.objectContaining({
-              total: expect.any(Number),
-              created: expect.any(Number),
-              failed: expect.any(Number),
-            }),
-          });
           break;
         case 'triggerRun':
           // M3.3 piece-3 — POST /tests/{testId}/runs → TriggerRunResponse.
@@ -417,43 +167,12 @@ describe('findSample', () => {
         case 'getRun':
           // M3.3 piece-3 — GET /runs/{runId} → RunResponse.
           expect(body).toMatchObject({
-            runId: expect.any(String),
+            resultId: expect.any(String),
             testId: expect.any(String),
             projectId: expect.any(String),
             userId: expect.any(String),
             status: expect.any(String),
             stepSummary: expect.any(Object),
-          });
-          break;
-        case 'getRunFailure':
-          // M3.3 piece-4 — run-scoped failure bundle (same FailureContext
-          // shape as `getTestFailure` but addressed by runId).
-          expect(body).toMatchObject({
-            snapshotId: expect.any(String),
-            testId: expect.any(String),
-            result: expect.objectContaining({ snapshotId: expect.any(String) }),
-          });
-          break;
-        case 'triggerRerun':
-          // M3.4 piece-3 — POST /tests/{testId}/runs/rerun → RerunResponse.
-          // G1c — closure is ALWAYS present (null for FE, object for BE).
-          expect(body).toMatchObject({
-            runId: expect.any(String),
-            status: 'queued',
-            enqueuedAt: expect.any(String),
-            codeVersion: expect.any(String),
-            autoHeal: expect.any(Boolean),
-          });
-          // closure must be explicitly present (not undefined); may be object or null.
-          expect('closure' in body).toBe(true);
-          break;
-        case 'triggerBatchRerun':
-          // M3.4 piece-3 — POST /tests/batch/rerun → BatchRerunResponse.
-          expect(body).toMatchObject({
-            accepted: expect.any(Array),
-            deferred: expect.any(Array),
-            conflicts: expect.any(Array),
-            closure: expect.any(Object),
           });
           break;
         case 'triggerBatchRunFresh':
@@ -468,28 +187,6 @@ describe('findSample', () => {
             (body as { accepted: Array<Record<string, unknown>> }).accepted.length,
           ).toBeGreaterThan(0);
           break;
-        case 'listTestRuns': {
-          // M3.4 piece-5 — GET /tests/{testId}/runs → ListRunsResponse.
-          // G1b — run rows include targetUrl + targetUrlSource fields.
-          expect(body).toMatchObject({
-            runs: expect.any(Array),
-            nextCursor: null,
-            meta: expect.any(Object),
-          });
-          // At least one run row present for illustrative purposes.
-          const runs = (body as { runs: Array<Record<string, unknown>> }).runs;
-          expect(runs.length).toBeGreaterThan(0);
-          // All rows must carry the G1b fields (present, even if null).
-          for (const row of runs) {
-            expect('targetUrl' in row).toBe(true);
-            expect('targetUrlSource' in row).toBe(true);
-          }
-          // First row: a real URL with source='run'.
-          expect(runs[0]).toMatchObject({ targetUrl: expect.any(String), targetUrlSource: 'run' });
-          // Second row: unresolved shape (null URL, source='unresolved').
-          expect(runs[1]).toMatchObject({ targetUrl: null, targetUrlSource: 'unresolved' });
-          break;
-        }
         case 'createProject':
           // P6 — POST /projects → CliCreateProjectResponse shape. Both id
           // field names present (the live field is
@@ -514,13 +211,13 @@ describe('findSample', () => {
           });
           break;
         case 'cancelRun':
-          // POST /runs/{runId}/cancel → CancelRunResponse
-          // (RunResponse shape + alreadyCancelled).
           expect(body).toMatchObject({
             runId: expect.any(String),
-            testId: expect.any(String),
-            status: 'cancelled',
             alreadyCancelled: false,
+            alreadyFinished: false,
+            results: [
+              expect.objectContaining({ resultId: expect.any(String), status: 'cancelled' }),
+            ],
           });
           break;
         case 'deleteProject':
@@ -528,58 +225,6 @@ describe('findSample', () => {
           expect(body).toMatchObject({
             projectId: expect.any(String),
             deletedAt: expect.any(String),
-          });
-          break;
-        case 'getProjectSignIn':
-        case 'setProjectSignIn':
-          expect(body).toMatchObject({
-            projectId: expect.any(String),
-            environment: expect.objectContaining({
-              name: expect.any(String),
-              authMode: expect.any(String),
-            }),
-            signIn: expect.objectContaining({ mode: expect.any(String) }),
-          });
-          expect(body.nextAction === null || typeof body.nextAction === 'string').toBe(true);
-          break;
-        case 'generatePlans':
-          // POST /projects/{id}/plans/generate →
-          // CliGeneratePlansResponse (202 trigger ack).
-          expect(body).toMatchObject({
-            status: 'accepted',
-            projectId: expect.any(String),
-            stagesRemaining: expect.any(Array),
-            enqueuedAt: expect.any(String),
-          });
-          expect('stage' in body).toBe(true);
-          break;
-        case 'getPlans': {
-          // GET /projects/{id}/plans → CliGetPlansResponse.
-          // Every staged proposal must carry its stable proposalId (that id
-          // is what `accept --only` consumes).
-          expect(body).toMatchObject({
-            generation: expect.objectContaining({ status: expect.any(String) }),
-            proposals: expect.any(Array),
-            credits: expect.objectContaining({ charged: expect.any(Array) }),
-          });
-          const proposals = (body as { proposals: Array<Record<string, unknown>> }).proposals;
-          expect(proposals.length).toBeGreaterThan(0);
-          for (const p of proposals) {
-            expect(p).toMatchObject({
-              proposalId: expect.any(String),
-              title: expect.any(String),
-              priority: expect.any(String),
-              type: expect.any(String),
-            });
-          }
-          break;
-        }
-        case 'acceptPlans':
-          // POST /projects/{id}/plans/accept → the server's real
-          // `{acceptedCount, caseKeys}` shape (DR-29: no codegen field).
-          expect(body).toMatchObject({
-            acceptedCount: expect.any(Number),
-            caseKeys: expect.any(Array),
           });
           break;
         case 'listSchedules':
@@ -601,9 +246,6 @@ describe('findSample', () => {
         case 'deleteSchedule':
           expect(body).toMatchObject({ scheduleId: expect.any(String) });
           break;
-        case 'listScheduleRuns':
-          expect(body).toMatchObject({ runs: expect.any(Array) });
-          break;
         case 'listTunnels':
           expect(body).toMatchObject({ tunnels: expect.any(Array) });
           expect((body as { tunnels: unknown[] }).tunnels).toHaveLength(2);
@@ -620,79 +262,64 @@ describe('findSample', () => {
             ready: true,
             markdown: expect.any(String),
             report: expect.objectContaining({
-              executionId: expect.any(String),
+              runId: expect.any(String),
               stats: expect.objectContaining({ total: expect.any(Number) }),
               tests: expect.any(Array),
             }),
+          });
+          break;
+        case 'startConversation':
+          expect(body).toMatchObject({ id: expect.any(String), url: expect.any(String) });
+          break;
+        case 'listConversations':
+          expect(body).toMatchObject({ conversations: expect.any(Array) });
+          break;
+        case 'getConversation':
+          expect(body).toMatchObject({
+            id: expect.any(String),
+            url: expect.any(String),
+            state: expect.any(String),
+            lastSeq: expect.any(Number),
+            events: expect.any(Array),
+          });
+          break;
+        case 'conversationFileUrl':
+          expect(body).toMatchObject({ uploadUrl: expect.any(String), name: expect.any(String) });
+          break;
+        case 'sendConversationMessage':
+        case 'sendConversationEnvironmentMessage':
+          expect(body).toMatchObject({ seq: expect.any(Number) });
+          break;
+        case 'applyConversationProposal':
+          expect(body).toMatchObject({ applied: expect.any(String), ok: true });
+          break;
+        case 'rejectConversationProposal':
+          expect(body).toMatchObject({ rejected: expect.any(String) });
+          break;
+        case 'stopConversation':
+          expect(body).toMatchObject({ ok: true });
+          break;
+        case 'discardConversation':
+          expect(body).toMatchObject({
+            discarded: expect.any(String),
+            released: expect.any(Array),
+          });
+          break;
+        case 'listResults':
+          expect(body).toMatchObject({ results: expect.any(Array) });
+          break;
+        case 'getResult':
+          expect(body).toMatchObject({
+            resultId: expect.any(String),
+            runId: expect.any(String),
+            testStatus: expect.any(String),
+            steps: expect.any(Array),
           });
           break;
         default:
           throw new Error(`Unexpected operationId in samples: ${e.operationId}`);
       }
     }
-  });
-
-  it('GET /tests/{testId}/runs resolves listTestRuns (not getTest)', () => {
-    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/test_abc/runs');
-    expect(e?.operationId).toBe('listTestRuns');
-    const body = e?.body() as {
-      runs: Array<Record<string, unknown>>;
-      nextCursor: null;
-      meta: unknown;
-    };
-    expect(Array.isArray(body.runs)).toBe(true);
-    expect(body.runs.length).toBeGreaterThan(0);
-    expect(body.nextCursor).toBeNull();
-    // G1b — every row must carry targetUrl + targetUrlSource.
-    for (const row of body.runs) {
-      expect('targetUrl' in row).toBe(true);
-      expect('targetUrlSource' in row).toBe(true);
-    }
-  });
-
-  it('GET /tests/{testId}/runs: first row has isRerun:false, second has isRerun:true', () => {
-    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/test_abc/runs');
-    const body = e?.body() as {
-      runs: Array<{
-        runId: string;
-        isRerun: boolean;
-        failureKind: string | null;
-        targetUrl: string | null;
-        targetUrlSource: string | null;
-      }>;
-    };
-    expect(body.runs[0]?.isRerun).toBe(false);
-    expect(body.runs[0]?.failureKind).toBeNull();
-    // G1b — first row: real URL with source='run'.
-    expect(body.runs[0]?.targetUrlSource).toBe('run');
-    expect(typeof body.runs[0]?.targetUrl).toBe('string');
-    expect(body.runs[1]?.isRerun).toBe(true);
-    expect(body.runs[1]?.failureKind).toBe('assertion');
-    // G1b — second row: unresolved shape.
-    expect(body.runs[1]?.targetUrl).toBeNull();
-    expect(body.runs[1]?.targetUrlSource).toBe('unresolved');
-  });
-
-  it('failure context maintains §6.7 atomicity invariant (snapshotId === result.snapshotId)', () => {
-    const failure = findSample('GET', '/tests/t_x/failure');
-    const body = failure?.body() as { snapshotId: string; result: { snapshotId: string } };
-    expect(body.result.snapshotId).toBe(body.snapshotId);
-  });
-
-  // updateTest method regression guard.
-  // Backend route is `@Put('/:testId')` in cli-tests.controller.ts:577;
-  // the CLI `runUpdate` calls `client.put()`; the dry-run sample is also
-  // registered as PUT. Prior audit incorrectly claimed PATCH was the wire
-  // verb based on CLAUDE.md's aspirational table — actual wire reality is
-  // PUT. This test pins the verb so a future "fix" doesn't silently break
-  // `test update` against the deployed backend.
-  it('PUT /tests/{id} resolves updateTest', () => {
-    const e = findSample('PUT', 'https://api.testsprite.com/api/cli/v1/tests/test_abc');
-    expect(e?.operationId).toBe('updateTest');
-    const body = e?.body() as { testId: string; updatedFields: string[]; updatedAt: string };
-    expect(body.testId).toBeTruthy();
-    expect(Array.isArray(body.updatedFields)).toBe(true);
-    expect(body.updatedAt).toBeTruthy();
   });
 
   it('PATCH /tests/{id} has no sample (backend route is PUT)', () => {
@@ -702,7 +329,7 @@ describe('findSample', () => {
 
   // defect-2 fix: getRun sample must return the passed shape (first-match-wins
   // in findSample). Prior to fix, a duplicate failed-shape entry appeared
-  // before the passed-shape entry; `test wait --dry-run` always resolved to
+  // before the passed-shape entry; `run wait --dry-run` always resolved to
   // status: "failed", giving agents the wrong happy-path canned response.
   it('GET /runs/{runId} resolves to the passed-shape getRun (not the failed shape)', () => {
     const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/runs/run_xyz');
@@ -716,24 +343,18 @@ describe('findSample', () => {
     expect(body.stepSummary.failedCount).toBe(0);
   });
 
-  it('GET /runs/run_failed_sample resolves to the sentinel failed run-scoped step sample', () => {
-    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/runs/run_failed_sample');
+  it('GET /runs/res_failed_sample resolves to the sentinel failed run sample', () => {
+    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/runs/res_failed_sample');
     expect(e?.operationId).toBe('getRun');
     const body = e?.body() as {
       status: string;
-      runId: string;
+      resultId: string;
       failedStepIndex: number | null;
       failureKind: string | null;
       error: string | null;
       stepSummary: { total: number; completed: number; passedCount: number; failedCount: number };
-      steps: Array<{
-        stepIndex: string;
-        type: string;
-        status: string | null;
-        error: string | null;
-      }>;
     };
-    expect(body.runId).toBe('run_failed_sample');
+    expect(body.resultId).toBe('res_failed_sample');
     expect(body.status).toBe('failed');
     expect(body.failedStepIndex).toBe(3);
     expect(body.failureKind).toBe('assertion');
@@ -744,14 +365,6 @@ describe('findSample', () => {
       passedCount: 2,
       failedCount: 1,
     });
-
-    const failingStep = body.steps.find(step => step.stepIndex === '0003');
-    expect(failingStep).toMatchObject({
-      type: 'assertion',
-      status: 'failed',
-      error: expect.any(String),
-    });
-    expect(failingStep?.error).not.toBe('');
   });
 
   // POST /runs/{runId}/cancel must resolve to `cancelRun`, never fall
@@ -760,8 +373,12 @@ describe('findSample', () => {
   it('POST /runs/{runId}/cancel resolves cancelRun (not getRun)', () => {
     const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/runs/run_xyz/cancel');
     expect(e?.operationId).toBe('cancelRun');
-    const body = e?.body() as { status: string; alreadyCancelled: boolean; runId: string };
-    expect(body.status).toBe('cancelled');
+    const body = e?.body() as {
+      results: Array<{ status: string }>;
+      alreadyCancelled: boolean;
+      runId: string;
+    };
+    expect(body.results[0]?.status).toBe('cancelled');
     expect(body.alreadyCancelled).toBe(false);
   });
 
@@ -793,32 +410,7 @@ describe('findSample', () => {
     expect(hasTruthy).toBe(true);
   });
 
-  it('triggerRerun sample closure is explicitly present (G1c — always-present nullable)', () => {
-    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/be_test/runs/rerun');
-    const body = e?.body() as Record<string, unknown>;
-    // closure must be present (not undefined); BE sample carries the object.
-    expect('closure' in body).toBe(true);
-    expect(body.closure).not.toBeUndefined();
-  });
-
-  it('POST /tests/{testId}/runs/rerun resolves triggerRerun (not triggerRun)', () => {
-    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/test_abc/runs/rerun');
-    expect(e?.operationId).toBe('triggerRerun');
-    const body = e?.body() as { runId: string; status: string; autoHeal: boolean };
-    expect(body.runId).toBeTruthy();
-    expect(body.status).toBe('queued');
-    expect(typeof body.autoHeal).toBe('boolean');
-  });
-
-  it('POST /tests/batch/rerun resolves triggerBatchRerun (not createTestBatch)', () => {
-    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/batch/rerun');
-    expect(e?.operationId).toBe('triggerBatchRerun');
-    const body = e?.body() as { accepted: unknown[]; deferred: unknown[] };
-    expect(Array.isArray(body.accepted)).toBe(true);
-    expect(Array.isArray(body.deferred)).toBe(true);
-  });
-
-  it('POST /tests/batch/run resolves triggerBatchRunFresh (not rerun or create)', () => {
+  it('POST /tests/batch/run resolves triggerBatchRunFresh', () => {
     const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/batch/run');
     expect(e?.operationId).toBe('triggerBatchRunFresh');
     const body = e?.body() as { accepted: unknown[]; skippedFrontend: unknown[] };
@@ -834,79 +426,17 @@ describe('findSample', () => {
     };
     expect(body.accepted[0]).toMatchObject({
       testId: expect.any(String),
-      runId: expect.any(String),
+      resultId: expect.any(String),
       enqueuedAt: expect.any(String),
     });
   });
 
-  it('triggerRerun sample carries closure.members with per-member runIds (C2)', () => {
-    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/be_test/runs/rerun');
-    const body = e?.body() as {
-      closure?: { members: Array<{ testId: string; runId: string; role: string }> };
-    };
-    expect(body.closure?.members).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ runId: expect.any(String), role: expect.any(String) }),
-      ]),
-    );
-  });
-
-  it('triggerBatchRerun sample carries deferred[] example (C1)', () => {
-    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/batch/rerun');
-    const body = e?.body() as { deferred: Array<{ testId: string; reason: string }> };
-    expect(body.deferred.length).toBeGreaterThan(0);
-    expect(body.deferred[0]).toMatchObject({
-      testId: expect.any(String),
-      reason: expect.any(String),
-    });
-  });
-
-  it('DELETE /tests/batch resolves deleteBatch documentation sample', () => {
-    // delete-batch is inline-dry-run (no network call) but the sample is
-    // registered for shape documentation and build-guard purposes.
-    const e = findSample('DELETE', 'https://api.testsprite.com/api/cli/v1/tests/batch');
-    expect(e?.operationId).toBe('deleteBatch');
-    const body = e?.body() as { results: unknown[]; summary: Record<string, number> };
-    expect(Array.isArray(body.results)).toBe(true);
-    expect(body.summary.total).toBeGreaterThanOrEqual(1);
-  });
-
-  // `project docs upload` dry-runs via an inline early-exit (zero network,
-  // stat only — the presigned PUT leg cannot be expressed through canned
-  // fetch samples). These two entries are documentation/shape-guards, same
-  // family as `deleteBatch`.
-  it('POST /projects/{id}/docs/upload-url resolves docsUploadUrl (wire shape)', () => {
-    const e = findSample(
-      'POST',
-      'https://api.testsprite.com/api/cli/v1/projects/p_x/docs/upload-url',
-    );
-    expect(e?.operationId).toBe('docsUploadUrl');
-    const body = e?.body() as { uploadUrl: string; s3Key: string; expiresInSeconds: number };
-    expect(body.uploadUrl).toMatch(/^https:/);
-    expect(body.s3Key).toBeTruthy();
-    expect(body.expiresInSeconds).toBe(3600);
-  });
-
-  it('POST /projects/{id}/docs resolves docsRegister (not shadowed by upload-url)', () => {
-    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/projects/p_x/docs');
-    expect(e?.operationId).toBe('docsRegister');
-    const body = e?.body() as {
-      resourceId: string;
-      displayName: string;
-      docRole: string;
-      processStatus: string;
-    };
-    expect(body.resourceId).toBeTruthy();
-    expect(body.docRole).toBe('API_DOC');
-    expect(body.processStatus).toBeTruthy();
-  });
-
   it('keeps the failed run sentinel before generic getRun while retaining cancelRun', () => {
     // findSample is first-match-wins; exact run fixtures must precede
-    // `/runs/{runId}` so `test wait --dry-run` still gets the passed sample.
+    // `/runs/{runId}` so `run wait --dry-run` still gets the passed sample.
     // The adjacent POST cancel fixture was added on main after this branch forked.
     const failedRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
-      e => e.method === 'GET' && e.pathTemplate === '/runs/run_failed_sample',
+      e => e.method === 'GET' && e.pathTemplate === '/runs/res_failed_sample',
     );
     const genericRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
       e => e.method === 'GET' && e.pathTemplate === '/runs/{runId}',
@@ -919,122 +449,102 @@ describe('findSample', () => {
     expect(cancelRunIndex).toBeGreaterThanOrEqual(0);
     expect(failedRunIndex).toBeLessThan(genericRunIndex);
   });
+});
 
-  // Input-derived sample tests (Fix #1 — dogfood 2026-05-15)
-  describe('input-derived samples echo user flags', () => {
-    it('updateTest: updatedFields reflects the actual request body keys', () => {
-      const e = findSample('PUT', 'https://api.testsprite.com/api/cli/v1/tests/test_abc', {
-        name: 'my-new-name',
-      });
-      const body = e?.body() as { updatedFields: string[] };
-      expect(body.updatedFields).toEqual(['name']);
-    });
+describe('result samples', () => {
+  const API = 'https://api.testsprite.com/api/cli/v1';
 
-    it('updateTest: updatedFields reflects multiple fields', () => {
-      const e = findSample('PUT', 'https://api.testsprite.com/api/cli/v1/tests/test_abc', {
-        name: 'n',
-        description: 'd',
-        priority: 'high',
-      });
-      const body = e?.body() as { updatedFields: string[] };
-      expect(body.updatedFields).toEqual(['name', 'description', 'priority']);
-    });
+  it('GET /results resolves listResults for a run and for a test', () => {
+    for (const query of ['run=exec_x&status=failed%2Cblocked', 'test=case-a&env=staging&limit=5']) {
+      expect(findSample('GET', `${API}/results?${query}`)?.operationId).toBe('listResults');
+    }
+  });
 
-    it('updateTest: falls back to default ["name","description"] when no request body', () => {
-      const e = findSample('PUT', 'https://api.testsprite.com/api/cli/v1/tests/test_abc');
-      const body = e?.body() as { updatedFields: string[] };
-      expect(body.updatedFields).toEqual(['name', 'description']);
-    });
+  it('GET /results/{resultId} resolves getResult, not the listing', () => {
+    expect(findSample('GET', `${API}/results/result_x`)?.operationId).toBe('getResult');
+    expect(findSample('GET', `${API}/results/result_x/steps`)).toBeUndefined();
+  });
 
-    it('putPlanSteps: stepCount reflects actual planSteps array length', () => {
-      const planSteps = [
-        { type: 'action', description: 'step 1' },
-        { type: 'assertion', description: 'step 2' },
-      ];
-      const e = findSample(
-        'PUT',
-        'https://api.testsprite.com/api/cli/v1/tests/test_abc/plan-steps',
-        { planSteps },
-      );
-      const body = e?.body() as { stepCount: number };
-      expect(body.stepCount).toBe(2);
-    });
+  it('the listing is one run with a running, a failed, a passed and a blocked result', () => {
+    const body = findSample('GET', '/results')!.body();
+    const list = v.parse(RESULT_LIST_SCHEMA, body);
+    // The sample spells out every field, so parsing changes nothing.
+    expect(list).toEqual(body);
+    const { results } = list;
+    expect(results.map(r => r.testStatus).sort()).toEqual([
+      'BLOCKED',
+      'FAILED',
+      'PASSED',
+      'RUNNING',
+    ]);
+    expect(new Set(results.map(r => r.runId)).size).toBe(1);
+  });
 
-    it('putPlanSteps: falls back to stepCount 3 when no planSteps in body', () => {
-      const e = findSample(
-        'PUT',
-        'https://api.testsprite.com/api/cli/v1/tests/test_abc/plan-steps',
-      );
-      const body = e?.body() as { stepCount: number };
-      expect(body.stepCount).toBe(3);
-    });
+  it('each result belongs to a sample test: caseKey is the id `test list` prints', () => {
+    // On the backend a result's `caseKey` is the test id the CLI uses, so a
+    // dry run of `result list --test <id>` must line up with `test list`.
+    const tests = findSample('GET', '/tests')!.body() as { items: Array<{ id: string }> };
+    const ids = tests.items.map(test => test.id);
+    const { results } = findSample('GET', '/results')!.body() as {
+      results: Array<{ caseKey: string }>;
+    };
+    expect(results.map(r => r.caseKey).every(caseKey => ids.includes(caseKey))).toBe(true);
+    expect(new Set(results.map(r => r.caseKey)).size).toBe(results.length);
+    const detail = findSample('GET', '/results/any')!.body() as { caseKey: string };
+    expect(ids).toContain(detail.caseKey);
+  });
 
-    it('createTestBatch: one result per supplied spec', () => {
-      const tests = [
-        { type: 'frontend', name: 'A' },
-        { type: 'frontend', name: 'B' },
-      ];
-      const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/batch', { tests });
-      const body = e?.body() as {
-        results: Array<{ specIndex: number; status: string }>;
-        summary: { total: number; created: number };
-      };
-      expect(body.results).toHaveLength(2);
-      expect(body.results[0]?.specIndex).toBe(0);
-      expect(body.results[1]?.specIndex).toBe(1);
-      expect(body.summary.total).toBe(2);
-      expect(body.summary.created).toBe(2);
-    });
+  it('a result names its test as `test list` does, and the report rows name theirs the same way', () => {
+    const tests = findSample('GET', '/tests')!.body() as {
+      items: Array<{ id: string; title: string }>;
+    };
+    const nameOf = new Map(tests.items.map(test => [test.id, test.title]));
+    const { results } = findSample('GET', '/results')!.body() as {
+      results: Array<{ resultId: string; caseKey: string; title: string }>;
+    };
+    expect(results.map(r => r.title)).toEqual(results.map(r => nameOf.get(r.caseKey)));
+    const detail = findSample('GET', '/results/any')!.body() as { caseKey: string; title: string };
+    expect(detail.title).toBe(nameOf.get(detail.caseKey));
+    const { report } = findSample('GET', '/tests/executions/e/report')!.body() as {
+      report: { tests: Array<{ id: string; title: string }> };
+    };
+    const titleOf = new Map(results.map(r => [r.resultId, r.title]));
+    expect(report.tests.map(t => t.title)).toEqual(report.tests.map(t => titleOf.get(t.id)));
+  });
 
-    it('createTestBatch: falls back to 3-entry sample when no tests in body', () => {
-      // Preserves the educational mixed-status sample for learners who run
-      // dry-run without a body (e.g. direct fetch calls in tests).
-      const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/batch');
-      const body = e?.body() as { summary: { total: number; created: number; failed: number } };
-      expect(body.summary.total).toBe(3);
-      expect(body.summary.created).toBe(2);
-      expect(body.summary.failed).toBe(1);
-    });
+  it("the history window is a test's: a run's listing carries neither field", () => {
+    const run = findSample('GET', `${API}/results?run=r1&status=failed`)!.body() as object;
+    expect(run).toHaveProperty('results');
+    expect(run).not.toHaveProperty('hiddenRunCount');
+    expect(run).not.toHaveProperty('retentionDays');
+    const test = findSample('GET', `${API}/results?test=t1`)!.body() as object;
+    expect(test).toMatchObject({ hiddenRunCount: 4, retentionDays: 30 });
+  });
 
-    it('createTestBatch: backend specs are echoed as validation_error (mirroring runCreateBatch)', () => {
-      // codex-review round-2 P2 (2026-05-28): the round-1 fix added a
-      // type === 'backend' branch but had no regression guard. This test
-      // covers the rejection path so a future refactor can't silently
-      // start marking BE specs as `created` again.
-      const tests = [
-        { type: 'frontend', name: 'fe-spec' },
-        { type: 'backend', name: 'be-spec' },
-        { type: 'frontend', name: 'another-fe' },
-      ];
-      const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/tests/batch', { tests });
-      const body = e?.body() as {
-        results: Array<{
-          specIndex: number;
-          status: string;
-          testId: string | null;
-          error?: { code: string; message: string; field: string };
-        }>;
-        summary: { total: number; created: number; failed: number };
-      };
-      expect(body.results).toHaveLength(3);
-      // Position 0 (FE) → created
-      expect(body.results[0]?.status).toBe('created');
-      expect(body.results[0]?.testId).toBe('test_dryrun_batch_0');
-      // Position 1 (BE) → validation_error, testId null, error wired with field=type
-      expect(body.results[1]?.status).toBe('validation_error');
-      expect(body.results[1]?.testId).toBeNull();
-      expect(body.results[1]?.error?.code).toBe('VALIDATION_ERROR');
-      expect(body.results[1]?.error?.field).toBe('type');
-      // The error message should reference the BE workaround so the user
-      // sees the production guidance even in dry-run.
-      expect(body.results[1]?.error?.message).toMatch(/test create --type backend --code-file/);
-      // Position 2 (FE) → created (BE rejection does not abort siblings)
-      expect(body.results[2]?.status).toBe('created');
-      // Summary counts the FE specs as created (2) and the BE spec as failed (1).
-      expect(body.summary.total).toBe(3);
-      expect(body.summary.created).toBe(2);
-      expect(body.summary.failed).toBe(1);
-    });
+  it("the listing says how much of a test's history the plan holds back", () => {
+    const list = findSample('GET', '/results')!.body() as {
+      hiddenRunCount?: number;
+      retentionDays?: number | null;
+    };
+    expect(list.hiddenRunCount).toBeGreaterThan(0);
+    expect(list.retentionDays).toBeGreaterThan(0);
+  });
+
+  it('the single result is the failed one of that listing, with its failed step', () => {
+    const list = findSample('GET', '/results')!.body() as { results: Array<{ resultId: string }> };
+    const body = findSample('GET', '/results/any')!.body();
+    const detail = v.parse(RESULT_DETAIL_SCHEMA, body);
+    expect(detail).toEqual(body);
+    expect(detail.testStatus).toBe('FAILED');
+    expect(list.results.map(r => r.resultId)).toContain(detail.resultId);
+    expect(detail.failedStep).toEqual(detail.steps.find(s => s.status === 'failed'));
+    expect(detail.failedStep).not.toBeNull();
+    // A frontend test: the backend sends its traceback and output as null.
+    expect(detail).toMatchObject({ trace: null, apiOutput: null });
+    // Values the backend sends: its TEST_TYPE (upper case) and a STEP_ACTION
+    // assertion, so a script learnt from --dry-run matches a real response.
+    expect(detail.type).toBe('FRONTEND');
+    expect(detail.failedStep).toMatchObject({ type: 'assertion', action: 'visible' });
   });
 });
 
@@ -1051,17 +561,9 @@ describe('schedule samples', () => {
     expect(findSample('DELETE', '/schedules/sch_1')?.operationId).toBe('deleteSchedule');
   });
 
-  it('matches the runs sub-path ahead of the single-schedule pattern', () => {
-    // First-match-wins: if the entries were ordered the other way, this would
-    // resolve to getSchedule and the run list would render the wrong shape.
-    expect(findSample('GET', '/schedules/sch_1/runs')?.operationId).toBe('listScheduleRuns');
-  });
-
-  it('wraps the list and run-list bodies in their named keys', () => {
+  it('wraps the schedule list body in its named key', () => {
     const list = findSample('GET', '/schedules')?.body() as { schedules?: unknown[] };
     expect(Array.isArray(list.schedules)).toBe(true);
-    const runs = findSample('GET', '/schedules/sch_1/runs')?.body() as { runs?: unknown[] };
-    expect(Array.isArray(runs.runs)).toBe(true);
   });
 
   it('echoes the update patch so a caller can confirm their flags landed', () => {
@@ -1100,16 +602,6 @@ describe('schedule samples', () => {
     expect(body.name).toBe('Nightly checkout');
     expect(body.cron).toBe('0 3 * * *');
   });
-
-  it('reports a run status consistent with its own counts', () => {
-    // The sample shows one failure, so `status` must be failed — a sample that
-    // contradicted itself would teach the wrong contract.
-    const runs = findSample('GET', '/schedules/sch_1/runs')?.body() as {
-      runs: Array<{ status: string; stats: { failed: number } }>;
-    };
-    expect(runs.runs[0]?.stats.failed).toBeGreaterThan(0);
-    expect(runs.runs[0]?.status).toBe('failed');
-  });
 });
 
 describe('buildDryRunPathPattern (route-template regex escaping)', () => {
@@ -1146,5 +638,26 @@ describe('buildDryRunPathPattern (route-template regex escaping)', () => {
       const samplePath = e.pathTemplate.replace(/\{[^}]+\}/g, 'sample_value');
       expect(e.pattern.test(samplePath)).toBe(true);
     }
+  });
+});
+
+describe('findSample agent conversation routes', () => {
+  it.each([
+    ['POST', '/projects/p_x/conversations', 'startConversation'],
+    ['GET', '/projects/p_x/conversations?limit=1', 'listConversations'],
+    ['GET', '/projects/p_x/conversations/c_1?afterSeq=0&waitSeconds=25', 'getConversation'],
+    ['POST', '/projects/p_x/conversations/c_1/files', 'conversationFileUrl'],
+    ['POST', '/projects/p_x/conversations/c_1/messages', 'sendConversationMessage'],
+    ['POST', '/projects/p_x/conversations/c_1/apply', 'applyConversationProposal'],
+    ['POST', '/projects/p_x/conversations/c_1/reject', 'rejectConversationProposal'],
+    ['POST', '/projects/p_x/conversations/c_1/stop', 'stopConversation'],
+    ['POST', '/projects/p_x/conversations/c_1/discard', 'discardConversation'],
+  ] as const)('%s %s → %s', (method, path, operationId) => {
+    expect(findSample(method, path)?.operationId).toBe(operationId);
+  });
+
+  it('never shows a live-looking portal link', () => {
+    const sample = findSample('GET', '/projects/p_x/conversations/c_1')!.body() as { url: string };
+    expect(sample.url).toContain('.invalid/');
   });
 });

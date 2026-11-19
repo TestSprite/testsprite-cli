@@ -1,6 +1,20 @@
-import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+
+/** Give a CLI-owned .testsprite directory its default rules without replacing user rules. */
+export function ensureStateGitignore(dir: string): void {
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixed filename inside the CLI state directory.
+    writeFileSync(
+      join(dir, '.gitignore'),
+      "# This machine's TestSprite CLI state; not for git.\n*\n",
+      { flag: 'wx' },
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  }
+}
 
 /** Result of an lstat call: `null` means the path does not exist. */
 export type GitUtilsStat = { isSymbolicLink: boolean } | null;

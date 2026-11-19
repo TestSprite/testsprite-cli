@@ -24,9 +24,11 @@ import {
   parseSkillMarker,
   renderForTarget,
   renderOwnFileWithMarker,
+  isLegacyOwnFileRender,
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
 } from '../lib/agent-targets.js';
+import { terminalSafeWriter } from '../lib/terminal-text.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -355,7 +357,7 @@ function makeOwnFileBodyResolver(): (target: AgentTarget, skill: string) => stri
 
 export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Promise<void> {
   const agentFs = deps.fs ?? defaultAgentFs;
-  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderrFn = terminalSafeWriter(deps.stderr);
   const out = makeOutput(opts.output, deps);
 
   // 1. Parse targets
@@ -726,22 +728,28 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         results.push({ target: t, path: relPath, action: 'written', skills: [skill] });
       } else {
         const existing = await agentFs.readFile(abs);
+        // A v0.15.0 render whose canonical body is unchanged is a stale
+        // install, not a user edit: repair it without --force.
+        const legacyRender = isLegacyOwnFileRender(t, skill, existing);
         if (equalIgnoringCrlf(existing, content)) {
           // Byte-identical — skip
           results.push({ target: t, path: relPath, action: 'skipped', skills: [skill] });
-        } else if (!opts.force) {
+        } else if (!opts.force && !legacyRender) {
           // Differs and no --force → blocked
           results.push({ target: t, path: relPath, action: 'blocked', skills: [skill] });
         } else {
-          // Differs and --force → back up the current bytes to a fresh slot
-          // (never clobbering an existing backup or following a symlink), then
-          // overwrite. The overwrite itself can follow a symlink swapped in after
-          // the check — an accepted TOCTOU residual for a local, single-user CLI.
-          const backupPath = await writeBackup(agentFs, abs, existing);
-          await agentFs.writeFile(abs, content);
-          if (opts.output === 'text') {
-            stderrFn(`backed up ${relPath} to ${path.relative(root, backupPath)}`);
+          // Overwrite. With --force, back up the current bytes to a fresh slot
+          // (never clobbering an existing backup or following a symlink) first;
+          // a legacy render needs no backup because nothing of the user's is
+          // lost. The overwrite itself can follow a symlink swapped in after the
+          // check — an accepted TOCTOU residual for a local, single-user CLI.
+          if (opts.force) {
+            const backupPath = await writeBackup(agentFs, abs, existing);
+            if (opts.output === 'text') {
+              stderrFn(`backed up ${relPath} to ${path.relative(root, backupPath)}`);
+            }
           }
+          await agentFs.writeFile(abs, content);
           results.push({ target: t, path: relPath, action: 'updated', skills: [skill] });
         }
       }
@@ -821,7 +829,7 @@ function agentDisplayName(target: AgentTarget, status: string): string {
 
 export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promise<void> {
   const out = makeOutput(opts.output, deps);
-  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderrFn = terminalSafeWriter(deps.stderr);
 
   // One row per (target × default skill). Own-file targets land each skill at a
   // distinct path; the codex managed-section target merges all skills into the
@@ -882,10 +890,12 @@ export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promis
  *  - 'unmarked' : artifact present but carries no testsprite-skill marker
  *                 (installed before markers existed), or the landing path is
  *                 occupied by a non-regular file (never followed).
- *  - 'stale'    : marker present, but its hash differs from the current
- *                 canonical body: a re-install would change the content. Edits
- *                 on top of an OLD install also read stale (older renders
- *                 cannot be reproduced); the remedy is the same re-install.
+ *  - 'stale'    : marker present, but either its hash differs from the current
+ *                 canonical body, or the bytes are exactly a legacy (v0.15.0)
+ *                 render of that body: a re-install would change the content
+ *                 and repair it without --force. Edits on top of an OLD install
+ *                 also read stale (older renders cannot be reproduced); the
+ *                 remedy is the same re-install.
  *  - 'modified' : marker hash matches the current body, but the artifact bytes
  *                 differ from the canonical render carrying that same marker
  *                 line: the user edited the artifact after install.
@@ -944,7 +954,11 @@ async function classifyOwnFileState(
   // render carrying its own marker line, so a marker whose version string lags
   // behind an unchanged body still reads ok.
   const reRender = renderOwnFileWithMarker(target, skill, marker.line, body);
-  return equalIgnoringCrlf(existing, reRender) ? 'ok' : 'modified';
+  if (equalIgnoringCrlf(existing, reRender)) return 'ok';
+  // v0.15.0 wrote the same body with an unquoted frontmatter description; that
+  // is a stale install a plain re-install repairs, not a user edit.
+  if (isLegacyOwnFileRender(target, skill, existing, body)) return 'stale';
+  return 'modified';
 }
 
 /**
@@ -1029,18 +1043,15 @@ async function classifyManagedSectionStates(
  * (exit 0) when every row is 'ok' or 'absent'; throws CLIError exit 1 when any
  * row is stale/modified/unmarked/corrupt, so the command can gate CI.
  */
-export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Promise<void> {
-  const agentFs = deps.fs ?? defaultAgentFs;
-  const out = makeOutput(opts.output, deps);
-
-  // An explicit but empty --dir must not silently resolve to cwd
-  // (path.resolve('') === cwd).
-  if (opts.dir !== undefined && opts.dir.trim() === '') {
-    throw localValidationError('dir', 'must not be empty');
-  }
-  const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
-  const root = path.resolve(dir);
-
+/**
+ * Each target's state for each default skill under `root`: what `agent
+ * status` prints and `doctor` reads. Absent artifacts never touch the skill
+ * assets.
+ */
+export async function skillStates(
+  root: string,
+  agentFs: AgentFs = defaultAgentFs,
+): Promise<StatusResult[]> {
   // The SAME resolver the installer stamps its marker hashes from — a
   // separate copy here is exactly how install and status end up disagreeing.
   const ownFileBodyFor = makeOwnFileBodyResolver();
@@ -1075,6 +1086,20 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
       });
     }
   }
+  return results;
+}
+
+export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Promise<void> {
+  const agentFs = deps.fs ?? defaultAgentFs;
+  const out = makeOutput(opts.output, deps);
+
+  // An explicit but empty --dir must not silently resolve to cwd
+  // (path.resolve('') === cwd).
+  if (opts.dir !== undefined && opts.dir.trim() === '') {
+    throw localValidationError('dir', 'must not be empty');
+  }
+  const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
+  const results = await skillStates(path.resolve(dir), agentFs);
 
   out.print(results, data => {
     const items = data as StatusResult[];

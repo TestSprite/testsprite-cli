@@ -1,11 +1,8 @@
 /**
- * Types for M3.3 piece-3 — `test run` / `test wait` commands.
- * Extended by M3.4 piece-3 — `test rerun` command.
- * Extended by M3.4 piece-5 — `test result --history` command.
-
+ * Wire types for the run surfaces: `run`, `run wait`, `run cancel`,
+ * `run --testlist` and `ci run`.
  */
-
-import type { ConflictReason, RunConflict } from './conflict-reason.js';
+import type { RunConflict } from './conflict-reason.js';
 
 /** Literal body sent to `POST /api/cli/v1/tests/{testId}/runs`. */
 export interface TriggerRunBody {
@@ -24,22 +21,6 @@ export interface TriggerRunBody {
    * dropping the field.
    */
   tunnelClientId?: string;
-  /**
-   * May the agent re-author this test when its stored code no longer
-   * executes?
-   *
-   * OMITTED on purpose whenever auto-heal is on. The field is tri-state on the
-   * wire and the CLI only ever sends one of its three states: `false`, for
-   * `--no-auto-heal`. Absent means "heal, but replay a user-authored body
-   * rather than rewriting it" — the server-side default — and sending an
-   * explicit `true` would mean something DIFFERENT and worse here: an
-   * unconditional heal that re-authors code the user wrote. So the default is
-   * expressed by saying nothing, which also means an older backend (the field
-   * is stripped by `whitelist: true`, never 400'd) behaves exactly as it does
-   * today for the default case.
-   */
-  autoHeal?: false;
-
   /**
    * The NAME of the project environment whose credentials, auto-auth and OTP
    * settings this run should use (`unique(project_id, name)` server side).
@@ -64,188 +45,23 @@ export interface RunEnvironmentRef {
   name: string | null;
 }
 
-// ---------------------------------------------------------------------------
-// M3.4 — Rerun wire types
-// ---------------------------------------------------------------------------
-
-/**
- * Body sent to `POST /api/cli/v1/tests/{testId}/runs/rerun`.
- * Tunnel replay includes the saved environment URL verbatim; ordinary replay
- * uses the configured URL.
- * `source` must be "cli" (not "cli-rerun" — that is not a valid RUN_SOURCES value).
- */
-export interface RerunRequest {
-  tunnelClientId?: string;
-  targetUrl?: string;
-  source: 'cli';
-  /** Opt into AI heal-on-drift. Paid + FE only. Server tier-gates and echoes effective value. */
-  autoHeal?: boolean;
-  /** BE only: rerun only the named test without expanding the producer/teardown closure. */
-  skipDependencies?: boolean;
-  /** See `TriggerRunBody.environment` — the named environment to replay against. */
-  environment?: string;
-}
-
-/** One closure member returned in `RerunResponse.closure.members[]`. */
-export interface RerunClosureMember {
-  testId: string;
-  /** The runId minted synchronously (claimRunSlotOrThrow) for this member. Never null. */
-  runId: string;
-  /** Role of this test in the closure: 'selected' | 'producer' | 'teardown'. */
-  role: 'selected' | 'producer' | 'teardown';
-}
-
-/** Closure breakdown returned for BE reruns. */
-export interface RerunClosure {
-  members: RerunClosureMember[];
-  addedProducers: string[];
-  addedTeardowns: string[];
-  clearedCaptured: number;
-}
-
-/**
- * A machine-readable note that a requested option was forwarded to the
- * execution engine but is not yet honored there. Emitted ONLY on a
- * V3-routed rerun when the caller explicitly requested `autoHeal:false` —
- * absent otherwise, including every V2 response and every V3 response that
- * did not request an opt-out.
- */
-export interface RerunAdvisory {
-  /** Machine-readable feature name the advisory concerns (e.g. "autoHeal"). */
-  feature: string;
-  /** Human-readable explanation of the current limitation. */
-  message: string;
-}
-
-/**
- * Response from `POST /api/cli/v1/tests/{testId}/runs/rerun`.
- * FE shape: no `closure`. BE shape: includes `closure` with per-member runIds.
- * `runId` is always non-null (minted synchronously before async invoke).
- */
-export interface RerunResponse {
-  tunnelClientId?: string;
-  /** The named test's runId (minted synchronously before async Lambda invoke). */
-  runId: string;
-  status: 'queued';
-  enqueuedAt: string;
-  codeVersion: string;
-  /** Effective autoHeal value after the server tier-gate (Free → always false). */
-  autoHeal: boolean;
-  /**
-   * Present for BE reruns only. Contains per-member runIds.
-   * G1c: backend always sends this field; FE reruns send `null`.
-   * `undefined` means pre-G1c backend (treated identically to `null` —
-   * the `!!closure` truthy check in the CLI already handles both).
-   */
-  closure?: RerunClosure | null;
-  /**
-   * Present only when this rerun was routed to V3 execution AND the caller
-   * explicitly requested `autoHeal:false` (see {@link RerunAdvisory}). Absent
-   * on every other response, including older backends that predate the field.
-   */
-  advisories?: RerunAdvisory[];
-  /** See `TriggerRunResponse.dashboardUrl` — same present-or-absent contract. */
-  dashboardUrl?: string;
-  /** See `TriggerRunResponse.executionUrl` — same present-or-absent contract. */
-  executionUrl?: string;
-}
-
-/**
- * Body sent to `POST /api/cli/v1/tests/batch/rerun`.
- * Mixed FE/BE testIds allowed; BE closure deduped server-side per project.
- */
-export interface BatchRerunRequest {
-  tunnelClientId?: string;
-  targetUrl?: string;
-  source: 'cli';
-  testIds: string[];
-  autoHeal?: boolean;
-  skipDependencies?: boolean;
-  /** See `TriggerRunBody.environment` — applied to every test in the batch. */
-  environment?: string;
-}
-
-/** One accepted run in the batch rerun response. */
-export interface BatchRerunAccepted {
-  testId: string;
-  /** runId minted synchronously (claimRunSlotOrThrow). Never null. */
-  runId: string;
-  enqueuedAt: string;
-}
-
-/** One rate-deferred testId in the batch rerun response. */
-export interface BatchRerunDeferred {
-  testId: string;
-  reason: string;
-}
-
-/**
- * One testId in the batch rerun response that did not dispatch.
- *
- * `currentRunId` is present only when the refusal points at a run already in
- * flight; otherwise `reason` says why it did not start.
- */
-export interface BatchRerunConflict {
-  testId: string;
-  currentRunId?: string;
-  reason?: ConflictReason;
-  message?: string;
-}
-
-/** Per-project closure summary in the batch rerun response. */
-export interface BatchRerunClosureByProject {
-  projectId: string;
-  testIds: string[];
-  addedProducers: string[];
-  addedTeardowns: string[];
-  clearedCaptured: number;
-}
-
-export interface BatchRerunClosure {
-  byProject: BatchRerunClosureByProject[];
-}
-
-/**
- * Response from `POST /api/cli/v1/tests/batch/rerun`.
- * `accepted` carries one entry per dispatched run (incl. BE closure members), each with its runId.
- * `deferred` = rate-limited this window; retry later (C1).
- * `conflicts` = already in-flight, skipped.
- * `notFound` = ids that were unknown, cross-tenant, or never completed a clean run (D2-CLI).
- *   Present when the server supports partial-accept (SOME ids bad → 200 with accepted+notFound).
- *   When ALL ids are bad the server returns 404 (caught separately in the catch block).
- *   Optional for back-compat with older backends that don't send this field.
- * `advisories` = present only when at least one FE test in the batch was routed to V3
- *   execution AND explicitly requested `autoHeal:false` (see {@link RerunAdvisory}).
- *   Absent on every other response. The CLI aggregates + dedupes this field across
- *   chunked dispatch requests (see `dedupeRerunAdvisories` in `commands/test.ts`).
- */
-export interface BatchRerunResponse {
-  tunnelClientId?: string;
-  accepted: BatchRerunAccepted[];
-  deferred: BatchRerunDeferred[];
-  conflicts: BatchRerunConflict[];
-  closure: BatchRerunClosure;
-  notFound?: string[];
-  advisories?: RerunAdvisory[];
-}
-
 /**
  * Response from `POST /api/cli/v1/tests/{testId}/runs`.
- * All fields are stamped at trigger time and cannot change for this runId.
+ * All fields are stamped at trigger time and cannot change for this resultId.
  */
 export interface TriggerRunResponse {
   tunnelClientId?: string;
-  runId: string;
+  resultId: string;
+  /** The launch this result belongs to. Absent on an older backend. */
+  runId?: string;
   status: 'queued';
   enqueuedAt: string;
   /**
    * The EFFECTIVE heal decision the server made for this run.
    *
-   * OPTIONAL on purpose, and the absence is the load-bearing case: the backend
-   * runs `whitelist: true`, so a CLI sending `autoHeal` to a server that
-   * predates the field has it silently STRIPPED and the run heals anyway. An
-   * absent echo is how the CLI learns it is talking to such a server and that
-   * `--no-auto-heal` did nothing — without it the opt-out is unfalsifiable.
+   * OPTIONAL on purpose: a server that predates the field echoes nothing. The
+   * CLI sends no request for it (the server decides per run; code a person
+   * wrote is never re-authored), so the echo is informational.
    */
   autoHeal?: boolean;
   /** codeVersion resolved at trigger time from the test row. */
@@ -258,15 +74,13 @@ export interface TriggerRunResponse {
    */
   environment?: RunEnvironmentRef | null;
   /**
-   * Portal deep link for the run's test, built by the server for the store
-   * that dispatched it. Present-or-absent (never null): an older backend, a
-   * V3 run while the server's org-link flag is off, or one with no resolvable
-   * workspace all OMIT it, and the CLI prints nothing rather than guessing.
+   * Portal deep link for the run's test, built by the server. Present-or-absent
+   * (never null): an older backend, or a run with no resolvable workspace,
+   * OMITS it, and the CLI prints nothing rather than guessing.
    */
   dashboardUrl?: string;
   /**
-   * Portal deep link to THIS run's result page — V3-served runs only (a V2
-   * run has no execution page). Same present-or-absent contract.
+   * Portal deep link to THIS run's result page. Same present-or-absent contract.
    */
   executionUrl?: string;
   /**
@@ -284,8 +98,8 @@ export interface TriggerRunResponse {
 export type RunStatus = 'queued' | 'running' | 'passed' | 'failed' | 'blocked' | 'cancelled';
 
 /**
- * Lightweight step summary returned inside `GET /api/cli/v1/runs/{runId}`.
- * Full step records arrive via `/runs/{runId}/failure`.
+ * Lightweight step summary returned inside `GET /api/cli/v1/runs/{resultId}`.
+ * Full step records come from `GET /api/cli/v1/results/{resultId}` (`result get`).
  */
 export interface RunStepSummary {
   total: number;
@@ -295,30 +109,12 @@ export interface RunStepSummary {
 }
 
 /**
- * One step row returned when `GET /api/cli/v1/runs/{runId}?includeSteps=true`.
- * Mirrors the backend's `RunStepDto` / `TestRunStepEntity` public fields.
- *
- * Note: `stepIndex` is a zero-padded string on the wire (SK of `TestRunStep`);
- * parse with `parseInt` when a numeric index is needed. `createdAt` is the
- * timestamp the step was recorded (no separate `updatedAt` for run-scoped steps).
- */
-export interface RunStepDto {
-  stepIndex: string;
-  type: 'action' | 'assertion';
-  action: string;
-  status: 'passed' | 'failed' | null;
-  description: string | null;
-  error: string | null;
-  screenshotUrl: string | null;
-  htmlSnapshotUrl: string | null;
-  createdAt: string;
-}
-
-/**
- * Response from `GET /api/cli/v1/runs/{runId}`.
+ * Response from `GET /api/cli/v1/runs/{resultId}`.
  */
 export interface RunResponse {
-  runId: string;
+  resultId: string;
+  /** The launch this result belongs to. Absent on an older backend. */
+  runId?: string;
   testId: string;
   /**
    * The test's human title, for CI output. `null`/absent on older servers or
@@ -346,8 +142,8 @@ export interface RunResponse {
    */
   targetUrl: string | null;
   /**
-   * The environment this run resolved to. Absent on an older backend (or a
-   * V2-served run); `null` when the row names no environment.
+   * The environment this run resolved to. Absent on an older backend; `null`
+   * when the row names no environment.
    */
   environment?: RunEnvironmentRef | null;
   createdFrom: string | null;
@@ -366,46 +162,30 @@ export interface RunResponse {
   /** Optional hint from the server; honored by the polling loop. */
   retryAfterSeconds?: number;
   /**
-   * Portal deep link for this run's test.
-   *
-   * **Server-provided when present, client-synthesized otherwise.** Newer
-   * backends send this field on `GET /runs/{runId}` because only the server
-   * knows which store answered the read (a V3-served run's page is a different
-   * route family, and the V2 route it replaces cannot render for a V3-native
-   * project) and only the server can resolve the portal origin outside prod.
+   * Portal deep link for this run's test. **Server-built only**: the server
+   * alone knows the workspace that owns the project and the portal origin
+   * outside prod, so the CLI never builds one itself.
    *
    * A server `null` means "no correct link exists for this run" — the CLI
-   * treats it as absent for rendering and does NOT substitute its own guess.
-   * A missing field (older backend) reopens the client path: `resolvePortalUrl`
-   * from projectId+testId when the endpoint maps to a known portal host. See
+   * treats it like an absent field and prints nothing. See
    * `withRunDashboardUrl` in `commands/test.ts`.
    */
   dashboardUrl?: string | null;
   /**
-   * Portal deep link to THIS RUN's result page (`…/projects/{pid}/execution/{eid}`),
-   * the run-scoped companion to `dashboardUrl` (which opens the test case). Same
-   * server-built / omit-not-null contract as `dashboardUrl`: **V3-served runs
-   * only** — a V2 run has no execution page, so the field is absent there and the
-   * CLI keeps `dashboardUrl` (the test-case link) for the run cell.
+   * Portal deep link to this result's own page, the companion to
+   * `dashboardUrl` (which opens the test case). Same server-built /
+   * omit-not-null contract as `dashboardUrl`; when it is absent the job
+   * summary's Result cell shows the bare result id, and an annotation links
+   * the test case instead.
    */
   executionUrl?: string | null;
-  /**
-   * Full ordered step list. Only present when the request includes
-   * `?includeSteps=true`. Absent (undefined) when the flag was not sent.
-   * Null means the server returned the field explicitly as null (treated
-   * the same as absent for rendering purposes).
-   *
-   * Per M3.4 piece-4: default (absent/false) is byte-identical to the M3.3
-   * summary shape — the cheap `test wait` polling path is unaffected.
-   */
-  steps?: RunStepDto[] | null;
 }
 
 // ---------------------------------------------------------------------------
 // Cancel wire types
 // ---------------------------------------------------------------------------
 
-/** Credit outcome returned when cancellation applies V3 frontend billing rules. */
+/** Credit outcome returned when cancellation applies frontend billing rules. */
 export interface CancelRunRefund {
   status: 'refunded' | 'not_charged' | 'failed';
   /** Original charged amount returned to the workspace. Present when refunded. */
@@ -413,18 +193,27 @@ export interface CancelRunRefund {
 }
 
 /**
- * Response from `POST /api/cli/v1/runs/{runId}/cancel`.
- * Same shape as `GET /runs/{runId}` (`status: "cancelled"`, verdict
+ * Response from `POST /api/cli/v1/runs/{resultId}/cancel`.
+ * Same shape as `GET /runs/{resultId}` (`status: "cancelled"`, verdict
  * untouched) plus `alreadyCancelled` distinguishing a fresh cancel
  * (naturally idempotent) from a no-op re-cancel.
  */
-export interface CancelRunResponse extends RunResponse {
+export interface CancelRunResult {
+  resultId: string;
+  runId: string | null;
+  testId: string | null;
+  title: string;
+  status: RunStatus;
   alreadyCancelled: boolean;
-  /**
-   * Present only when the server evaluated a V3 frontend run refund. Older
-   * backends, V2 runs, and backend-test runs omit it.
-   */
+  alreadyFinished: boolean;
   refund?: CancelRunRefund;
+}
+
+export interface CancelRunResponse {
+  runId: string;
+  alreadyCancelled: boolean;
+  alreadyFinished: boolean;
+  results: CancelRunResult[];
 }
 
 /** Terminal states from the RunStatus union. */
@@ -437,119 +226,6 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set([
 
 export function isTerminalStatus(status: RunStatus): boolean {
   return TERMINAL_RUN_STATUSES.has(status);
-}
-
-// ---------------------------------------------------------------------------
-// M3.4 piece-5 — run-history wire types
-// ---------------------------------------------------------------------------
-
-/**
- * Valid trigger source values for filtering run history.
- * "cli-rerun" is NOT a valid source — reruns have source="cli" and
- * createdFrom starting with "rerun:" (surfaced as `isRerun: true`).
- */
-export type RunSource = 'cli' | 'portal' | 'mcp' | 'schedule' | 'github_action';
-
-/** The valid RUN_SOURCES values as an array for CLI flag validation. */
-export const RUN_SOURCES: ReadonlyArray<RunSource> = [
-  'cli',
-  'portal',
-  'mcp',
-  'schedule',
-  'github_action',
-];
-
-/**
- * One row in a `GET /api/cli/v1/tests/{testId}/runs` response.
- *
- * `isRerun` is a derived field: `createdFrom?.startsWith('rerun:')` on the
- * backend. Reruns always have `source: 'cli'`; the `isRerun` flag + the
- * `createdFrom` lineage string together identify them.
- */
-export interface RunHistoryItem {
-  runId: string;
-  status: RunStatus;
-  source: RunSource;
-  /** Derived by backend: true when `createdFrom` starts with "rerun:". */
-  isRerun: boolean;
-  /** Lineage pointer; `null` for fresh runs. For reruns: `"rerun:<priorRunId>"`. */
-  createdFrom: string | null;
-  createdAt: string;
-  /** May be null — backend doesn't always stamp it. */
-  startedAt: string | null;
-  finishedAt: string | null;
-  /** May be null — not stamped on pre-M3.2 rows or on tests with no code body. */
-  codeVersion: string | null;
-  /** Null when the run passed. */
-  failureKind: string | null;
-  /**
-   * G1b — the resolved target URL for this specific run. `null` when the
-   * backend could not determine the URL (pre-G1b rows, or `targetUrlSource`
-   * is `'unresolved'`). Optional on the wire for back-compat with older
-   * backends that don't ship the field.
-   */
-  targetUrl?: string | null;
-  /**
-   * G1b — provenance of `targetUrl`.
-   * - `'run'`: stamped at run-trigger time (authoritative; V2).
-   * - `'unresolved'`: backend could not resolve a URL for this run.
-   * - `null`: a V3 run — the environment in `environment` IS the target and
-   *   `targetUrl` is its address, so there is no separate provenance.
-   * - absent: pre-G1b backend; treat as unknown.
-   */
-  targetUrlSource?: 'run' | 'unresolved' | null;
-  /** The environment this run resolved to. Absent on older backends. */
-  environment?: RunEnvironmentRef | null;
-}
-
-/**
- * Pre-cutover metadata block present when the test has no CLI-tracked
- * history (created before 2026-05-14).
- */
-export interface RunHistoryMeta {
-  testKind?: 'frontend' | 'backend';
-  /**
-   * ISO date the history window starts at.
-   * Present on pre-cutover responses (when `runs` is empty because no
-   * TestRun rows exist for this test).
-   */
-  historyStartsAt?: string;
-  /**
-   * Human-readable note from the backend.
-   * Rendered in CLI text mode instead of a blank table for pre-cutover tests.
-   */
-  note?: string;
-  /** Portal URL where older run history can be viewed. */
-  portalUrl?: string;
-  /** Plan-limited history details; absent on older backends and V2. */
-  tier?: string;
-  retentionDays?: number | null;
-  hiddenCount?: number;
-  billingUrl?: string;
-}
-
-/**
- * Response from `GET /api/cli/v1/tests/{testId}/runs`.
- *
- * Pre-cutover shape: `runs: []`, `nextCursor: null`, `meta` has
- * `historyStartsAt` + `note` + `portalUrl`.
- */
-export interface ListRunsResponse {
-  runs: RunHistoryItem[];
-  /** Opaque cursor for the next page; `null` when no more pages. */
-  nextCursor: string | null;
-  meta: RunHistoryMeta;
-}
-
-/** Query parameters for `GET /api/cli/v1/tests/{testId}/runs`. */
-export interface ListRunsQuery {
-  cursor?: string;
-  pageSize?: number;
-  source?: RunSource;
-  /** ISO timestamp (after client-side duration parsing). */
-  since?: string;
-  /** Only runs whose credentials came from this environment (by name). */
-  environment?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -578,14 +254,20 @@ export interface BatchRunFreshRequest {
   projectId: string;
   testIds?: string[];
   source: 'cli';
-  /** See `TriggerRunBody.autoHeal`, including why `true` is never sent. */
-  autoHeal?: false;
   /** See `TriggerRunBody.environment` — applied to every test in the batch. */
   environment?: string;
   /** See `TriggerRunBody.skipDependencies` — applies to every BE test in the batch. */
   skipDependencies?: boolean;
   /** Per-run URL override for the batch; echoed when the backend honors it. */
   targetUrl?: string;
+  /** See `TriggerRunBody.tunnelClientId`; carries every test of the request. Echoed when used. */
+  tunnelClientId?: string;
+  /**
+   * The most frontend tests of each run this request starts that execute at
+   * once (the server also caps a tunnelled run). Echoed with the cap it
+   * applied when a frontend run was started.
+   */
+  maxConcurrency?: number;
   /**
    * `'all'`: the server seeds every selected case into one execution and
    * paces dispatch itself (as for a GitHub App run) instead of cutting the
@@ -598,47 +280,70 @@ export interface BatchRunFreshRequest {
   githubTrigger?: CiGithubTrigger;
 }
 
+/** Strict body of POST /projects/:projectId/runs. Pacing belongs to the server. */
+export interface ProjectRunRequest {
+  testIds?: string[];
+  environment?: string;
+  targetUrl?: string;
+  tunnelClientId?: string;
+  skipDependencies?: boolean;
+  maxConcurrency?: number;
+  admission?: 'all';
+  previewName?: string;
+  githubTrigger?: CiGithubTrigger;
+}
+
+/** One project launch. Result identities are read from GET /results?run=. */
+export interface ProjectRunResponse {
+  runId: string;
+  projectId: string;
+  enqueuedAt: string;
+  total: number;
+  autoHeal: boolean;
+  maxConcurrency?: number;
+  environment: RunEnvironmentRef | null;
+  targetUrl: string | null;
+  tunnelClientId?: string;
+  dashboardUrl?: string;
+  blocked: Array<{ testId: string; resultId: string; reason: string; message?: string }>;
+  held: Array<{ testId: string; runId: string; resultId: string }>;
+}
+
 /** One accepted run in the batch fresh-run response. */
 export interface BatchRunFreshAccepted {
   /**
-   * The `test_execution.id` this run was dispatched under (V3-served runs
-   * only; absent on a V2 backend). One execution usually covers the whole
-   * batch — `ci run` de-duplicates it to read the execution report.
+   * The `test_execution.id` this run was dispatched under (absent on an
+   * older backend). One execution usually covers the whole batch — `ci run`
+   * de-duplicates it to read the execution report.
    */
-  executionId?: string;
+  runId?: string;
   testId: string;
   /**
-   * runId minted synchronously by `claimRunSlotOrThrow`. The backend partitions
+   * resultId minted synchronously by `claimRunSlotOrThrow`. The backend partitions
    * any member whose slot-claim failed into `conflicts[]`, so every entry that
-   * lands in `accepted[]` always carries a real runId (never undefined). The CLI
+   * lands in `accepted[]` always carries a real resultId (never undefined). The CLI
    * polls each one under `--wait`.
    */
-  runId: string;
+  resultId: string;
   enqueuedAt: string;
-  /**
-   * CLIENT-synthesized Portal deep link — never sent by the server. Added by
-   * `test run --all` (projectId from the request, testId per item) when the
-   * API endpoint maps to a known portal host.
-   */
-  dashboardUrl?: string;
 }
 
 /**
  * Response from `POST /api/cli/v1/tests/batch/run`.
- * `accepted` carries per-test runIds. `conflicts`/`deferred`/`skippedFrontend`/
- * `skippedIntegration` enumerate everything NOT dispatched, so a JSON consumer
- * reading `accepted` alone can never silently undercount.
- *   - `conflicts`        — BE test already executing (slot-claim conflict)
+ * `accepted` carries per-test runIds. `conflicts`/`deferred` enumerate
+ * everything NOT dispatched, so a JSON consumer reading `accepted` alone can
+ * never silently undercount.
+ *   - `conflicts`        — test already executing (slot-claim conflict)
  *   - `deferred`         — per-key run budget exhausted this window; retry later
- *   - `skippedFrontend`  — FE tests in the set (BE-only wave engine)
- *   - `skippedIntegration` — assembled integration tests (run via the portal)
+ *   - `skippedFrontend` / `skippedIntegration` — always empty (every case
+ *     runs); kept on the wire, and in the CLI's JSON, for older consumers.
  */
 export interface BatchRunFreshResponse {
   accepted: BatchRunFreshAccepted[];
   /** See `TriggerRunResponse.autoHeal`; absence means the same thing. */
   autoHeal?: boolean;
   /**
-   * A run-slot conflict. `currentRunId`, when present, is the id of the run
+   * A run-slot conflict. `currentResultId`, when present, is the id of the run
    * ALREADY in flight for this test — under `--wait` the CLI polls it to a
    * verdict (auto-resume) instead of failing the batch. Absent ⇒ a hard
    * conflict with no resolvable in-flight run (still fails the batch).
@@ -655,13 +360,10 @@ export interface BatchRunFreshResponse {
    */
   integration?: { existing: number; runsAfterWave: boolean; mayGenerate: boolean };
   /**
-   * Project-level portal link the batch closes with ("watch it here"). Same
-   * absent-vs-present contract as the per-run `dashboardUrl`: ABSENT ⇒ an older
-   * backend (or the V2 engine, whose live page is the CLI's own
-   * `/dashboard/tests/{projectId}` template) — compute the legacy link
-   * client-side; a string ⇒ print it verbatim; `null` ⇒ the server knows no
-   * correct page exists (several sibling projects, no owning org) — print
-   * nothing rather than a dead link.
+   * Project-level portal link the batch closes with ("watch it here"),
+   * server-built: a string ⇒ print it verbatim; `null` or absent ⇒ no correct
+   * page exists (several sibling projects, no owning org, or an older
+   * backend) — print nothing rather than a dead link.
    */
   dashboardUrl?: string | null;
   /**
@@ -675,9 +377,17 @@ export interface BatchRunFreshResponse {
   previewName?: string;
   /** See `TriggerRunResponse.skipDependencies`; same present-or-omitted contract. */
   skipDependencies?: boolean;
+  /** The request's tunnel, echoed once a test was started through it. */
+  tunnelClientId?: string;
+  /**
+   * The cap the server applied to each run it started (the highest when the
+   * request spans projects), echoed when the request sent `maxConcurrency`
+   * and a frontend run was started.
+   */
+  maxConcurrency?: number;
 }
 
-// ─── Execution report (GET /tests/executions/{executionId}/report) ───────────
+// ─── Execution report (GET /tests/executions/{runId}/report) ───────────
 
 /** One row of an execution report — one `test_result` of that execution. */
 export interface ExecutionReportTest {
@@ -703,7 +413,7 @@ export interface ExecutionReportTest {
  */
 export interface ExecutionReport {
   projectId: string;
-  executionId: string;
+  runId: string;
   projectName: string;
   orgId: string | null;
   stats: { passed: number; failed: number; blocked: number; total: number };

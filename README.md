@@ -44,7 +44,7 @@ AI ships code in minutes — verifying it hasn't. `testsprite` opens your live a
 
 [TestSprite](https://www.testsprite.com) is the AI testing platform 100,000+ teams use to test their software, frontend and backend — in the cloud, against the live product, not mocks. This repo is its official CLI.
 
-It puts that platform in your coding agent's hands: the agent verifies every behavior it ships, and what broke comes back as **one self-consistent bundle** it can act on — no dashboard scraping. Humans drive the same surface from a terminal or CI.
+It puts that platform in your coding agent's hands: the agent verifies every behavior it ships, and what broke comes back as **one result** — the failed step, its cause and a fix — it can act on, with no dashboard scraping. Humans drive the same surface from a terminal or CI.
 
 ## ⭐️ Star the Repository
 
@@ -54,189 +54,91 @@ If you find `testsprite` useful, a GitHub Star ⭐️ would be greatly appreciat
 
 ## Quickstart
 
-Requires **Node.js 20.19+**, **22.13+**, or **24+**. (No global install? `npx @testsprite/testsprite-cli` works too.)
+You need Node.js 20.19+ on the 20.x line, 22.13+ on 22.x, or 24 or later. [Using 0.16? Read its command reference.](https://github.com/TestSprite/testsprite-cli/blob/v0.16.0/DOCUMENTATION.md)
+
+From your app's repository, install the CLI and run setup. It prompts for your [workspace API key](https://www.testsprite.com/dashboard-v3/settings/apikey) and installs the skills for the coding agents it detects.
 
 ```bash
 npm install -g @testsprite/testsprite-cli
+testsprite --version
 testsprite setup
+testsprite auth status
 ```
 
-`testsprite setup` prompts for your [API key](https://www.testsprite.com/dashboard/settings/apikey), verifies it, and installs the verification-loop skill for the coding agents this project uses — one command, so your agent is wired to verify its own work.
-
-**Which agent it installs for.** Each of the eight supported targets — `claude`, `cursor`, `cline`, `windsurf`, `antigravity`, `kiro`, `copilot`, `codex` — lands its skill in a different place, so `setup` works out which you use: the agent calling it, if it identifies itself, together with every agent whose config is already in the project. It installs for all of them and prints what it found — in a terminal it shows you that list first, so you can accept it or narrow it before anything is written. If nothing identifies an agent, it installs for `claude` and says so — that is the one case where you want `--agent <target>` to name one yourself. Check the result any time with `testsprite agent status`.
-
-Non-interactive (CI / onboarding scripts):
+**Choose your project and target.** Run `testsprite project list` to find an existing project. For a new frontend project, create it and add the URL where your app is running. Replace the URL below with yours and set `PROJECT_ID` to the ID printed by `project create`.
 
 ```bash
-TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes
+testsprite project create --type frontend --name "Checkout"
+PROJECT_ID=your-project-id
+testsprite project env create "$PROJECT_ID" --name staging --url https://staging.example.com
 ```
 
-> **Pointing a coding agent (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). `setup` reports which agents it installed for; add `--agent <target>` if that list is not the one you wanted. New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
-
-> **Privacy note:** interactive runs check the npm registry at most once per 24 h to offer a "new version available" notice — package name only, never your key or data; `TESTSPRITE_NO_UPDATE_NOTIFIER=1` disables it. The backend also advertises its minimum supported CLI version — a below-floor CLI prints a one-line upgrade advisory on stderr, and a too-old client may be rejected with exit 14 (`CLIENT_TOO_OLD`). Details in [DOCUMENTATION.md → Update notice](./DOCUMENTATION.md#update-notice).
-
-From there, the loop runs on its own — an example session, typed by the coding agent:
+**Get your first test.** Ask the project's agent to propose coverage. If it asks a question in a text message, answer with `testsprite reply "your answer"`. Review the proposed steps in the terminal and apply the plan when they match what you want to verify. For a backend project, attach the API specification with `--file ./openapi.yaml`.
 
 ```bash
-# 1 — describe the behavior you want to guarantee, run it, wait
-# Set projectId in checkout-flow.plan.json to your project ID.
-testsprite test create --plan-from ./checkout-flow.plan.json \
-  --run --wait --output json
-#   → exits 1: the run failed
-
-# 2 — pull ONE self-consistent failure bundle
-testsprite test failure get test_3a9f21c7 --out ./.testsprite/failure
-
-# 3 — the agent reads the bundle, fixes the code, then replays
-testsprite test run test_3a9f21c7 --wait --output json
-#   → exits 0: passed. The test now lives in your durable suite.
+testsprite plan "Verify that a guest can place an order with a test card" --project "$PROJECT_ID" --steps
 ```
-
-`./checkout-flow.plan.json` (the `--plan-from` argument above) is a JSON file describing the test in plain language — no browser code required. This is the exact, byte-identical output of `testsprite test create --plan-template` (also embedded verbatim in `test create --help`):
-
-```json
-{
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.4.0/schemas/plan.schema.json",
-  "projectId": "prj_abc123",
-  "type": "frontend",
-  "name": "Login rejects an empty password",
-  "planSteps": [
-    {
-      "type": "action",
-      "description": "Navigate to /login and submit the form with an empty password"
-    },
-    {
-      "type": "assertion",
-      "description": "Verify an inline error says the password is required"
-    }
-  ]
-}
-```
-
-Get this exact skeleton without hand-copying it (and without the risk of it drifting from your installed version — see below): `testsprite test create --plan-template`. Full field reference (including the `{{...}}`-placeholder caveat, size caps, and the `$schema` hook for live editor validation): [Plan file format](./DOCUMENTATION.md#plan-file-format).
-
-> The `$schema` URL above is pinned to the CLI version that generated this doc (`v0.4.0`) — `--plan-template`'s live output always pins to **your installed version** instead, which is what actually resolves. If you're reading this on a later release, run the command yourself rather than trusting this snippet verbatim.
-
-**Don't want to write the first tests yourself?** For a deployed target, ask TestSprite to propose them. Local projects use the authored-plan flow below. `testsprite test plan generate --project <id>` explores your app (or reads the API spec you uploaded with `project docs upload`), drafts test cases, and stages them for review — nothing is written to your disk. You read the printed table and keep what you want:
 
 ```bash
-testsprite test plan generate --project proj_8f0f6           # stages proposals for review
-testsprite test plan accept --project proj_8f0f6             # → real tests
-testsprite test plan accept --project proj_8f0f6 --only prop_2 prop_5   # or just these
+testsprite apply
+testsprite test list --project "$PROJECT_ID"
 ```
 
-It only runs what the project is still missing, so a second call picks up where the first left off. Generation spends workspace credits per stage that actually runs (the result line reports the spend), and a PRD uploaded with `project docs upload --role prd` bills 0.5 credits for its embedding — an API spec is free. Full walkthrough, including what happens on Ctrl-C and every precondition error: [Generate commands](./DOCUMENTATION.md#generate-commands).
+**Run and inspect.** A project run waits for the suite when you pass `--wait`. Exit 0 means it passed. On exit 1, look for a failed or blocked row in `results[]` and copy its `resultId` to inspect the error and available evidence. If no row failed, check `runFailures` for an execution-level error such as cancellation. Without `--output json`, each run also prints a `Dashboard:` link that opens it in the Portal.
 
-Prefer to configure each step by hand (or learn the surface offline with `--dry-run` first)? See [Manual setup](./DOCUMENTATION.md#manual-setup) and [Install & verify](./DOCUMENTATION.md#install--verify).
+```bash
+testsprite run --project "$PROJECT_ID" --wait --output json
+```
+
+```bash
+RESULT_ID=your-result-id
+testsprite result get "$RESULT_ID" --out ".testsprite/results/$RESULT_ID"
+```
+
+After deploying a fix, run the affected test again with `testsprite run "$TEST_ID" --wait`, using its ID from `test list`. To resume waiting for a run you already started, use its **run ID** with `testsprite run wait "$RUN_ID"`. The [scripting example](./DOCUMENTATION.md#output--scripting) shows how to extract both IDs and preserve the verdict in CI.
 
 ## Testing an environment on your machine
 
-Frontend tests can reach your running app through a TestSprite tunnel, including on the Free plan (ordinary run credits apply).
-Use an API key with `run:tunnel`; the CLI names the missing scope if the key cannot open a tunnel. Existing keys receive this scope on backend v0.18.0 or later unless deliberately narrowed.
+Start your frontend app on port 3000. To run the project's saved tests against the app on this machine, supply the port. The CLI opens a tunnel and waits for the cloud runner.
 
 ```bash
-testsprite project create --type frontend --name "My local app" --local 3000
-# Set projectId in checkout.plan.json to the project ID returned above.
-testsprite test create --plan-from ./checkout.plan.json
-testsprite test run <test-id>  # the saved loopback URL opens a tunnel and waits
-testsprite test run <id> <id> --max-concurrency 5
-testsprite test run --all --project <project-id>
-# Or keep one tunnel open in terminal A (no port argument)
-testsprite tunnel start --ttl 3600
-# Terminal B: borrow the clientId printed above; keep terminal A running
-testsprite test run <test-id> --tunnel-client <client-uuid>
-testsprite tunnel list
-testsprite tunnel stop <client-uuid>
-# Stop every live tunnel on this account only when you intend to revoke them all
-testsprite tunnel stop --all --confirm
+testsprite run --project "$PROJECT_ID" --local 3000
 ```
 
-Run several local frontend tests in one invocation to share one tunnel binding. The batch runs up to 5 tests at once by default; `--max-concurrency` accepts 1–10. `--all --local` skips backend tests. An owned batch cancels unfinished runs on Ctrl-C or tunnel loss; JSON output lists every requested test in input order, including tests that did not start. The minted client id is printed before the tunnel connects.
-Hit the tunnel limit? Run `testsprite tunnel list`, then `testsprite tunnel stop <client-uuid>` for an unused binding, or `testsprite tunnel stop --all --confirm` to revoke them all. An older server without listing returns exit 4; a key without `run:tunnel` returns exit 3.
-A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
-An environment is one origin (scheme, host and port) plus its sign-in configuration. Frontend runs automatically open a tunnel for a saved `localhost`, `127.0.0.1` or `[::1]` URL: `test run`, `test create --run`, `test create-batch --run` and `testlist run` use this behavior. `--env <name>` selects the environment; omit it for the project default. `--no-wait` disables automatic tunnels; drop it to run through one. If environment reads are unavailable, the command keeps the previous server behavior. Several fresh-run IDs require a tunnel; public targets retain the exit-5 refusal. A named public environment used against a local origin prints a sign-in advisory on stderr. Test-list runs share one timeout including capacity waits and require the server to confirm tunnel support; an older server triggers a cancellation attempt and a clear error.
-
-`--local <port>` saves new project and environment URLs as `http://localhost:<port>`. Use `--url http://127.0.0.1:<port>` or `--url http://[::1]:<port>` when the host matters (`--local-host` is deprecated). Dev servers can be slow through a tunnel, so for heavy apps test a production build (`npm run build` plus your framework's preview or start command).
-
-The tunnel uses verified TLS. On a network that re-signs TLS, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` to your organisation's root CA. If the tunnel keeps failing to connect for 60 seconds, the command exits **10**, and an owned run is cancelled and refunded.
-
-On an owned tunnel, Ctrl-C or a timeout cancels unfinished runs by default, and a run cancelled before it finishes is refunded. A run on a borrowed `--tunnel-client` detaches on Ctrl-C instead. Local projects skip plan generation, so write plans with `test create --plan-from`. Portal runs stay blocked, at no charge, until the project has a public URL. See [the local-testing reference](./DOCUMENTATION.md#local-frontend-testing-and-tunnels) for the details.
+For a local-only project, you can save the port as its first environment with `testsprite project env create "$PROJECT_ID" --name local --local 3000`. Give the project's agent a Git diff or a spec so it can propose tests without browsing localhost. Review and apply the test plan, then run with `--env local`. An ordinary Ctrl-C detaches a public run. With a tunnel this command opened, Ctrl-C cancels unfinished work by default and closes the tunnel. [Local frontend testing and tunnels](./DOCUMENTATION.md#local-frontend-testing-and-tunnels)
 
 ## Commands
 
-| Group          | Command                                                                     | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| -------------- | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Setup**      | `setup`                                                                     | **Start here** — one command: configure your API key, verify it, and install the agent verification skill                                                                                                                                                                                                                                                                                                                                     |
-|                | `doctor`                                                                    | Environment diagnostic — CLI/Node versions, profile, endpoint, credentials, connectivity, agent skill; exits non-zero on failure                                                                                                                                                                                                                                                                                                              |
-|                | `completion`                                                                | Print a shell completion script (bash, zsh, fish)                                                                                                                                                                                                                                                                                                                                                                                             |
-| **Auth**       | `auth status`                                                               | Resolve the active profile to its user, key, env, and scopes                                                                                                                                                                                                                                                                                                                                                                                  |
-|                | `auth remove`                                                               | Remove the active profile from the credentials file                                                                                                                                                                                                                                                                                                                                                                                           |
-|                | `usage` (alias `credits`)                                                   | Account pre-flight: identity, plus credit balance / plan info when the backend supplies them                                                                                                                                                                                                                                                                                                                                                  |
-| **Read**       | `project list` / `project get`                                              | List projects / fetch one by id, including the default environment and environment count when the server reports them                                                                                                                                                                                                                                                                                                                         |
-|                | `test list` / `test get`                                                    | List tests under a project / fetch one by id; `test list --env <name>` selects frontend status and the ENV column names its source                                                                                                                                                                                                                                                                                                            |
-|                | `test code get`                                                             | Print (or write) the generated test source                                                                                                                                                                                                                                                                                                                                                                                                    |
-|                | `test steps`                                                                | List the latest run's steps with screenshot / DOM pointers                                                                                                                                                                                                                                                                                                                                                                                    |
-|                | `test result`                                                               | Latest result; `--history` lists a test's prior runs (ENV column; `--env <name>` filters by environment)                                                                                                                                                                                                                                                                                                                                      |
-|                | `test failure get`                                                          | The agent entry point: one self-contained latest-failure bundle                                                                                                                                                                                                                                                                                                                                                                               |
-|                | `test failure summary`                                                      | One-screen triage card (no media download)                                                                                                                                                                                                                                                                                                                                                                                                    |
-|                | `test diff`                                                                 | Compare two runs — verdict, failure kind, per-step status flips, code-version drift                                                                                                                                                                                                                                                                                                                                                           |
-|                | `test open`                                                                 | Open a test in the dashboard (`--no-browser` prints the URL only)                                                                                                                                                                                                                                                                                                                                                                             |
-| **Write**      | `test scaffold` / `test lint`                                               | Author plans locally: emit a schema-correct starter, validate plan files offline — no network, no credentials                                                                                                                                                                                                                                                                                                                                 |
-|                | `test create` / `test create-batch`                                         | Create a test (or bulk-create from a plan file); `--step-timeout <ms>` sets a per-test timeout; dependency flags wire BE metadata                                                                                                                                                                                                                                                                                                             |
-|                | `test update` / `test delete` / `test delete-batch`                         | Edit metadata, set/clear the step timeout (`--step-timeout` / `--clear-step-timeout`), or permanently delete (`--confirm` required)                                                                                                                                                                                                                                                                                                           |
-|                | `test code put`                                                             | Replace generated code (etag-guarded)                                                                                                                                                                                                                                                                                                                                                                                                         |
-|                | `test plan put`                                                             | Replace a frontend test's plan-steps                                                                                                                                                                                                                                                                                                                                                                                                          |
-|                | `project create` / `project update` / `project delete`                      | Manage projects; `--test-id-attributes <list>` registers the app's own test-hook attributes (priority order) for exported locators, `--clear-test-id-attributes` reverts; `delete` removes a project and everything under it (`--confirm` required, no restore window)                                                                                                                                                                        |
-|                | `project credential` / `project auto-auth`                                  | Configure backend-test auth: a static injected credential, or auto-refresh login (Pro)                                                                                                                                                                                                                                                                                                                                                        |
-|                | `project env list` / `get` / `create` / `update` / `delete` / `set-default` | Manage a project's named URL + login bundles. `get` shows safe login details and variables; `create` / `update` accept repeatable `--var KEY=VALUE` (plain text — not for secrets, use `--username`/`--password`), and `update --clear-credentials` disables account login. Use `--url http://localhost:<port>` or `--local <port>` for an app on this machine; runs open its tunnel automatically. `delete` refuses the default environment. |
-|                | `project sign-in get` / `set`                                               | Inspect or change an environment's app sign-in mode; choose OTP with `project env create --sign-in otp`. SSO selection requires the per-account manual-login feature flag; capture the session in the Portal.                                                                                                                                                                                                                                 |
-| **Generate**   | `test plan generate`                                                        | Ask TestSprite to propose test cases for a project — proposals are staged server-side for review, never written to disk; only the stages the project is missing actually run                                                                                                                                                                                                                                                                  |
-|                | `test plan accept`                                                          | Turn staged proposals into real tests — all of them, or a subset with `--only`                                                                                                                                                                                                                                                                                                                                                                |
-|                | `project docs upload`                                                       | Upload an API spec or PRD as a project source, so generation has something to read                                                                                                                                                                                                                                                                                                                                                            |
-| **Run**        | `test run`                                                                  | Trigger a fresh run; saved loopback environments open a tunnel and wait automatically; `--wait` blocks until terminal; several ids or `--all --project <id>` run a batch in wave order (`--status`/`--filter` narrow `--all`; `--skip-dependencies` for backend); `--env <name>` runs against a named environment.                                                                                                                            |
-|                | `test rerun`                                                                | **Deprecated** — use `test run` (same flags; several ids and `--all --status` are supported there). Removed in 0.17.0.                                                                                                                                                                                                                                                                                                                        |
-|                | `test flaky`                                                                | **Deprecated** — no replacement; run `test run <id>` again to sample a test. Removed in 0.17.0.                                                                                                                                                                                                                                                                                                                                               |
-|                | `test wait`                                                                 | Block on one or more `runId`s until terminal                                                                                                                                                                                                                                                                                                                                                                                                  |
-|                | `test cancel`                                                               | Cancel one or more in-flight runs (Ctrl-C during `--wait` only detaches, `cancel` is the real stop — except a run with an owned tunnel, which Ctrl-C cancels by default)                                                                                                                                                                                                                                                                      |
-|                | `test artifact get`                                                         | Download the failure bundle for a specific `runId`                                                                                                                                                                                                                                                                                                                                                                                            |
-| **Test lists** | `testlist list` / `testlist get`                                            | Inspect saved test lists — named, cross-project collections with per-project environment pins (V3-only)                                                                                                                                                                                                                                                                                                                                       |
-|                | `testlist create` / `update` / `add` / `remove` / `delete`                  | Manage a list and its cases; `--project-env <id>:<env>` pins environments; `delete` requires `--confirm`                                                                                                                                                                                                                                                                                                                                      |
-|                | `testlist run`                                                              | Run every case (or a `--case` subset) through its pinned environment; loopback environments open a tunnel automatically; `--wait` polls all runs, `--report junit` writes a CI sidecar                                                                                                                                                                                                                                                        |
-| **Schedule**   | `schedule list` / `schedule get`                                            | List schedules visible to the key / fetch one by id, including a project schedule's pinned or inherited environment (status is `ENABLED`, `PAUSED`, or `AUTO_PAUSED` after repeated failures)                                                                                                                                                                                                                                                 |
-|                | `schedule create`                                                           | Run a project or test list on a 5-field cron; `--env <name>` pins a project schedule, while omission inherits the live default; states frequency and estimated cost                                                                                                                                                                                                                                                                           |
-|                | `schedule update`                                                           | Retime or rename a schedule, change recipients, pin a project schedule with `--env <name>`, or `--pause` / `--resume` it                                                                                                                                                                                                                                                                                                                      |
-|                | `schedule delete`                                                           | Remove a schedule and its run history, stopping future triggers (`--confirm` required, no restore window)                                                                                                                                                                                                                                                                                                                                     |
-|                | `schedule run list`                                                         | A schedule's past runs, with per-run pass / fail / blocked counts                                                                                                                                                                                                                                                                                                                                                                             |
-| **CI**         | `ci init github`                                                            | Write a GitHub Actions PR gate that runs `ci run` against each pull request's preview deployment — one placeholder step to fill in: your platform deploys every PR (`on: deployment_status`) or the workflow deploys                                                                                                                                                                                                                          |
-|                | `ci run`                                                                    | The CI gate in one command: every project test (or `--filter`) against `--target-url`, signed in as `--env`, in a temporary `github-pr-<N>` environment, one execution; waits and exits with the verdict. Job summary = the execution report (the GitHub App comment); `--summary-file`, `--report junit`, step outputs                                                                                                                       |
-| **Agent**      | `agent install` / `agent list` / `agent status`                             | Add, list, or health-check coding-agent skills (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot`                                                                                                                                                                                                                                                                                               |
-| **CI**         | `ci init github`                                                            | Write a GitHub Actions workflow that runs your tests                                                                                                                                                                                                                                                                                                                                                                                          |
-|                | `ci doctor`                                                                 | Check that deployment events reach this repo                                                                                                                                                                                                                                                                                                                                                                                                  |
-|                | `ci connect`                                                                | Link your deploy platform (Vercel) to this repo                                                                                                                                                                                                                                                                                                                                                                                               |
-| **Tunnel**     | `tunnel start` / `list` / `status` / `stop`                                 | Hold one tunnel open for several `--local` runs; list, check, or stop tunnels                                                                                                                                                                                                                                                                                                                                                                 |
+| Task                                             | Command                                                                                |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Check credentials or install coding-agent skills | `auth status`, `setup`, `agent status`                                                 |
+| Manage a project and its targets                 | `project list`, `project create`, `project env`                                        |
+| Propose tests, review them and save them         | `plan`, `status`, `reply`, `reject`, `apply`                                           |
+| Find the ID or steps of a saved test             | `test list --project <id>`, `test get <test-id>`                                       |
+| Launch a project, named tests or a saved list    | `run --project <id>`, `run <test-id...>`, `run --testlist <list-id>`                   |
+| Follow or cancel an execution                    | `run wait <run-id...>`, `run cancel <run-id...>`                                       |
+| Read results and download evidence               | `result list --run <run-id>`, `result list --test <test-id>`, `result get <result-id>` |
+| Automate scheduled tests or a pull-request gate  | `schedule`, `ci init github`, `ci run`                                                 |
 
-> The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
-
-📚 **Full reference — every command, flag, and example:** [DOCUMENTATION.md](./DOCUMENTATION.md), including [configuration & profiles](./DOCUMENTATION.md#configuration), [scripting](./DOCUMENTATION.md#output--scripting), and [exit codes](./DOCUMENTATION.md#exit-codes).
-
-Exit codes: `0` success, `1` failure (including a run that did not pass), `7` timeout, `12` insufficient credits, `13` feature gated, `14` CLI too old; the rest are in [DOCUMENTATION.md](./DOCUMENTATION.md#exit-codes).
+For test lists, tunnel management, usage, diagnostics, profiles and exit codes, see the [command reference](./DOCUMENTATION.md#command-reference). To migrate shell scripts or previously installed agent skills from 0.16, see [Upgrading from 0.16](./DOCUMENTATION.md#upgrading-from-016).
 
 ## Why a CLI for coding agents?
 
 - 🧪 **Tests like a real user.** Runs against a live browser or API in the cloud — real clicks, real navigation, real assertions. Not a mock.
-- 🤖 **Agent-shaped output.** `test failure get` returns **one bundle** — the failing step, its neighbors, screenshots, DOM snapshots, the test source, a root-cause hypothesis, and a recommended fix target — all sharing a single `snapshotId`. The CLI _refuses_ to stitch data from two different runs, so an agent never reasons over a frankenstein context.
-- ♻️ **A loop, not a one-shot.** `create → run → failure get → fix → run` — every pass is banked, not thrown away.
-- 📐 **Scriptable & deterministic.** Stable `--output json` contract, predictable [exit codes](./DOCUMENTATION.md#exit-codes), and a `--dry-run` that exercises the full code path offline with canned data.
-- 🚦 **CI-native.** `testsprite ci init github` writes a PR gate; `testsprite ci run --env <name> --target-url "$PREVIEW_URL"` tests each pull request's preview deployment as one execution and exits with the verdict. The job summary is the execution report — the same content as the GitHub App's PR comment — plus `::error::` annotations on the checks tab, step outputs, `--summary-file` for a machine summary and `--report junit` for a JUnit sidecar. In any other CI, `testsprite ci run --project <id> --env <name> --target-url <url>` still runs the suite as one execution and makes the exit code the verdict — the pull-request context, draft skip and job summary are GitHub Actions only. [Details →](./DOCUMENTATION.md#continuous-integration)
+- 🤖 **Agent-shaped output.** `run` names the run (`runId`) and each test's result in it (`resultId`). `result get <result-id>` returns that one result — the verdict, the error, its cause and fix, the failed step with its screenshot, a backend test's traceback and output, and every step — and `--out <dir>` downloads its video and each step's screenshot and page. The agent reads the run it just started, never an older one.
+- **Whole-run results.** Every selector and `run wait` use the same JSON: `runs[]` describes executions, `results[]` lists individual results, and `summary` counts outcomes when waiting. A complete run can fail. Only a timeout or interruption that leaves work unfinished adds `partial: true`. A cancelled execution fails even if its existing results passed. Read detailed evidence with `result get <result-id>`.
+- ♻️ **A loop, not a one-shot.** `plan → apply → run → result get → fix → run` — every pass is banked, not thrown away.
+- 📐 **Scriptable & deterministic.** Stable `--output json` contract, predictable [exit codes](./DOCUMENTATION.md#exit-codes), and a `--dry-run` for previewing commands. A credentialed run preview can read environment metadata to determine whether it would open a tunnel.
+- 🚦 **CI-native.** `testsprite ci init github` writes a PR gate; `testsprite ci run --project "$PROJECT_ID" --env <name> --target-url "$PREVIEW_URL"` tests each pull request's preview deployment as one run and exits with the verdict. The job summary is the execution report — the same content as the GitHub App's PR comment — plus `::error::` annotations on the checks tab, step outputs, `--summary-file` for a machine summary and `--report junit` for a JUnit sidecar. In any other CI, `testsprite ci run --project <id> --env <name> --target-url <url>` still runs the suite as one run and makes the exit code the verdict — the pull-request context, draft skip and job summary are GitHub Actions only. [Details →](./DOCUMENTATION.md#continuous-integration)
 - 🔌 **One command to onboard your agent.** `testsprite setup` drops ready-made skill files into your repo — for the agents it detects you using — so your coding agent knows how to drive the loop on its own.
 
 ## How it works
 
 Every time your agent changes code, it asks one question: **is this behavior already covered by the suite?**
 
-- **Not yet covered** → `testsprite test create` — describe the new behavior, run it.
-- **Already covered** → `testsprite test run --all` — run the existing tests, so nothing that used to work breaks silently.
-- **Something fails** → `testsprite test failure get` — one self-consistent bundle; the agent fixes the code and runs again.
+- **Not yet covered** → `testsprite plan` — the project's agent writes a test for the new behavior; `testsprite apply` saves it, then run it.
+- **Already covered** → `testsprite run --project <project-id> --wait` — run the existing tests, so nothing that used to work breaks silently.
+- **Something fails** → `testsprite result get <result-id>` — the failed step, its cause and a fix; the agent fixes the code and runs again.
 
 Every pass is banked into a durable suite, so coverage compounds as the project grows — a lasting record of every requirement it has ever gotten right, far bigger than any context window.
 
@@ -244,20 +146,20 @@ Every pass is banked into a durable suite, so coverage compounds as the project 
 flowchart TD
     A["🤖 Your coding agent<br/>Claude Code · Codex · Antigravity · Kimi · Cursor · Trae …"]
     D{"behavior already<br/>covered by the suite?"}
-    B["<b>testsprite test create</b><br/>new behavior → new test"]
-    R["<b>testsprite test run --all</b><br/>run the existing tests"]
+    B["<b>testsprite plan → apply</b><br/>the project's agent writes a test<br/>for the new behavior"]
+    R["<b>testsprite run --project &lt;project-id&gt; --wait</b><br/>run the existing tests"]
     C{{"☁️ TestSprite testing agent<br/>runs the test like a real user against<br/>real browsers & real APIs on Cloud"}}
-    F["<b>testsprite test failure get</b><br/>ONE self-consistent bundle:<br/>failing step · screenshots · DOM ·<br/>root-cause · recommended fix"]
+    F["<b>testsprite result get</b><br/>one test's result in the run:<br/>failed step · screenshots · video ·<br/>cause · fix"]
     S[("📚 Durable integration suite<br/>grows with every pass")]
 
     A -->|"writes / changes code"| D
     D -->|"no — new behavior"| B
     D -->|"yes"| R
-    B --> C
+    B --> R
     R --> C
     C -->|"pass ✅"| S
     C -->|"fail ❌"| F
-    F -->|"agent reads the bundle<br/>& fixes the code"| A
+    F -->|"agent reads the result<br/>& fixes the code"| A
     S -.->|"defines what's covered"| D
 ```
 
@@ -274,7 +176,7 @@ That's the point of all of this: you no longer need the biggest, most expensive 
 - 📚 **CLI reference** — [DOCUMENTATION.md](./DOCUMENTATION.md)
 - 🌐 **Platform docs** — [docs.testsprite.com](https://docs.testsprite.com)
 - 🐛 **Issues & feature requests** — [GitHub issues](https://github.com/TestSprite/testsprite-cli/issues)
-- 💬 **Quick questions** — [Discord](https://discord.gg/GXWFjCe4an), or `testsprite --help` / `testsprite test run --help` right in your terminal
+- 💬 **Quick questions** — [Discord](https://discord.gg/GXWFjCe4an), or `testsprite --help` / `testsprite run --help` right in your terminal
 - 📝 **Changelog** — [CHANGELOG.md](./CHANGELOG.md)
 
 ## Contributing

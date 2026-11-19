@@ -27,12 +27,13 @@
 import { closeSync, constants, fstatSync, openSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { localValidationError } from './errors.js';
+import { decodeWithBom } from './text-file.js';
 
 /**
  * Read a secret from `path`, surfacing every filesystem failure as a typed
  * `VALIDATION_ERROR` (exit 5) attributed to `flag`.
  *
- * The returned value is trimmed, matching what the unguarded call sites did.
+ * Most flags trim the returned value. A credential file preserves spaces in a raw Basic pair.
  * Trimming also drops a leading UTF-8 BOM: `U+FEFF` is ECMAScript whitespace,
  * so a file written by PowerShell 5.1's default `Set-Content -Encoding utf8`
  * no longer smuggles an invisible character into the secret.
@@ -97,8 +98,16 @@ export function readSecretFileGuarded(flag: string, path: string): string {
     }
 
     try {
+      // Decoded through decodeWithBom so a UTF-16LE/BE secret file (PowerShell
+      // 5.1 `Set-Content -Encoding unicode`) yields the real secret instead of
+      // mojibake; decodeWithBom also strips a UTF-8 BOM.
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- `fd` is the open file descriptor from openSync() above, not a path string; the rule's non-literal-argument check does not distinguish the two, but there is no path re-resolution here for anything to race against.
-      return readFileSync(fd, 'utf8').trim();
+      const value = decodeWithBom(readFileSync(fd));
+      // A Basic username or password can start or end in a space. Drop only
+      // the file's BOM and one terminating line ending for static credentials.
+      return flag === 'credential-file'
+        ? value.replace(/^\uFEFF/, '').replace(/\r?\n$/, '')
+        : value.trim();
     } catch (err) {
       throw secretFileError(flag, path, err, 'read');
     }

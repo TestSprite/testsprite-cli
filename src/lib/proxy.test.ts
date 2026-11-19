@@ -179,6 +179,15 @@ describe('maybeInstallProxyAgent', () => {
       expect(proxy.seen).toEqual([]);
     });
 
+    it.each(['HTTPS_PROXY', 'http_proxy'] as const)(
+      'installs nothing for a whitespace-only %s',
+      name => {
+        const { agent, warnings } = captureAgent({ [name]: '   ' });
+        expect(agent).toBeUndefined();
+        expect(warnings).toEqual([]);
+      },
+    );
+
     it('still warns and falls back for a value that is not a URL at all', () => {
       const { agent, warnings } = captureAgent({ HTTPS_PROXY: 'http://' });
       expect(agent).toBeUndefined();

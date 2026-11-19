@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { localValidationError } from './errors.js';
+import { readTextFileBomAware } from './text-file.js';
 
 export const DEFAULT_PROFILE = 'default';
 
@@ -130,8 +131,35 @@ const CREDENTIALS_LOCK_STALE_MS = 30_000;
 // How long a transient Windows error on replacing the credentials file is retried.
 const CREDENTIALS_RENAME_TRANSIENT_WAIT_MS = 2_000;
 
+/**
+ * Section names that are never a profile. Used as a key on an ordinary object,
+ * `__proto__` and `constructor` reach the object's prototype and the shared
+ * `Object` function instead of naming an entry, so the key/value lines under
+ * such a header would be written onto a built-in the whole process shares
+ * (for `__proto__`, onto every object). Neither ever worked as a profile name.
+ * `prototype` is not among them: an ordinary object has no such member, and a
+ * profile by that name has always read and written normally. The parser drops
+ * these sections, the serialiser never writes them, and `writeProfile` refuses
+ * them, so the three agree on what can be stored.
+ */
+const RESERVED_SECTION_NAMES: ReadonlySet<string> = new Set(['__proto__', 'constructor']);
+
+/**
+ * Look a profile up by name without consulting the prototype chain. A name
+ * that comes from the file, a flag or an environment variable can spell an
+ * inherited member (`toString`, `hasOwnProperty`, `__proto__`); a plain
+ * `file[name]` would then hand back that built-in as if it were a profile.
+ */
+function ownProfile(file: CredentialsFile, profile: string): ProfileEntry | undefined {
+  return Object.hasOwn(file, profile) ? file[profile] : undefined;
+}
+
 export function parseCredentials(content: string): CredentialsFile {
-  const result: CredentialsFile = {};
+  // Sections are collected on an object with no prototype, so a name read from
+  // the file can only ever find a section this loop stored itself. On an
+  // ordinary object `[toString]` would find the inherited function and the
+  // lines under it would be written onto that shared built-in.
+  const sections = Object.create(null) as CredentialsFile;
   let currentEntry: ProfileEntry | null = null;
   for (const rawLine of content.split('\n')) {
     const line = rawLine.trim();
@@ -139,12 +167,18 @@ export function parseCredentials(content: string): CredentialsFile {
     const sectionMatch = /^\[([^\]]+)\]$/.exec(line);
     if (sectionMatch) {
       const sectionName = sectionMatch[1]!.trim();
-      const existing = result[sectionName];
+      if (RESERVED_SECTION_NAMES.has(sectionName)) {
+        // Not a profile: leave no current section, so the key/value lines under
+        // this header are skipped rather than applied to the section above it.
+        currentEntry = null;
+        continue;
+      }
+      const existing = sections[sectionName];
       if (existing) {
         currentEntry = existing;
       } else {
         const newEntry: ProfileEntry = {};
-        result[sectionName] = newEntry;
+        sections[sectionName] = newEntry;
         currentEntry = newEntry;
       }
       continue;
@@ -154,18 +188,26 @@ export function parseCredentials(content: string): CredentialsFile {
     if (eqIndex < 0) continue;
     const rawKey = line.slice(0, eqIndex).trim();
     const rawValue = line.slice(eqIndex + 1).trim();
-    const field = FILE_KEY_TO_FIELD[rawKey];
+    // Own-property lookup: a key such as `constructor` must not match the
+    // inherited `Object` function and be taken for a known field.
+    const field = Object.hasOwn(FILE_KEY_TO_FIELD, rawKey) ? FILE_KEY_TO_FIELD[rawKey] : undefined;
     if (field) currentEntry[field] = rawValue;
   }
-  return result;
+  // Callers and test matchers expect ordinary objects, so hand the sections
+  // back on one. `Object.fromEntries` defines each as an own property.
+  return Object.fromEntries(Object.entries(sections));
 }
 
 export function serializeCredentials(file: CredentialsFile): string {
-  const orderedSections = Object.keys(file).sort((a, b) => {
-    if (a === DEFAULT_PROFILE) return -1;
-    if (b === DEFAULT_PROFILE) return 1;
-    return a.localeCompare(b);
-  });
+  const orderedSections = Object.keys(file)
+    // The parser drops these sections, so writing one would store a profile
+    // that can never be read back.
+    .filter(section => !RESERVED_SECTION_NAMES.has(section))
+    .sort((a, b) => {
+      if (a === DEFAULT_PROFILE) return -1;
+      if (b === DEFAULT_PROFILE) return 1;
+      return a.localeCompare(b);
+    });
   const lines: string[] = [];
   for (const section of orderedSections) {
     const entry = file[section];
@@ -173,6 +215,10 @@ export function serializeCredentials(file: CredentialsFile): string {
     lines.push(`[${section}]`);
     const fields = Object.keys(entry).sort() as Array<keyof ProfileEntry>;
     for (const field of fields) {
+      // Own-property lookup: an entry key the file format does not know has no
+      // line to be written as, and one that spells an inherited member
+      // (`constructor`) would otherwise print that built-in as the key.
+      if (!Object.hasOwn(FIELD_TO_FILE_KEY, field)) continue;
       const value = entry[field];
       if (value === undefined || value === '') continue;
       // Guard against INI injection: a value containing newline characters
@@ -193,7 +239,9 @@ export function serializeCredentials(file: CredentialsFile): string {
 export function readCredentialsFile(options: CredentialsOptions = {}): CredentialsFile {
   const path = resolvePath(options);
   if (!existsSync(path)) return {};
-  return parseCredentials(readFileSync(path, 'utf-8'));
+  // Shared BOM sniff (UTF-8, UTF-16LE, UTF-16BE). Writes stay UTF-8 with no BOM,
+  // so a UTF-16 file is normalised on the next save. The parser is unchanged.
+  return parseCredentials(readTextFileBomAware(path));
 }
 
 export function readProfile(
@@ -201,8 +249,7 @@ export function readProfile(
   options: CredentialsOptions = {},
 ): ProfileEntry | undefined {
   assertValidProfileName(profile);
-  const file = readCredentialsFile(options);
-  return file[profile];
+  return ownProfile(readCredentialsFile(options), profile);
 }
 
 export function writeProfile(
@@ -211,9 +258,21 @@ export function writeProfile(
   options: CredentialsOptions = {},
 ): void {
   assertValidProfileName(profile);
+  // Refused before the directory, lock or file is touched: the parser drops a
+  // section with one of these names, so the profile could never be read back,
+  // and assigning to `__proto__` would swap the file object's prototype
+  // instead of adding an entry.
+  if (RESERVED_SECTION_NAMES.has(profile)) {
+    throw localValidationError(
+      'profile',
+      'must not be __proto__ or constructor (reserved names that cannot be stored)',
+      undefined,
+      'flag',
+    );
+  }
   const path = resolvePath(options);
   mutateCredentialsFile(path, file => {
-    file[profile] = { ...file[profile], ...entry };
+    file[profile] = { ...ownProfile(file, profile), ...entry };
     return file;
   });
 }
@@ -224,7 +283,10 @@ export function deleteProfile(profile: string, options: CredentialsOptions = {})
   if (!existsSync(path)) return false;
   let removed = false;
   mutateCredentialsFile(path, file => {
-    if (!(profile in file)) return undefined;
+    // Own-property check: `in` also sees inherited members, so a name such as
+    // `__proto__` or `toString` would be reported as removed and the file
+    // rewritten although no such profile was ever stored.
+    if (!Object.hasOwn(file, profile)) return undefined;
     removed = true;
     delete file[profile];
     return file;

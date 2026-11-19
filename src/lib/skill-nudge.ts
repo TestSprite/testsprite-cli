@@ -9,60 +9,28 @@ import {
 import { detectCallerFromEnv } from './agent-detect.js';
 import { defaultCredentialsPath, readProfile } from './credentials.js';
 import type { OutputMode } from './output.js';
+import { terminalSafeWriter } from './terminal-text.js';
 
 /**
  * Full command paths (group + leaf) that signal the caller is actively driving
- * the verification loop — running or authoring tests, or checking auth in
- * preflight. The skill nudge fires ONLY for these.
+ * the verification loop — running tests, or checking auth in preflight. The
+ * skill nudge fires ONLY for these.
  *
  * Deliberately excluded:
- * - `setup` / `init` / `agent install` — they ARE the fix; nudging is circular.
- * - read-only inspection (`test list/get/result/...`, `project list/get`) —
+ * - `setup` / `agent install` — they ARE the fix; nudging is circular.
+ * - read-only inspection (`test list/get`, `result list/get`, `project list/get`) —
  *   keeps an agent that is merely browsing from being nagged.
- * - `auth configure` / `auth remove` (and the deprecated `auth logout`) —
- *   credential management, not the loop.
+ * - `auth remove` — credential management, not the loop.
  *
- * Match the strings emitted by `commandPathOf` in `src/index.ts`. `auth status`
- * is the primary identity command; `auth whoami` is its deprecated alias and is
- * listed too so the warning fires regardless of which name the caller uses.
+ * Match the strings emitted by `commandPathOf` in `src/index.ts`.
  */
-export const SKILL_NUDGE_COMMANDS: ReadonlySet<string> = new Set([
-  'test run',
-  'test rerun',
-  'test create',
-  'test create-batch',
-  'auth status',
-  'auth whoami',
-]);
+export const SKILL_NUDGE_COMMANDS: ReadonlySet<string> = new Set(['run', 'auth status']);
 
 /**
  * Env var that silences the warning. For CI, or users who deliberately drive
  * the CLI by hand without wiring a coding agent.
  */
 export const SKILL_NUDGE_OPT_OUT_ENV = 'TESTSPRITE_NO_SKILL_WARNING';
-
-/**
- * True when this invocation is `test create --plan-template`, a
- * pure-local/informational flag (prints the plan-file skeleton and exits)
- * that must be treated like `setup` / `agent install`: exempt from BOTH the
- * missing-skill nudge above AND the update-registry check
- * (`src/lib/update-check.ts`'s `maybeNotifyUpdate`, which hits the network
- * and writes `~/.testsprite/update-check.json` — both contradict "no
- * network" for this flag). Neither allowlist (`SKILL_NUDGE_COMMANDS` here,
- * the unconditional call site in `src/index.ts`) tracks individual flags,
- * only whole commands, so `src/index.ts`'s `preAction` hook filters this one
- * case via this pure, independently-testable helper instead of teaching
- * either module about flags. Exported from `skill-nudge.ts` (rather than
- * `src/index.ts`, which executes `program.parse()` at import time and so
- * cannot be safely imported by a unit test) purely so it has a home that
- * supports direct unit testing.
- */
-export function isPlanTemplateInvocation(
-  commandPath: string,
-  planTemplate: boolean | undefined,
-): boolean {
-  return commandPath === 'test create' && planTemplate === true;
-}
 
 export interface SkillPresenceDeps {
   existsSync?: (p: string) => boolean;
@@ -129,7 +97,7 @@ function hasCompleteManagedSection(content: string): boolean {
 }
 
 export interface SkillNudgeContext {
-  /** Full command path, e.g. "test run" / "auth whoami". */
+  /** Full command path, e.g. "run" / "auth status". */
   commandPath: string;
   output: OutputMode;
   dryRun: boolean;
@@ -162,7 +130,7 @@ export interface SkillNudgeContext {
  * `--debug` callers receive the swallowed reason on stderr.
  */
 export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
-  const write = ctx.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const write = terminalSafeWriter(ctx.stderr);
   try {
     if (ctx.output !== 'text') return;
     if (ctx.dryRun) return;

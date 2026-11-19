@@ -1,5 +1,6 @@
 import { resolvePortalBase } from './facade.js';
 import type { ApiError } from './errors.js';
+import { terminalSafeLine } from './terminal-text.js';
 
 /**
  * The workspace gate's three refusals, named as the backend's `GateRefusal`
@@ -106,16 +107,16 @@ export function resolveBillingLinks(input: {
   const billing =
     (foundBilling !== undefined ? rebaseOntoOverride(foundBilling) : undefined) ??
     (base
-      ? `${base}${orgId ? `/dashboard-v3/o/${orgId}` : '/dashboard'}/settings/billing`
+      ? `${base}${orgId ? `/dashboard-v3/o/${orgId}` : '/dashboard-v3'}/settings/billing`
       : orgId
         ? `/dashboard-v3/o/${orgId}/settings/billing`
-        : '/dashboard/settings/billing');
+        : '/dashboard-v3/settings/billing');
   return { pricing, billing };
 }
 
 /** One `  label: value` line, aligned like the CLI's other key/value output. */
 function fact(label: string, value: string): string {
-  return `  ${`${label}:`.padEnd(11)}${value}`;
+  return `  ${`${label}:`.padEnd(11)}${terminalSafeLine(value)}`;
 }
 
 function safeOrgId(value: unknown): string | undefined {

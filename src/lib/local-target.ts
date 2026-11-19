@@ -207,9 +207,9 @@ function flagPairError(message: string): ApiError {
 }
 
 /**
- * Refuse a stored-target write whose loopback port has nothing listening —
- * the same check `project create --local` runs, so a typo in the port is
- * caught before a row exists anywhere. `skipPreflight` is a pure no-op.
+ * Refuse a stored-target write (`project env create` / `project env update`
+ * with `--local`) whose loopback port has nothing listening, so a typo in the
+ * port is caught before a row exists anywhere. `skipPreflight` is a pure no-op.
  */
 export async function assertStoredLocalTargetListening(
   target: StoredLocalTarget,

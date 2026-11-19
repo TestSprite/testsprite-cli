@@ -338,7 +338,7 @@ describe('ApiError.fromEnvelope status fallback', () => {
     const err = ApiError.fromEnvelope({ code, message: 'Refused.', statusCode: 403 }, 403);
     expect(err.code).toBe('FEATURE_GATED');
     expect(err.details.reason).toBe(reason);
-    expect(err.nextAction).toContain('/dashboard/settings/billing');
+    expect(err.nextAction).toContain('/dashboard-v3/settings/billing');
     expect(classifyBillingRefusal(err)?.links.pricing).toBe('/pricing');
   });
 
@@ -348,14 +348,14 @@ describe('ApiError.fromEnvelope status fallback', () => {
         statusCode: 403,
         code: 'workspace_paused',
         message: 'This workspace is paused.',
-        billingUrl: 'https://portal.example/dashboard/settings/billing',
+        billingUrl: 'https://portal.example/dashboard-v3/settings/billing',
       },
       403,
     );
     expect(err.code).toBe('FEATURE_GATED');
     expect(err.details).toMatchObject({ reason: 'paused' });
     expect(err.details).not.toHaveProperty('state');
-    expect(err.nextAction).toContain('https://portal.example/dashboard/settings/billing');
+    expect(err.nextAction).toContain('https://portal.example/dashboard-v3/settings/billing');
   });
 
   it("keeps the raw paused body's own reason and pause fields", () => {
@@ -582,7 +582,7 @@ describe('localValidationError', () => {
 
   // A reason string that already ends in a period (common when a
   // call site composes multiple already-punctuated sentences, e.g.
-  // `test run --all --target-url` builds its rejection out of an
+  // `run --project --target-url` builds its rejection out of an
   // explanatory sentence + an instruction sentence) must not end up with a
   // doubled `..` once the template appends its own trailing period.
   it('does not double the trailing period when reason already ends with one', () => {
@@ -797,8 +797,8 @@ describe('INSUFFICIENT_CREDITS detection', () => {
     expect(err.exitCode).toBe(12);
     // No nextAction from backend AND no apiUrl → synthesized billing hint is
     // route-only (no hardcoded domain — the right portal host is unknown).
-    // Pin the real route (/dashboard/settings/billing — bare /settings/billing 404s).
-    expect(err.nextAction).toContain('(/dashboard/settings/billing)');
+    // Pin the real route (/dashboard-v3/settings/billing — bare /settings/billing 404s).
+    expect(err.nextAction).toContain('(/dashboard-v3/settings/billing)');
     expect(err.nextAction).toContain('(/pricing)');
     expect(err.nextAction).not.toContain('https://');
   });
@@ -826,7 +826,7 @@ describe('INSUFFICIENT_CREDITS detection', () => {
     expect(err.nextAction.toLowerCase()).toContain('org admin');
     // The personal-key link is still offered — it's a real, correct fix for
     // the common case, just no longer presented as the only one.
-    expect(err.nextAction).toContain('(/dashboard/settings/billing)');
+    expect(err.nextAction).toContain('(/dashboard-v3/settings/billing)');
   });
 
   it('synthesized billing link resolves the PROD portal from a prod apiUrl', () => {
@@ -844,7 +844,7 @@ describe('INSUFFICIENT_CREDITS detection', () => {
       undefined,
       'https://api.testsprite.com/api/cli/v1',
     );
-    expect(err.nextAction).toContain('https://www.testsprite.com/dashboard/settings/billing');
+    expect(err.nextAction).toContain('https://www.testsprite.com/dashboard-v3/settings/billing');
     expect(err.nextAction).toContain('https://www.testsprite.com/pricing');
   });
 
@@ -866,7 +866,7 @@ describe('INSUFFICIENT_CREDITS detection', () => {
         'https://api.example.com:8443/api/cli/v1',
       );
       expect(err.nextAction).toContain(
-        'https://portal.internal.example.com/dashboard/settings/billing',
+        'https://portal.internal.example.com/dashboard-v3/settings/billing',
       );
       expect(err.nextAction).not.toContain('www.testsprite.com');
     } finally {
@@ -1002,7 +1002,7 @@ describe('AMBIGUOUS_ORG detection (409 CONFLICT + reason: ambiguous_org)', () =>
         error: {
           code: 'CONFLICT',
           message: 'Another run is already in flight.',
-          nextAction: 'Poll it with test wait.',
+          nextAction: 'Poll it with run wait.',
           requestId: 'req_conflict_2',
           details: { reason: 'run_in_flight', currentRunId: 'run_abc' },
         },
