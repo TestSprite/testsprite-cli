@@ -10,6 +10,7 @@ import {
   localValidationError,
 } from './errors.js';
 import { buildUserAgent } from './client-tag.js';
+import { classifyFatalTransportFailure } from './transport-failure.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
@@ -940,6 +941,26 @@ export class HttpClient {
           if (err instanceof RequestTimeoutError) throw err;
           // Retrying a refused redirect could repeat an already accepted mutation.
           if (err instanceof RedirectError) throw err;
+          // An untrusted TLS certificate or a proxy 407 fails the same way on
+          // every attempt. Fail now, before the retry decision, so no request
+          // (read, keyed write or replay-safe call) spends its backoff budget on
+          // it, and name the fix instead of "temporarily unavailable".
+          const fatal = classifyFatalTransportFailure(err, url);
+          if (fatal !== undefined) {
+            this.debug({
+              kind: 'error',
+              method,
+              url,
+              attempt,
+              requestId,
+              errorCode: 'TRANSPORT',
+              durationMs: Date.now() - startedAt,
+            });
+            throw new TransportError(fatal.message, requestId, {
+              nextAction: fatal.nextAction,
+              details: { cause: fatal.cause },
+            });
+          }
           const delayMs = this.transportRetryDelayOrThrow({
             message: err instanceof Error ? err.message : String(err),
             transition: 'Network error',
@@ -1055,16 +1076,38 @@ export class HttpClient {
           return { body: raw as T, requestId, status: response.status };
         }
 
-        let rawBody: unknown;
+        let errorBody: ErrorResponseBody;
         try {
-          rawBody = await safeReadJson(response);
+          errorBody = await readErrorResponseBody(response);
         } catch (err) {
           // Interrupt passthrough (see the fetch catch above).
           if (err instanceof InterruptError) throw err;
-          // safeReadJson rethrows aborts/timeouts (it swallows only non-abort parse
-          // errors), so a timeout fired mid-body-read on a non-OK response lands here.
+          // readErrorResponseBody rethrows aborts/timeouts (it swallows only
+          // non-abort read/parse errors), so a timeout fired mid-body-read on a
+          // non-OK response lands here.
           this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
           throw err;
+        }
+        const rawBody = errorBody.json;
+
+        // The API answers every 4xx with a JSON body. A 4xx whose body is not
+        // JSON came from something in between (a proxy, firewall or captive
+        // portal page). Mapping its status would tell the user the key is bad
+        // (403), the credits ran out (402), the resource is gone (404) or the
+        // CLI is too old (426) for a request the API never saw. 408 and 429
+        // keep their retry handling below.
+        if (errorBody.notJson && isNonApiCandidateStatus(response.status)) {
+          this.debug({
+            kind: 'error',
+            method,
+            url,
+            attempt,
+            status: response.status,
+            requestId,
+            errorCode: 'TRANSPORT',
+            durationMs,
+          });
+          throw nonApiResponseError(response, requestId, url);
         }
 
         // Edge proxies / load balancers return 408/502/504 without our error
@@ -1531,16 +1574,51 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   if (typeof unref === 'function') unref.call(timer);
 }
 
-async function safeReadJson(response: Response): Promise<unknown> {
+interface ErrorResponseBody {
+  /** The parsed body, or `null` when it could not be read or parsed. */
+  json: unknown;
+  /** True only when the body arrived and is not JSON (an empty body included). */
+  notJson: boolean;
+}
+
+async function readErrorResponseBody(response: Response): Promise<ErrorResponseBody> {
   try {
-    return await response.json();
+    return { json: await response.json(), notJson: false };
   } catch (err) {
     // Don't swallow interrupts, aborts, or timeouts as a null body — the caller
     // must preserve the interruption or classify a timeout correctly.
     if (err instanceof InterruptError) throw err;
     if (isAbortError(err) || isTimeoutError(err)) throw err;
-    return null;
+    // A JSON parse failure is a SyntaxError. Anything else is a body that
+    // failed to arrive, which keeps the status mapping it always had.
+    return { json: null, notJson: err instanceof Error && err.name === 'SyntaxError' };
   }
+}
+
+/** A 4xx that the API would have answered with JSON; 408 and 429 keep their retries. */
+function isNonApiCandidateStatus(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+/**
+ * Exit-10 error for a 4xx whose body is not JSON. It is a `TransportError`
+ * with no `httpStatus`, like a bare edge 502: the status belongs to whatever
+ * answered in front of the API, so nothing downstream reads it as the API's
+ * verdict. The status and content type stay in `details`.
+ */
+function nonApiResponseError(response: Response, requestId: string, url: string): TransportError {
+  const contentType = response.headers.get('content-type');
+  return new TransportError(
+    `Something between this machine and the TestSprite API answered HTTP ${response.status} ` +
+      `(content-type: ${contentType ?? 'none'}) instead of the API; the API key was not rejected.`,
+    requestId,
+    {
+      nextAction:
+        'A proxy, firewall or captive portal probably answered. Check HTTPS_PROXY and ' +
+        `--endpoint-url / TESTSPRITE_API_URL, or ask your network admin to allow ${new URL(url).host}, then retry.`,
+      details: { httpStatus: response.status, contentType },
+    },
+  );
 }
 
 /**
