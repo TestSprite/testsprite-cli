@@ -205,9 +205,9 @@ Read the current project instructions here before replacing them with `project u
 
 When the server supplies an environment summary, text detail shows `defaultEnv:  <name>` and `envs:        <count>`, with a `testsprite project env list <project-id>` hint for a positive count. A reported null default shows `-`; older servers omit both lines. JSON preserves the server's fields without adding missing values.
 
-#### `testsprite test list --project <id>`
+#### `testsprite test list [--project <id>]`
 
-List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
+List the project's test cases as they are written. A nonblank `--project` takes precedence over `TESTSPRITE_PROJECT_ID`. If you omit the flag, the CLI uses `TESTSPRITE_PROJECT_ID`. With neither value set, the command exits 5. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
 
 ```bash
 testsprite test list --project "$PROJECT_ID" --output json
