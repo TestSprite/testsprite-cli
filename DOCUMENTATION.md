@@ -111,7 +111,7 @@ Ask the project's agent to propose tests and show you the steps. A backend proje
 testsprite plan "Verify that a guest can complete checkout" --project "$PROJECT_ID" --steps
 ```
 
-Answer a question in a text message with `testsprite reply "your answer"`. For a question card, use the **Open in the portal** link to submit your answers. Review a proposed plan and use `reject "what to change"` to request a revision. Applying a test plan saves the cases. Applying a run proposal starts an execution.
+Answer a question in a text message with `testsprite reply "your answer"`. For a question card, pass all answers together in the terminal, for example `testsprite apply --answer 1=b --answer 2=a,c`. Use the letters the card shows. The **Open in the portal** link also lets you answer there. Review a proposed plan and use `reject "what to change"` to request a revision. Applying a test plan saves the cases. Applying a run proposal starts an execution.
 
 ```bash
 testsprite apply --output json
