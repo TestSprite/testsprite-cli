@@ -223,7 +223,7 @@ Common flags:
 
 #### `testsprite test get <test-id>`
 
-Get one test case by id, with its steps. Test ids come from `test list` (and from `apply`). Text output lists the case's fields, then each step; backend cases echo their dependency declarations — `produces` / `consumes` — when present. When a per-test timeout is set, text output includes `stepTimeout: <N> ms (applies to every step)`. Nothing here is a result: `testsprite result list --test <test-id> --limit 1` lists the latest one, and `testsprite result get <result-id>` reads it.
+Get one test case by id, with its steps. Test ids come from `test list` (and from `apply`). Text output lists the case's fields, then each step; backend cases echo their dependency declarations — `produces` / `consumes` — when present. When a per-test timeout is set, text output includes `stepTimeout: <N> ms (applies to every step)`. Nothing here is a result: `testsprite result list --test <test-id> --limit 1` lists the latest non-cancelled result, and `testsprite result get <result-id>` reads it.
 
 ```bash
 testsprite test get "$TEST_ID" --output json
@@ -248,7 +248,14 @@ testsprite result list --test "$TEST_ID" --env staging --dry-run
 | `--env <name>`    | `--test` | only results from this project environment; an unknown name is exit 5 and lists the valid names                                             |
 | `--limit <n>`     | `--test` | how many results, 1–100 (default 20)                                                                                                        |
 
-Exactly one of `--run` / `--test` is required, and `--env` or `--limit` with `--run` is exit 5. Text prints one line per result (`CREATED  STATUS  RESULT ID  RUN ID  ENV  TITLE`), or `No results.`; with `--test`, a stderr note says how many older results your plan's history window hides. The `--run` response includes a `run` object with the execution status. Both queries return `results[]` with `resultId`, `runId`, `caseKey`, `title`, `testStatus` and timestamps. A test history can also include `hiddenRunCount` and `retentionDays`; `testStatus` is upper case. `title` is the title the test had when that result ran. Exit `0` whatever the verdicts; `4` when the run or test is not found. A test's newest result: `result list --test <test-id> --limit 1`, then `result get <result-id>`.
+Exactly one of `--run` / `--test` is required, and `--env` or `--limit` with `--run` is exit 5. Text prints one line per result (`CREATED  STATUS  RESULT ID  RUN ID  ENV  TITLE`), or `No results.`; with `--test`, a stderr note says how many older results your plan's history window hides. The `--run` response includes a `run` object with the execution status. Both queries return `results[]` with `resultId`, `runId`, `caseKey`, `title`, `testStatus` and timestamps. A test history can also include `hiddenRunCount` and `retentionDays`; `testStatus` is upper case. `title` is the title the test had when that result ran. Exit `0` whatever the verdicts; `4` when the run or test is not found.
+
+`--limit 1` returns the latest result among the selected statuses. The default omits cancelled results, so it can return an older result after a cancellation. To include every supported status, then read the returned result ID:
+
+```bash
+testsprite result list --test "$TEST_ID" --limit 1 --status passed,failed,running,blocked,cancelled
+testsprite result get "$RESULT_ID"
+```
 
 The text output of `result list` and `result get` shows `QUEUED` while a result is waiting for dispatch. On the wire this is `testStatus: "RUNNING"` with `processStatus: "Idle"`, so `--status running` includes queued results.
 
