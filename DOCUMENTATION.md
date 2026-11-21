@@ -1063,6 +1063,8 @@ The API key comes from a `TESTSPRITE_API_KEY` repo secret; `ci init` prints the 
 
 > Backend tests use the base URL inside their generated code, not the preview URL. To block merges on the gate, make the `testsprite-tests` check a required status check in your branch protection. The job is named `testsprite-tests` rather than `test` or `e2e` because GitHub matches required status checks by job name alone, across every workflow in the repository, so the name must not collide with a job you already have.
 
+**GitHub merge queues.** The generated workflow handles pull requests or deployment events. It doesn't run on `merge_group`. If your branch uses a merge queue, require a check that reports for the merge-group commit. Requiring the generated `testsprite-tests` check alone leaves the queue waiting for a check it won't receive. See [GitHub's merge-queue status check requirements](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#status-checks-with-github-actions-and-a-merge-queue).
+
 #### Checking that deployment events reach the repo
 
 A workflow triggered by deployments (`on: deployment_status`) only fires if the repo actually **receives** GitHub Deployment events — written by whatever deploys your app (Vercel's GitHub App writes them when the project is git-linked). When the platform is not linked, nothing is written and the gate stays silent, with no error anywhere. Set `GITHUB_REPOSITORY` to the repository in `owner/name` form and read its deployment history with an authenticated GitHub CLI.
