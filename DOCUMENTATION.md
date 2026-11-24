@@ -1067,7 +1067,7 @@ In a GitHub pull request, pass both `--env` and `--target-url` to run in a tempo
 
 > To block merges on the gate, make the `testsprite-tests` check a required status check in your branch protection. The job is named `testsprite-tests` rather than `test` or `e2e` because GitHub matches required status checks by job name alone, across every workflow in the repository, so the name must not collide with a job you already have.
 
-**GitHub merge queues.** The generated workflow handles pull requests or deployment events. It doesn't run on `merge_group`. If your branch uses a merge queue, require a check that reports for the merge-group commit. Requiring the generated `testsprite-tests` check alone leaves the queue waiting for a check it won't receive. See [GitHub's merge-queue status check requirements](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#status-checks-with-github-actions-and-a-merge-queue).
+**GitHub merge queues.** The generated workflow handles pull requests or deployment events. It doesn't run on `merge_group`. If `testsprite-tests` is a required check on a branch that uses a merge queue, GitHub never receives it for the merge-group commit, and the pull request is removed from the queue when the queue's status check timeout runs out. A required check reports there only if its workflow also has a `merge_group:` trigger. See [GitHub's merge-queue status check requirements](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#status-checks-with-github-actions-and-a-merge-queue).
 
 #### Checking that deployment events reach the repo
 
