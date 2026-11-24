@@ -136,7 +136,7 @@ testsprite run "$TEST_ID" --wait
 
 ## Agent onboarding (`agent install`)
 
-`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and how to read a result — no prompt engineering required. It writes the skill files locally without requiring an API key. The CLI may still check for updates or send telemetry when a key is configured. For an offline install, set `TESTSPRITE_NO_UPDATE_NOTIFIER=1` and `TESTSPRITE_NO_TELEMETRY=1`.
+`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and how to read a result — no prompt engineering required. It writes the skill files locally without requiring an API key. The CLI may still check the npm registry for updates, with or without a key, and it sends telemetry when a key is configured. For an offline install, set `TESTSPRITE_NO_UPDATE_NOTIFIER=1` and `TESTSPRITE_NO_TELEMETRY=1`.
 
 ```bash
 testsprite agent install claude     # install the skill for Claude Code
