@@ -58,6 +58,7 @@ After upgrading, run `testsprite agent status` in your repository. For each targ
 
 | In a 0.16 workflow                                                                                              | In 0.17                                                                                                                                  |
 | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `init`, `auth configure`, `auth whoami`, `auth logout`                                                          | `setup`, `setup`, `auth status`, `auth remove`, respectively.                                                                            |
 | Define, edit or delete a test with `test create`, `test update` or `test delete`                                | Describe the change with `plan`, review the proposal, then `apply`. Attach a spec with `--file` or code changes with `--diff`.           |
 | Set the app URL on `project create`                                                                             | Create the project, then add a named target with `project env create <id> --name staging --url <url>`.                                   |
 | `test run --all --project P`, `test run T`, `test rerun T`                                                      | `run --project P --wait` for a suite or `run T --wait` for a saved test.                                                                 |
@@ -136,7 +137,7 @@ testsprite run "$TEST_ID" --wait
 
 ## Agent onboarding (`agent install`)
 
-`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and how to read a result — no prompt engineering required. It's a pure-local command: no network, no credentials.
+`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and how to read a result — no prompt engineering required. It writes the skill files locally without requiring an API key. The CLI may still check the npm registry for updates, with or without a key, and it sends telemetry when a key is configured. For an offline install, set `TESTSPRITE_NO_UPDATE_NOTIFIER=1` and `TESTSPRITE_NO_TELEMETRY=1`.
 
 ```bash
 testsprite agent install claude     # install the skill for Claude Code
@@ -207,7 +208,13 @@ When the server supplies an environment summary, text detail shows `defaultEnv: 
 
 #### `testsprite test list [--project <id>]`
 
+<<<<<<< HEAD
 List the project's test cases as they are written. A nonblank `--project` takes precedence over `TESTSPRITE_PROJECT_ID`. If you omit the flag, the CLI uses `TESTSPRITE_PROJECT_ID`. With neither value set, the command exits 5 (or 3 when no API key is configured). Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
+||||||| 4a32c8c8
+List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
+=======
+List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest non-cancelled one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
+>>>>>>> public/main
 
 ```bash
 testsprite test list --project "$PROJECT_ID" --output json
@@ -223,7 +230,7 @@ Common flags:
 
 #### `testsprite test get <test-id>`
 
-Get one test case by id, with its steps. Test ids come from `test list` (and from `apply`). Text output lists the case's fields, then each step; backend cases echo their dependency declarations — `produces` / `consumes` — when present. When a per-test timeout is set, text output includes `stepTimeout: <N> ms (applies to every step)`. Nothing here is a result: `testsprite result list --test <test-id> --limit 1` lists the latest one, and `testsprite result get <result-id>` reads it.
+Get one test case by id, with its steps. Test ids come from `test list` (and from `apply`). Text output lists the case's fields, then each step; backend cases echo their dependency declarations — `produces` / `consumes` — when present. When a per-test timeout is set, text output includes `stepTimeout: <N> ms (applies to every step)`. Nothing here is a result: `testsprite result list --test <test-id> --limit 1` lists the latest non-cancelled result, and `testsprite result get <result-id>` reads it.
 
 ```bash
 testsprite test get "$TEST_ID" --output json
@@ -248,7 +255,15 @@ testsprite result list --test "$TEST_ID" --env staging --dry-run
 | `--env <name>`    | `--test` | only results from this project environment; an unknown name is exit 5 and lists the valid names                                             |
 | `--limit <n>`     | `--test` | how many results, 1–100 (default 20)                                                                                                        |
 
-Exactly one of `--run` / `--test` is required, and `--env` or `--limit` with `--run` is exit 5. Text prints one line per result (`CREATED  STATUS  RESULT ID  RUN ID  ENV  TITLE`), or `No results.`; with `--test`, a stderr note says how many older results your plan's history window hides. The `--run` response includes a `run` object with the execution status. Both queries return `results[]` with `resultId`, `runId`, `caseKey`, `title`, `testStatus` and timestamps. A test history can also include `hiddenRunCount` and `retentionDays`; `testStatus` is upper case. `title` is the title the test had when that result ran. Exit `0` whatever the verdicts; `4` when the run or test is not found. A test's newest result: `result list --test <test-id> --limit 1`, then `result get <result-id>`.
+Exactly one of `--run` / `--test` is required, and `--env` or `--limit` with `--run` is exit 5. Text prints one line per result (`CREATED  STATUS  RESULT ID  RUN ID  ENV  TITLE`), or `No results.`; with `--test`, a stderr note says how many older results your plan's history window hides. The `--run` response includes a `run` object with the execution status. Both queries return `results[]` with `resultId`, `runId`, `caseKey`, `title`, `testStatus` and timestamps. A test history can also include `hiddenRunCount` and `retentionDays`; `testStatus` is upper case. `title` is the title the test had when that result ran. Exit `0` whatever the verdicts; `4` when the run or test is not found.
+
+`--limit 1` returns the latest result among the selected statuses. The default omits cancelled results, so it can return an older result after a cancellation. To include every supported status and read the result it returns:
+
+```bash
+RESULT_ID=$(testsprite result list --test "$TEST_ID" --limit 1 \
+  --status passed,failed,running,blocked,cancelled --output json | jq -r '.results[0].resultId')
+testsprite result get "$RESULT_ID"
+```
 
 The text output of `result list` and `result get` shows `QUEUED` while a result is waiting for dispatch. On the wire this is `testStatus: "RUNNING"` with `processStatus: "Idle"`, so `--status running` includes queued results.
 
@@ -1067,6 +1082,8 @@ In a GitHub pull request, pass both `--env` and `--target-url` to run in a tempo
 
 > To block merges on the gate, make the `testsprite-tests` check a required status check in your branch protection. The job is named `testsprite-tests` rather than `test` or `e2e` because GitHub matches required status checks by job name alone, across every workflow in the repository, so the name must not collide with a job you already have.
 
+**GitHub merge queues.** The generated workflow handles pull requests or deployment events. It doesn't run on `merge_group`. If `testsprite-tests` is a required check on a branch that uses a merge queue, GitHub never receives it for the merge-group commit, and the pull request is removed from the queue when the queue's status check timeout runs out. A required check reports there only if its workflow also has a `merge_group:` trigger. See [GitHub's merge-queue status check requirements](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#status-checks-with-github-actions-and-a-merge-queue).
+
 #### Checking that deployment events reach the repo
 
 A workflow triggered by deployments (`on: deployment_status`) only fires if the repo actually **receives** GitHub Deployment events — written by whatever deploys your app (Vercel's GitHub App writes them when the project is git-linked). When the platform is not linked, nothing is written and the gate stays silent, with no error anywhere. Set `GITHUB_REPOSITORY` to the repository in `owner/name` form and read its deployment history with an authenticated GitHub CLI.
@@ -1123,7 +1140,7 @@ Print a shell completion script (shell auto-detected from `$SHELL`), for example
 
 ### Profiles & credentials
 
-Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. A credentials file resaved as UTF-16 (Windows PowerShell 5.1 `>` / `Out-File`, or Notepad's "Unicode") is still read, and the next save writes it back as UTF-8. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
+Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. A credentials file resaved as UTF-16 (Windows PowerShell 5.1 `>` / `Out-File`, or Notepad's "Unicode") is still read, and the next save writes it back as UTF-8. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, `TESTSPRITE_API_KEY` and `TESTSPRITE_API_URL` override values from the file. To resolve the key and endpoint without reading the credentials file, set both variables, or set `TESTSPRITE_API_KEY` and pass `--endpoint-url`. In text output, `run` and `auth status` still look at the file for the skill-install warning; `TESTSPRITE_NO_SKILL_WARNING=1` or `--output json` skips that. With an API key alone, the CLI can still read the selected profile to resolve its endpoint.
 
 ### Global flags
 
@@ -1318,11 +1335,12 @@ Archive any requested reports with a step that also runs after failure (`if: alw
 Use `ci run` for one project's tests. A saved test list lets you gate a selected set of cases across several projects and pin each project's environment.
 
 ```bash
-testsprite run --testlist "$LIST_ID" --wait \
-  --report junit --report-file testsprite-junit.xml
+testsprite run --testlist "$LIST_ID" --wait --output json \
+  --report junit --report-file testsprite-junit.xml > testsprite-run.json &&
+  jq -e '.summary.total > 0 and .summary.skipped == 0' testsprite-run.json || exit $?
 ```
 
-A test list is the addressable unit for a mixed FE/BE, multi-project CI gate; each project runs against its configured environment. See [Test lists (`testlist`)](#test-lists-testlist).
+In 0.17, an empty saved list can exit successfully and produce a zero-test JUnit report. The JSON check makes the CI step fail when the list runs no tests or leaves any members undispatched. The trailing `|| exit $?` stops the step on a failed run or a failed check even when more commands follow. It requires `jq` on the runner. Each project runs against its configured environment. See [Test lists (`testlist`)](#test-lists-testlist).
 
 ### Gating on the outcome
 
