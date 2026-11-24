@@ -73,7 +73,7 @@ PROJECT_ID=your-project-id
 testsprite project env create "$PROJECT_ID" --name staging --url https://staging.example.com
 ```
 
-**Get your first test.** Ask the project's agent to propose coverage. If it asks a question in a text message, answer with `testsprite reply "your answer"`. Review the proposed steps in the terminal and apply the plan when they match what you want to verify. For a backend project, attach the API specification with `--file ./openapi.yaml`.
+**Get your first test.** Ask the project's agent to propose coverage. If it asks a question in a text message, answer with `testsprite reply "your answer"`. For a question card, submit all the numbered answers together with `testsprite apply --answer 1=b --answer 2=a,c`. Review the proposed steps in the terminal and apply the plan when they match what you want to verify. For a backend project, attach the API specification with `--file ./openapi.yaml`.
 
 ```bash
 testsprite plan "Verify that a guest can place an order with a test card" --project "$PROJECT_ID" --steps
