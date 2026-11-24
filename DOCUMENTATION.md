@@ -208,13 +208,7 @@ When the server supplies an environment summary, text detail shows `defaultEnv: 
 
 #### `testsprite test list [--project <id>]`
 
-<<<<<<< HEAD
-List the project's test cases as they are written. A nonblank `--project` takes precedence over `TESTSPRITE_PROJECT_ID`. If you omit the flag, the CLI uses `TESTSPRITE_PROJECT_ID`. With neither value set, the command exits 5 (or 3 when no API key is configured). Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
-||||||| 4a32c8c8
-List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
-=======
-List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest non-cancelled one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
->>>>>>> public/main
+List the project's test cases as they are written. A nonblank `--project` takes precedence over `TESTSPRITE_PROJECT_ID`. If you omit the flag, the CLI uses `TESTSPRITE_PROJECT_ID`. With neither value set, the command exits 5 (or 3 when no API key is configured). Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest non-cancelled one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
 
 ```bash
 testsprite test list --project "$PROJECT_ID" --output json
