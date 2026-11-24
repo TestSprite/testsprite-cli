@@ -159,7 +159,7 @@ Omitting `--target` installs for the agents the project shows it uses — the ca
 
 `setup`'s prompt is deliberately more forgiving than this one — it re-asks on an unrecognised name and takes `none` to skip. Neither command writes anything before its prompt, so the difference is not about what a refusal would leave behind: `setup` is the onboarding command, usually run once and often by an agent, where a re-run costs a whole round trip; `agent install` is a repair command already being run by hand, where re-running it is the obvious next thing to do. Both prompts accept a name in any case (`Cursor` and `cursor` are the same answer).
 
-`agent status` checks every installed skill file against the current CLI version and reports one of `ok`, `stale`, `modified`, `unmarked`, `absent`, or `corrupt` per target. It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
+`agent status` reports a row for each target and skill. It exits `0` when every row is `ok` or `absent`, including when no skills are installed. It exits `1` for any `stale`, `modified`, `unmarked`, or `corrupt` row. If CI requires a skill, check for an `ok` row for the intended target and skill in `--output json`. Use `--dir <path>` to inspect a different project root.
 
 The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
 
