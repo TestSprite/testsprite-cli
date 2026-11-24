@@ -1318,11 +1318,12 @@ Archive any requested reports with a step that also runs after failure (`if: alw
 Use `ci run` for one project's tests. A saved test list lets you gate a selected set of cases across several projects and pin each project's environment.
 
 ```bash
-testsprite run --testlist "$LIST_ID" --wait \
-  --report junit --report-file testsprite-junit.xml
+testsprite run --testlist "$LIST_ID" --wait --output json \
+  --report junit --report-file testsprite-junit.xml > testsprite-run.json &&
+  jq -e '.summary.total > 0 and .summary.skipped == 0' testsprite-run.json || exit $?
 ```
 
-A test list is the addressable unit for a mixed FE/BE, multi-project CI gate; each project runs against its configured environment. See [Test lists (`testlist`)](#test-lists-testlist).
+In 0.17, an empty saved list can exit successfully and produce a zero-test JUnit report. The JSON check makes the CI step fail when the list runs no tests or leaves any members undispatched. The trailing `|| exit $?` stops the step on a failed run or a failed check even when more commands follow. It requires `jq` on the runner. Each project runs against its configured environment. See [Test lists (`testlist`)](#test-lists-testlist).
 
 ### Gating on the outcome
 
