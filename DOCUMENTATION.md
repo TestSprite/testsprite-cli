@@ -58,6 +58,7 @@ After upgrading, run `testsprite agent status` in your repository. For each targ
 
 | In a 0.16 workflow                                                                                              | In 0.17                                                                                                                                  |
 | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `init`, `auth configure`, `auth whoami`, `auth logout`                                                          | `setup`, `setup`, `auth status`, `auth remove`, respectively.                                                                            |
 | Define, edit or delete a test with `test create`, `test update` or `test delete`                                | Describe the change with `plan`, review the proposal, then `apply`. Attach a spec with `--file` or code changes with `--diff`.           |
 | Set the app URL on `project create`                                                                             | Create the project, then add a named target with `project env create <id> --name staging --url <url>`.                                   |
 | `test run --all --project P`, `test run T`, `test rerun T`                                                      | `run --project P --wait` for a suite or `run T --wait` for a saved test.                                                                 |
@@ -136,7 +137,7 @@ testsprite run "$TEST_ID" --wait
 
 ## Agent onboarding (`agent install`)
 
-`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and how to read a result — no prompt engineering required. It's a pure-local command: no network, no credentials.
+`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and how to read a result — no prompt engineering required. It writes the skill files locally without requiring an API key. The CLI may still check the npm registry for updates, with or without a key, and it sends telemetry when a key is configured. For an offline install, set `TESTSPRITE_NO_UPDATE_NOTIFIER=1` and `TESTSPRITE_NO_TELEMETRY=1`.
 
 ```bash
 testsprite agent install claude     # install the skill for Claude Code
@@ -1075,6 +1076,8 @@ In a GitHub pull request, pass both `--env` and `--target-url` to run in a tempo
 
 > To block merges on the gate, make the `testsprite-tests` check a required status check in your branch protection. The job is named `testsprite-tests` rather than `test` or `e2e` because GitHub matches required status checks by job name alone, across every workflow in the repository, so the name must not collide with a job you already have.
 
+**GitHub merge queues.** The generated workflow handles pull requests or deployment events. It doesn't run on `merge_group`. If `testsprite-tests` is a required check on a branch that uses a merge queue, GitHub never receives it for the merge-group commit, and the pull request is removed from the queue when the queue's status check timeout runs out. A required check reports there only if its workflow also has a `merge_group:` trigger. See [GitHub's merge-queue status check requirements](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#status-checks-with-github-actions-and-a-merge-queue).
+
 #### Checking that deployment events reach the repo
 
 A workflow triggered by deployments (`on: deployment_status`) only fires if the repo actually **receives** GitHub Deployment events — written by whatever deploys your app (Vercel's GitHub App writes them when the project is git-linked). When the platform is not linked, nothing is written and the gate stays silent, with no error anywhere. Set `GITHUB_REPOSITORY` to the repository in `owner/name` form and read its deployment history with an authenticated GitHub CLI.
@@ -1131,7 +1134,7 @@ Print a shell completion script (shell auto-detected from `$SHELL`), for example
 
 ### Profiles & credentials
 
-Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. A credentials file resaved as UTF-16 (Windows PowerShell 5.1 `>` / `Out-File`, or Notepad's "Unicode") is still read, and the next save writes it back as UTF-8. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
+Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. A credentials file resaved as UTF-16 (Windows PowerShell 5.1 `>` / `Out-File`, or Notepad's "Unicode") is still read, and the next save writes it back as UTF-8. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, `TESTSPRITE_API_KEY` and `TESTSPRITE_API_URL` override values from the file. To resolve the key and endpoint without reading the credentials file, set both variables, or set `TESTSPRITE_API_KEY` and pass `--endpoint-url`. In text output, `run` and `auth status` still look at the file for the skill-install warning; `TESTSPRITE_NO_SKILL_WARNING=1` or `--output json` skips that. With an API key alone, the CLI can still read the selected profile to resolve its endpoint.
 
 ### Global flags
 
@@ -1326,11 +1329,12 @@ Archive any requested reports with a step that also runs after failure (`if: alw
 Use `ci run` for one project's tests. A saved test list lets you gate a selected set of cases across several projects and pin each project's environment.
 
 ```bash
-testsprite run --testlist "$LIST_ID" --wait \
-  --report junit --report-file testsprite-junit.xml
+testsprite run --testlist "$LIST_ID" --wait --output json \
+  --report junit --report-file testsprite-junit.xml > testsprite-run.json &&
+  jq -e '.summary.total > 0 and .summary.skipped == 0' testsprite-run.json || exit $?
 ```
 
-A test list is the addressable unit for a mixed FE/BE, multi-project CI gate; each project runs against its configured environment. See [Test lists (`testlist`)](#test-lists-testlist).
+In 0.17, an empty saved list can exit successfully and produce a zero-test JUnit report. The JSON check makes the CI step fail when the list runs no tests or leaves any members undispatched. The trailing `|| exit $?` stops the step on a failed run or a failed check even when more commands follow. It requires `jq` on the runner. Each project runs against its configured environment. See [Test lists (`testlist`)](#test-lists-testlist).
 
 ### Gating on the outcome
 
