@@ -1123,7 +1123,7 @@ Print a shell completion script (shell auto-detected from `$SHELL`), for example
 
 ### Profiles & credentials
 
-Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. A credentials file resaved as UTF-16 (Windows PowerShell 5.1 `>` / `Out-File`, or Notepad's "Unicode") is still read, and the next save writes it back as UTF-8. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, `TESTSPRITE_API_KEY` and `TESTSPRITE_API_URL` override values from the file. To run without reading the credentials file, set both variables, or set `TESTSPRITE_API_KEY` and pass `--endpoint-url`. With an API key alone, the CLI can still read the selected profile to resolve its endpoint.
+Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. A credentials file resaved as UTF-16 (Windows PowerShell 5.1 `>` / `Out-File`, or Notepad's "Unicode") is still read, and the next save writes it back as UTF-8. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, `TESTSPRITE_API_KEY` and `TESTSPRITE_API_URL` override values from the file. To resolve the key and endpoint without reading the credentials file, set both variables, or set `TESTSPRITE_API_KEY` and pass `--endpoint-url`. In text output, `run` and `auth status` still look at the file for the skill-install warning; `TESTSPRITE_NO_SKILL_WARNING=1` or `--output json` skips that. With an API key alone, the CLI can still read the selected profile to resolve its endpoint.
 
 ### Global flags
 
