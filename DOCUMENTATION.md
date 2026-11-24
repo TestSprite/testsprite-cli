@@ -207,7 +207,7 @@ When the server supplies an environment summary, text detail shows `defaultEnv: 
 
 #### `testsprite test list --project <id>`
 
-List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
+List the project's test cases as they are written. `--project` is required. Cursor-paginated. Each row is the case alone: `id`, `slug`, `title`, `type`, `category`, `priority`, `version` and `stepCount`; a result is never part of it (`testsprite result list --test <test-id> --limit 1` reads the latest non-cancelled one). Text output has the ID / SLUG / TITLE / TYPE / CATEGORY / PRIORITY / VERSION / STEPS / UPDATED columns.
 
 ```bash
 testsprite test list --project "$PROJECT_ID" --output json
@@ -250,10 +250,11 @@ testsprite result list --test "$TEST_ID" --env staging --dry-run
 
 Exactly one of `--run` / `--test` is required, and `--env` or `--limit` with `--run` is exit 5. Text prints one line per result (`CREATED  STATUS  RESULT ID  RUN ID  ENV  TITLE`), or `No results.`; with `--test`, a stderr note says how many older results your plan's history window hides. The `--run` response includes a `run` object with the execution status. Both queries return `results[]` with `resultId`, `runId`, `caseKey`, `title`, `testStatus` and timestamps. A test history can also include `hiddenRunCount` and `retentionDays`; `testStatus` is upper case. `title` is the title the test had when that result ran. Exit `0` whatever the verdicts; `4` when the run or test is not found.
 
-`--limit 1` returns the latest result among the selected statuses. The default omits cancelled results, so it can return an older result after a cancellation. To include every supported status, then read the returned result ID:
+`--limit 1` returns the latest result among the selected statuses. The default omits cancelled results, so it can return an older result after a cancellation. To include every supported status and read the result it returns:
 
 ```bash
-testsprite result list --test "$TEST_ID" --limit 1 --status passed,failed,running,blocked,cancelled
+RESULT_ID=$(testsprite result list --test "$TEST_ID" --limit 1 \
+  --status passed,failed,running,blocked,cancelled --output json | jq -r '.results[0].resultId')
 testsprite result get "$RESULT_ID"
 ```
 
