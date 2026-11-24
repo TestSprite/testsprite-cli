@@ -67,7 +67,7 @@ Writing tests now goes through the project's agent: `plan` asks it for tests and
   | `test list --status`, `--env`, `--created-from`                                                            | nothing on `test list`: a case carries no result; `result list --test <test-id> --limit 1` reads the latest one |
   | `test run --all --status`                                                                                  | `run <id…>` with the `caseKey` of each result `result list --run <run-id> --status failed,blocked` lists        |
   | `ci doctor`, `ci connect`                                                                                  | none; read deployment history with `gh api repos/<owner>/<repo>/deployments` and link the platform with its CLI |
-  | `init`, `auth configure`, `auth whoami`, `auth logout`                                                     | `setup`, `setup`, `auth status`, `auth remove`                                                                  |
+  | `init`, `auth configure`, `auth whoami`, `auth logout` (hidden aliases)                                    | `setup`, `setup`, `auth status`, `auth remove`                                                                  |
 
   The first-project hints after `setup`, `project create`, an empty `test list` and an empty `run --project <project-id>` now point at `testsprite plan`, then `testsprite apply`. The `schemas/plan.schema.json` plan-file schema is no longer shipped. `auth status` and `doctor` no longer print the routing advisory (its one open gap was `test rerun`).
 
