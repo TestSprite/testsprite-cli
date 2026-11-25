@@ -170,14 +170,9 @@ deployments are filtered out by the `if:`).
   URL) — which in a pull request is the preview, because `ci run --env X --target-url U`
   runs in a `github-pr-<N>` clone of X at U. Outside a pull request they use the environment's
   own URL (`--env`'s, or the default's). A hard-coded URL is left as is and always tests that address.
-- Testing `ci run` locally: a shell that exports `TESTSPRITE_API_URL` or
-  `TESTSPRITE_API_KEY` overrides the saved endpoint or key for the selected profile.
-  If the CLI reports `fetch failed` against a healthy API, check whether those
-  overrides are set without printing their values.
-
-  ```bash
-  node -e 'for (const name of ["TESTSPRITE_API_URL","TESTSPRITE_API_KEY"]) console.log(name + ": " + (process.env[name]?.trim() ? "set" : "unset"))'
-  ```
+- Testing `ci run` locally: a shell that exports `TESTSPRITE_API_KEY` overrides the
+  key `--profile` selects — an unexpected auth failure is usually that. Check
+  which are set first, without printing the key: `env | grep -o '^TESTSPRITE_[A-Z_]*'`.
 
 ## Don'ts
 
