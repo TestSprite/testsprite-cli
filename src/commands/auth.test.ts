@@ -1016,8 +1016,8 @@ describe('runConfigure', () => {
     const msg = (error as CLIError).message;
     // Must contain the endpoint so the user knows which host rejected the key.
     expect(msg).toContain('https://api.testsprite.com');
-    // Must contain the TESTSPRITE_API_URL hint.
-    expect(msg).toContain('TESTSPRITE_API_URL');
+    // The endpoint override is for internal use; the message does not name it.
+    expect(msg).not.toContain('TESTSPRITE_API_URL');
   });
 
   it('treats an empty / whitespace TESTSPRITE_API_URL as unset (falls through to profile, never "")', async () => {

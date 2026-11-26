@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { Command, CommanderError } from 'commander';
+import { Command, CommanderError, Option } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
 import { createCiCommand } from './commands/ci.js';
@@ -74,7 +74,9 @@ program
   .version(VERSION)
   .option('--output <mode>', 'Output format (json|text)', 'text')
   .option('--profile <name>', 'Configuration profile to use')
-  .option('--endpoint-url <url>', 'API base URL (a full http(s) URL)')
+  // For TestSprite's own use (pointing the CLI at a non-production API): it
+  // works, and no help page, completion script or "did you mean" names it.
+  .addOption(new Option('--endpoint-url <url>', 'API base URL (a full http(s) URL)').hideHelp())
   .option(
     '--verbose',
     'Log HTTP retry / backoff / polling transitions to stderr (lighter than --debug)',
@@ -163,6 +165,7 @@ function buildCompletionSpec(): CompletionSpec {
     if (subs.length > 0) subcommands[command.name()] = subs;
   }
   const flags = program.options
+    .filter(option => !option.hidden)
     .map(option => option.long)
     .filter((long): long is string => typeof long === 'string');
   if (!flags.includes('--help')) flags.push('--help');
@@ -195,7 +198,7 @@ let telemetryEmit = false;
 let telemetryAuth: ResolvedTelemetryAuth | undefined;
 
 // Local project admission failures must exit without any TestSprite HTTP,
-// including telemetry. Track companion flags even when --local is missing.
+// including telemetry.
 let telemetryLocalProject = false;
 
 // Propagate exitOverride AND the buffered outputError config to every
@@ -285,8 +288,8 @@ program.addHelpText(
   'after',
   '\nEnvironment:\n' +
     '  TESTSPRITE_API_KEY (overrides stored credentials), TESTSPRITE_NO_UPDATE_NOTIFIER (disables\n' +
-    '  the version check); TESTSPRITE_API_URL, TESTSPRITE_PROFILE and TESTSPRITE_REQUEST_TIMEOUT_MS\n' +
-    '  (milliseconds) mirror --endpoint-url, --profile and --request-timeout.',
+    '  the version check); TESTSPRITE_PROFILE and TESTSPRITE_REQUEST_TIMEOUT_MS (milliseconds)\n' +
+    '  mirror --profile and --request-timeout.',
 );
 
 program.addHelpText('beforeAll', () => {
@@ -348,7 +351,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     local?: string;
     localHost?: string;
   };
-  // Preserve explicit --local attempts, including refusals and borrowed tunnels;
+  // Preserve explicit --local attempts (project env create), including refusals;
   // only flag presence is recorded. Automatic tunnel paths record the same fact.
   if (globals.local !== undefined) recordTelemetryExtras({ local: true });
   telemetryLocalProject =

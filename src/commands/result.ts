@@ -1,5 +1,10 @@
 import { Command } from 'commander';
-import { makeHttpClient, resolveCommonOptions, type CommonOptions } from '../lib/client-factory.js';
+import {
+  makeHttpClient,
+  resolveCommonOptions,
+  resolveRequestTimeoutMs,
+  type CommonOptions,
+} from '../lib/client-factory.js';
 import { assertOutDirParentExists, resolveOutDir } from '../lib/download.js';
 import { ApiError, localValidationError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
@@ -193,6 +198,7 @@ async function runResultGet(
     warn: stderrOf(deps),
     failedOnly: flags.failedOnly,
     fetchImpl: deps.fetchImpl,
+    stallTimeoutMs: resolveRequestTimeoutMs(opts, deps.env ?? process.env),
   });
   output.print(evidence, data => renderEvidence(data as WrittenEvidence));
   // With no step at all there is nothing to say "every step" of.

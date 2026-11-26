@@ -44,12 +44,18 @@ function writeState(root: string, state: FolderState): void {
   writeFileSync(join(dir, STATE_FILE), `${JSON.stringify(state, null, 2)}\n`);
 }
 
+/** The project a command works on, and whether it came from this folder's state rather than the caller. */
+export interface ResolvedProject {
+  projectId: string;
+  /** Neither `--project` nor `TESTSPRITE_PROJECT_ID` named it: it is the one last worked on here. */
+  remembered: boolean;
+}
+
 /** `--project`, else `TESTSPRITE_PROJECT_ID`, else the project last worked on in this folder. */
-export function resolveProjectId(flag: string | undefined, deps: ContextDeps): string {
-  const projectId =
-    flag?.trim() ||
-    (deps.env ?? process.env).TESTSPRITE_PROJECT_ID?.trim() ||
-    readState(deps.root).projectId;
+export function resolveProject(flag: string | undefined, deps: ContextDeps): ResolvedProject {
+  const given = flag?.trim() || (deps.env ?? process.env).TESTSPRITE_PROJECT_ID?.trim();
+  if (given) return { projectId: given, remembered: false };
+  const projectId = readState(deps.root).projectId;
   if (!projectId) {
     throw new CLIError(
       'No project. Pass --project <id> (see `testsprite project list`) or set TESTSPRITE_PROJECT_ID; ' +
@@ -58,7 +64,19 @@ export function resolveProjectId(flag: string | undefined, deps: ContextDeps): s
       'VALIDATION_ERROR',
     );
   }
-  return projectId;
+  return { projectId, remembered: true };
+}
+
+/** `--project`, else `TESTSPRITE_PROJECT_ID`, else the project last worked on in this folder. */
+export function resolveProjectId(flag: string | undefined, deps: ContextDeps): string {
+  return resolveProject(flag, deps).projectId;
+}
+
+/** Make a project the one this folder works on, as `project create` does for the project it makes. */
+export function rememberProject(root: string, projectId: string): void {
+  const state = readState(root);
+  if (state.projectId === projectId) return;
+  writeState(root, { ...state, projectId });
 }
 
 /** Remember the project and its conversation for the next command run in this folder. */

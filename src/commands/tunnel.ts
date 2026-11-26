@@ -1,11 +1,11 @@
 /**
  * `testsprite tunnel start | list | status | stop`.
  *
- * The out-of-band primitive under `run --local`, which is sugar over it.
- * Two things it buys that the sugar cannot:
+ * The out-of-band primitive under a run on a local environment, which opens
+ * its own tunnel otherwise. Two things it buys that the automatic one cannot:
  *
  *   - **One tunnel, many runs.** `tunnel start` in one terminal, then
- *     `run <id> --local <port> --tunnel-client <id>` as many times as you
+ *     `run <id> --env <name> --tunnel-client <id>` as many times as you
  *     like in another. Each run would otherwise mint and tear down its own
  *     credential, and the per-principal live-binding cap is small.
  *   - **A place to look when a run says the tunnel is down.** `tunnel status`
@@ -740,7 +740,6 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
         '\nExamples:\n' +
         '  testsprite tunnel start    # hold a tunnel open (Ctrl-C to stop)\n' +
         '  testsprite run <test-id> --env <name> --tunnel-client <client-id>\n' +
-        '  testsprite run <test-id> --local 3000 --tunnel-client <client-id>\n' +
         '  testsprite tunnel stop --all --confirm\n',
     );
 

@@ -24,13 +24,7 @@ import { launchIds } from './run-render.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
 import { buildRunOutput, listResultReceipt, renderRunResults } from './run-output.js';
 import { ApiError, InterruptError, RequestTimeoutError, localValidationError } from './errors.js';
-import {
-  buildLocalTargetUrl,
-  DEFAULT_LOCAL_HOST,
-  parseLoopbackTargetUrl,
-  type LoopbackHost,
-  type StoredLocalTarget,
-} from './local-target.js';
+import { parseLoopbackTargetUrl, type StoredLocalTarget } from './local-target.js';
 import { terminalSafeLine, terminalSafeWriter } from './terminal-text.js';
 
 export interface RunTargetTest {
@@ -47,6 +41,8 @@ export interface ResolvedRunTarget extends StoredLocalTarget {
   targetUrl: string;
   automatic: boolean;
   environmentName?: string;
+  /** Whether that environment is the project's default, when the server says. */
+  environmentIsDefault?: boolean;
 }
 
 export const ENVIRONMENT_PREFLIGHT_TIMEOUT_MS = 5_000;
@@ -89,13 +85,13 @@ export function assertNoTunnelOptions(args: {
   if (args.tunnelClientId !== undefined)
     throw localValidationError(
       'tunnel-client',
-      '--tunnel-client only applies with --local (it attaches the run to an already-running ' +
-        'tunnel). Add --local <port>, or remove --tunnel-client',
+      '--tunnel-client only applies to a run on a local environment (it attaches the run to an ' +
+        'already-running tunnel). Run on one with --env <name>, or remove --tunnel-client',
     );
   if (args.cancelOnInterrupt === false)
     throw localValidationError(
       'cancel-on-interrupt',
-      '--no-cancel-on-interrupt only applies with --local. An ordinary run is never ' +
+      '--no-cancel-on-interrupt only applies to a run on a local environment. An ordinary run is never ' +
         'cancelled when this command stops waiting — Ctrl-C detaches, and `testsprite test ' +
         'cancel <run-id>` is the way to stop one',
     );
@@ -113,8 +109,6 @@ export async function resolveEnvironmentRunTarget(args: {
   dryRun?: boolean;
   projectId?: string;
   environment?: string;
-  localPort?: number;
-  localHost?: LoopbackHost;
   targetUrl?: string;
   tunnelClientId?: string;
   noWait?: boolean;
@@ -122,10 +116,9 @@ export async function resolveEnvironmentRunTarget(args: {
   stderr: (line: string) => void;
   cache?: Map<string, Environment[] | undefined>;
 }): Promise<ResolvedRunTarget | undefined> {
-  const explicitUrl =
-    args.targetUrl === undefined ? undefined : parseLoopbackTargetUrl(args.targetUrl);
-  const explicit = args.localPort !== undefined || explicitUrl !== undefined;
-  if (args.targetUrl !== undefined && !explicitUrl) return undefined;
+  // A run aimed at an address of its own (a pull request preview) leaves the
+  // environment's address, and its tunnel, alone.
+  if (args.targetUrl !== undefined) return undefined;
   let test = args.knownTest;
   if (!test && args.testId && !args.skipTestLookup) {
     try {
@@ -135,35 +128,10 @@ export async function resolveEnvironmentRunTarget(args: {
       );
     } catch (err) {
       if (err instanceof InterruptError) throw err;
-      if (explicit) {
-        if (
-          err instanceof ApiError &&
-          (err.httpStatus === 403 || err.httpStatus === 404 || err.code === 'UNAVAILABLE')
-        ) {
-          throw new ApiError(
-            {
-              code: err.code,
-              message: `Cannot read test ${args.testId} for --local preflight.`,
-              nextAction: 'Check the test ID and read:tests permission, then retry.',
-              requestId: err.requestId,
-              details: {},
-            },
-            err.httpStatus,
-          );
-        }
-        throw err;
-      }
       return undefined;
     }
   }
-  if (test?.type === 'backend' && !args.includeBackend) {
-    if (explicit)
-      throw localValidationError(
-        'local',
-        `backend tests don't open a browser; the tunnel is not used. Run: testsprite run ${args.testId}`,
-      );
-    return undefined;
-  }
+  if (test?.type === 'backend' && !args.includeBackend) return undefined;
   const projectId = test?.projectId ?? args.projectId;
   let environments: Environment[] | undefined;
   if (projectId) {
@@ -190,14 +158,6 @@ export async function resolveEnvironmentRunTarget(args: {
     args.environment === undefined
       ? (environments?.find(row => row.isDefault) ?? environments?.find(row => !row.isTemporary))
       : environments?.find(row => row.name === args.environment);
-  if (explicit && args.environment !== undefined && environments && !selected) {
-    const available = environments.map(row => row.name).sort();
-    throw localValidationError(
-      'env',
-      `unknown environment '${args.environment}'; use one of: ${available.join(', ')}`,
-      available,
-    );
-  }
   const localOf = (row: Environment | undefined): StoredLocalTarget | undefined => {
     if (!row || typeof row.url !== 'string') return undefined;
     try {
@@ -214,33 +174,6 @@ export async function resolveEnvironmentRunTarget(args: {
     if (!announced.has(key)) args.stderr(line);
     announced.add(key);
   };
-  const explicitTarget = (target: ResolvedRunTarget): ResolvedRunTarget => {
-    if (args.environment !== undefined && selected && !localOf(selected))
-      announce(
-        `sign-in:${projectId}:${selected.name}:${target.targetUrl}`,
-        `Using environment "${terminalSafeLine(selected.name)}" sign-in against ${terminalSafeLine(target.targetUrl)} through a tunnel.`,
-      );
-    return target;
-  };
-  if (explicitUrl)
-    return explicitTarget({ ...explicitUrl, targetUrl: args.targetUrl!, automatic: false });
-  if (args.localPort !== undefined) {
-    const selectedHost = localOf(selected)?.host;
-    const matching =
-      environments?.filter(row => !row.isTemporary && localOf(row)?.port === args.localPort) ?? [];
-    const hosts = new Set(matching.map(row => localOf(row)!.host));
-    const host =
-      args.localHost ??
-      selectedHost ??
-      (hosts.size === 1 ? [...hosts][0] : undefined) ??
-      (environments === undefined ? '127.0.0.1' : DEFAULT_LOCAL_HOST);
-    return explicitTarget({
-      host,
-      port: args.localPort,
-      targetUrl: buildLocalTargetUrl(host, args.localPort),
-      automatic: false,
-    });
-  }
   const local = localOf(selected);
   if (!local) return undefined;
   if (args.noWait) {
@@ -264,6 +197,7 @@ export async function resolveEnvironmentRunTarget(args: {
     targetUrl: selected!.url,
     automatic: args.tunnelClientId === undefined,
     environmentName: selected!.name,
+    ...(selected!.isDefault !== undefined ? { environmentIsDefault: selected!.isDefault } : {}),
   };
 }
 

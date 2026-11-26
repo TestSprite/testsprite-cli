@@ -100,8 +100,8 @@ describe('validation errors and telemetry through the CLI entry', { timeout: 20_
     }
   });
 
-  it('preserves telemetry for existing test-run local validation errors', () => {
-    const result = run(['--local', '0'], ['run', 'test_1']);
+  it('preserves telemetry for existing test-run validation errors', () => {
+    const result = run(['--tunnel-client', 'borrowed', '--no-wait'], ['run', 'test_1']);
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(5);
     expect(result.stderr.match(/HTTP: .*/g)).toEqual([

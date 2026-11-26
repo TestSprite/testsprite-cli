@@ -63,12 +63,13 @@ testsprite project env create <projectId> --name default --url <app-url> \
 Local frontend (start the app first):
 
 ```bash
-testsprite project env create <projectId> --name local --local <port>
+testsprite project env create <projectId> --name local --url http://localhost:<port>
 ```
 
-`--local` stores `http://localhost:<port>`; `--url http://127.0.0.1:<port>` or
-`http://[::1]:<port>` keeps another loopback host. Reuse that host on runs with
-`--local-host`; omit it for `localhost`. Dead port: exit 5 (`--skip-preflight` bypasses).
+`--url` also takes `http://127.0.0.1:<port>` or `http://[::1]:<port>`, and the app's
+entry path may follow (`--url http://localhost:<port>/app`); `--local <port>` is shorthand
+for `--url http://localhost:<port>`. Dead port: exit 5 (`--skip-preflight` bypasses).
+A backend project can't be local: its environment must point at a publicly deployed API.
 Local runs work on Free and need `run:tunnel` (mint a new key if missing).
 
 With a frontend test account, the cloud agent logs in through the tunnel using the
@@ -98,8 +99,9 @@ testsprite plan "Seed a first suite: <the 4–8 flows from step 1>" --project <p
   [--file ./openapi.yaml] [--file ./prd.md] [--diff] --output json
 ```
 
-- Frontend: the agent explores the deployed app in a real browser. A local project's app
-  can't be opened from the cloud: attach your change (`--diff`) and the agent works from it.
+- Frontend: the agent explores the app in a real browser. An app on this machine is reached
+  through a tunnel: when the agent asks for one, run `testsprite tunnel start` in another
+  terminal and `testsprite reply "The tunnel is running."`.
 - `"state": "replied"` → read `reply`; answer from the code what you can with
   `testsprite reply "..."`, ask the user only what only they know.
 - Exit 7: still working; `testsprite status --wait` follows it.
@@ -129,15 +131,15 @@ and run only those:
 
 ```bash
 testsprite run <test-id> --wait                     # deployed target
-testsprite run <test-id> --local <port> --local-host <host>  # local frontend
+testsprite run <test-id> --env local                # local frontend
 ```
 
 Do **not** run the whole suite automatically. Frontend runs, including local runs,
 cost 0.5 credit each; check `testsprite usage` before sizing the suite.
-Local runs wait (1200 s each). Put several in ONE `run <id> <id> --local <port>`
+Local runs wait (1200 s each). Put several in ONE `run <id> <id> --env local`
 (one tunnel, 5 at a time; each process holds 1 of 5 tunnel slots). Keep the stderr
 `Run <run-id>` receipt. An owned local timeout cancels by default: start a new run with
-`--local <port> --local-host <host> --timeout 1800` (same host), not `run wait`. For a frontend test cancelled before a terminal verdict the server attempts a refund; read the reported `refund`.
+`--env local --timeout 1800`, not `run wait`. For a frontend test cancelled before a terminal verdict the server attempts a refund; read the reported `refund`.
 
 ### 5. Report
 
@@ -147,12 +149,12 @@ Tell the user, plainly:
 - "I smoke-ran **M** — here's the result: <pass/fail + the dashboard link from the run output>."
 - "To run the rest (≈X credits, so they choose knowingly):
   - frontend — use `run <test-id> --wait` for deployed targets or
-    `run --project <id> --local <port> --local-host <host>` for local targets;
+    `run --project <id> --env local` for local targets;
   - backend — `testsprite run --project <id>` (wave-ordered, runs every BE test)."
 
 ## Quality checklist (self-check before reporting done)
 
-- [ ] FE project has a public `--url` or uses `--local`; login configured if needed.
+- [ ] FE project has a public or local (`http://localhost:<port>`) `--url`; login configured if needed.
 - [ ] API project: the API spec attached to the request (a PRD is optional, alongside it).
 - [ ] You **read the plan** and rejected or excluded the tests that don't fit,
       rather than applying it unseen.
@@ -166,7 +168,7 @@ Tell the user, plainly:
 - Don't auto-run the full suite (credit wall / surprise 402).
 - Don't apply narrative assertions an AI judge can't fail.
 - Don't call backend endpoints directly — only the `testsprite` CLI.
-- Don't create a FE project without public `--url` or `--local <port>`.
+- Don't create a FE project without a public or local (`http://localhost:<port>`) `--url`.
 - Don't apply a plan unread — reviewing it is the point of the proposal.
 - Don't write or edit tests yourself — ask the agent (`reply`, `reject`, or a new `plan`).
 

@@ -611,7 +611,8 @@ describe('HttpClient — 200 response with a non-JSON body', () => {
     expect(apiErr.exitCode).toBe(1);
     expect(apiErr.requestId).toMatch(/^cli_/);
     expect(apiErr.message).toContain('non-JSON response');
-    expect(apiErr.nextAction).toContain('TESTSPRITE_API_URL');
+    expect(apiErr.nextAction).toContain('HTTPS_PROXY');
+    expect(apiErr.nextAction).not.toContain('TESTSPRITE_API_URL');
     expect(apiErr.details).toMatchObject({ httpStatus: 200, contentType: 'text/html' });
     expect(String(apiErr.details.parseError)).toContain('JSON');
   });

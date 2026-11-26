@@ -115,8 +115,7 @@ gh secret set TESTSPRITE_API_KEY        # paste when prompted, or pipe on stdin
 ```
 
 (`ci init github --set-secret` does the same.) Never put the key in argv, YAML or
-logs. A non-production endpoint goes in the workflow `env:` as `TESTSPRITE_API_URL`.
-B also needs the platform's deploy token as a secret.
+logs. B also needs the platform's deploy token as a secret.
 
 ## 5. Preflight, then prove it on one real pull request
 

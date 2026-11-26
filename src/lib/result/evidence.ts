@@ -127,6 +127,7 @@ interface DownloadDeps {
   fetchImpl: FetchImpl;
   signal: AbortSignal;
   sleep?: (ms: number) => Promise<void>;
+  stallTimeoutMs?: number;
 }
 
 /**
@@ -153,6 +154,8 @@ export async function writeEvidence(
     fetchImpl?: FetchImpl;
     signal?: AbortSignal;
     sleep?: (ms: number) => Promise<void>;
+    /** How long one file may go without data before it is given up on. */
+    stallTimeoutMs?: number;
   },
 ): Promise<WrittenEvidence> {
   const { dir } = opts;
@@ -161,6 +164,7 @@ export async function writeEvidence(
     fetchImpl: opts.fetchImpl ?? globalThis.fetch.bind(globalThis),
     signal: opts.signal ?? globalShutdown.signal,
     sleep: opts.sleep,
+    stallTimeoutMs: opts.stallTimeoutMs,
   };
   // Critical work: a first Ctrl-C aborts the downloads and waits for the
   // staging directory to go, rather than exiting with it half written.
@@ -341,6 +345,7 @@ async function downloadOne(url: string, path: string, deps: DownloadDeps): Promi
     await streamUrlToFile(url, path, deps.fetchImpl, {
       sleep: deps.sleep,
       shutdownSignal: deps.signal,
+      stallTimeoutMs: deps.stallTimeoutMs,
     });
     return null;
   } catch (err) {

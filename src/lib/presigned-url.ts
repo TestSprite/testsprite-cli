@@ -30,8 +30,8 @@ export function assertSafePresignedUploadUrl(uploadUrl: string, facadeBaseUrl: s
         code: 'VALIDATION_ERROR',
         message: `Refusing the presigned upload URL the server returned: ${reason}.`,
         nextAction:
-          'No bytes were uploaded. This can indicate a misconfigured or intercepted API ' +
-          'endpoint — verify --endpoint-url / TESTSPRITE_API_URL and retry.',
+          'No bytes were uploaded. This can indicate an intercepted connection to the API — ' +
+          'check HTTPS_PROXY and your network, then retry.',
         requestId: 'local',
         details: { field: 'uploadUrl', reason: 'unsafe_presigned_url' },
       },

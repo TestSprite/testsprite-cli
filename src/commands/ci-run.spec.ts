@@ -398,9 +398,9 @@ globalThis.fetch = async (input, init = {}) => {
   });
 
   it('keeps the malformed loopback error and writes zero outputs', () => {
-    const result = run(['--target-url', 'http://localhost:3000/app']);
+    const result = run(['--target-url', 'http://localhost:3000/app?tab=1']);
     expect(result.status, result.stderr).toBe(5);
-    expect(result.stderr).toContain('no path');
+    expect(result.stderr).toContain('a query, fragment or credentials may not');
     expect(result.outputs).toBe(
       'previous=value\ntotal=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\nblocked=0\nfailedOnly=0\n',
     );
@@ -572,6 +572,69 @@ describe('ci run', () => {
       expect(h.calls.filter(c => c.method === 'POST')).toHaveLength(1);
     },
   );
+
+  // Outside a pull request the preview address is the run's own target. A held
+  // result joins only when its card names that target, or another target's
+  // verdict would stand in for this run's.
+  const heldAt = (target: string | null) =>
+    nativeHarness({
+      launch: projectRun({ runId: 'exec-1', projectId: 'project-1', held: [held] }),
+      runRead: () =>
+        new Response(
+          JSON.stringify(
+            resultCard({
+              ...held,
+              projectId: 'project-1',
+              targetUrl: target,
+              environment: { id: 'env-0', name: 'default' },
+            }),
+          ),
+        ),
+      listingRead: runId =>
+        runId === held.runId
+          ? new Response(
+              JSON.stringify(
+                runListing(
+                  {
+                    runId: held.runId,
+                    projectId: 'project-1',
+                    status: 'finished',
+                    cancelled: false,
+                  },
+                  [
+                    resultLine({
+                      runId: held.runId,
+                      resultId: held.resultId,
+                      caseKey: 'busy',
+                      title: 'Busy',
+                      testStatus: 'PASSED',
+                    }),
+                  ],
+                ),
+              ),
+            )
+          : undefined,
+    });
+
+  it.each(['https://other.example.com', null])(
+    'skips a held result whose target %s is not the --target-url',
+    async target => {
+      const h = heldAt(target);
+      await runCiRun({ ...h.opts, targetUrl: PREVIEW, skipPreflight: true }, h.deps);
+      expect(h.dispatches()[0]!.body).toMatchObject({ targetUrl: PREVIEW });
+      expect(h.summary()).toMatchObject({ total: 2, passed: 1, skipped: 1 });
+      expect(h.stderr.join('\n')).toContain('its run or target does not match');
+      expect(h.calls.some(c => c.path === '/results' && c.method === 'GET')).toBe(true);
+      expect(h.calls.filter(c => c.path === `/runs/${held.resultId}`)).toHaveLength(1);
+    },
+  );
+
+  it('joins a held result whose target is the --target-url', async () => {
+    const h = heldAt(PREVIEW);
+    await runCiRun({ ...h.opts, targetUrl: PREVIEW, skipPreflight: true }, h.deps);
+    expect(h.summary()).toMatchObject({ total: 2, passed: 2, skipped: 0 });
+    expect(h.stderr.join('\n')).toContain(`Joined run ${held.runId} for result ${held.resultId}.`);
+  });
 
   it.each(['empty project', 'all incompatible held'] as const)(
     '%s fails with 5 after publishing outputs, unless explicitly allowed',

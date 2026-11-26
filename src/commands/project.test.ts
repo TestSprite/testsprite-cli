@@ -1,7 +1,10 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Git } from '../lib/conversation/change.js';
+import { rememberConversation, resolveProject } from '../lib/conversation/context.js';
 import { ApiError } from '../lib/errors.js';
 import { terminalWidth } from '../lib/ticker.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
@@ -1024,6 +1027,67 @@ describe('runGet', () => {
 // ---------------------------------------------------------------------------
 // P6 — project create
 // ---------------------------------------------------------------------------
+
+describe("project create makes the new project this folder's", () => {
+  const noRepo: Git = () => ({ ok: false, stdout: '' });
+  const createdProject: CliProject = {
+    ...PROJECT_FIXTURE,
+    id: 'proj_new',
+    name: 'Shop',
+    createdFrom: 'cli',
+  };
+
+  async function create(cwd: string, globals: string[]): Promise<void> {
+    const { credentialsPath } = makeCreds();
+    const program = new Command()
+      .exitOverride()
+      .option('--output <mode>', '', 'text')
+      .option('--profile <name>')
+      .option('--dry-run');
+    program.addCommand(
+      createProjectCommand({
+        env: {},
+        credentialsPath,
+        cwd,
+        git: noRepo,
+        fetchImpl: makeFetch(() => ({ body: createdProject })),
+        stdout: () => {},
+        stderr: () => {},
+      }).exitOverride(),
+    );
+    await program.parseAsync([
+      'node',
+      'testsprite',
+      ...globals,
+      'project',
+      'create',
+      '--type',
+      'frontend',
+      '--name',
+      'Shop',
+    ]);
+  }
+
+  it.each([[[]], [['--output', 'json']]])(
+    'so the next plan without --project uses it, not the one used here before (%j)',
+    async globals => {
+      const cwd = mkdtempSync(join(tmpdir(), 'cli-project-folder-'));
+      rememberConversation(cwd, 'proj_old', 'c-old');
+      await create(cwd, globals);
+      expect(resolveProject(undefined, { root: cwd, env: {} })).toEqual({
+        projectId: 'proj_new',
+        remembered: true,
+      });
+    },
+  );
+
+  it('remembers nothing under --dry-run', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cli-project-folder-'));
+    await create(cwd, ['--dry-run']);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtempSync folder, never user input.
+    expect(existsSync(join(cwd, '.testsprite', 'agent.json'))).toBe(false);
+  });
+});
 
 describe('runCreate', () => {
   it('P6 FE happy — POSTs /projects with type=frontend + name + idempotency header', async () => {

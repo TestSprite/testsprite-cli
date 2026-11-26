@@ -630,9 +630,9 @@ describe('a command removed in 0.17.0, outside the read commands', () => {
   });
 });
 
-describe('an option removed in 0.17.0', () => {
+describe('a removed option', () => {
   const ENV_CREATE =
-    'set it on an environment: testsprite project env create <project-id> --name default --url <url> (or --local <port>), which takes the sign-in flags';
+    'set it on an environment: testsprite project env create <project-id> --name default --url <url>, which takes the sign-in flags';
   const ENV_UPDATE =
     'set it on an environment: testsprite project env update <project-id> <name> with the same flag';
 
@@ -685,6 +685,21 @@ describe('an option removed in 0.17.0', () => {
       ['test', 'list', '--project', 'p_1', '--status', 'failed'],
       '--status',
       '`test list --status` was removed in 0.17.0; a test case carries no result; read its results with testsprite result list --test <test-id> (--limit 1 for the latest)',
+    ],
+    [
+      ['run', 'test_1', '--local', '3000'],
+      '--local',
+      '`run --local` was removed in 0.18.0; the address lives on the environment: testsprite project env create <project-id> --name local --url http://localhost:<port>, then testsprite run <test-id...> --env local (no flag when it is the default) opens the tunnel',
+    ],
+    [
+      ['run', 'test_1', '--local-host', '127.0.0.1'],
+      '--local-host',
+      '`run --local-host` was removed in 0.18.0; the host lives on the environment: testsprite project env create <project-id> --name local --url http://127.0.0.1:<port> (or http://[::1]:<port>)',
+    ],
+    [
+      ['run', 'test_1', '--target-url', 'http://localhost:3000'],
+      '--target-url',
+      "`run --target-url` was removed in 0.18.0; a run's address is its environment's: testsprite project env create <project-id> --name <name> --url <url>, then testsprite run <test-id...> --env <name>; for a pull request preview, testsprite ci run --env <name> --target-url <url>",
     ],
   ])('%j exits 5 as an unknown option that says where it went', async (args, option, pointer) => {
     const printed = await cli(args);

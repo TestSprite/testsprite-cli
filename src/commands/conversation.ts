@@ -27,10 +27,12 @@ import {
   rememberCard,
   rememberConversation,
   resolveConversationId,
+  resolveProject,
   resolveProjectId,
   shownCard,
 } from '../lib/conversation/context.js';
 import { environmentNotes } from '../lib/conversation/environment.js';
+import { quoteEnvironmentName } from '../lib/environment-tunnel.js';
 import { followConversation, type FollowResult } from '../lib/conversation/follow.js';
 import { titleFrom } from '../lib/conversation/title.js';
 import {
@@ -378,15 +380,44 @@ function caller(env: NodeJS.ProcessEnv, interactive: boolean): Brief['caller'] {
   return detectCallerFromEnv(env).length > 0 || !interactive ? 'agent' : 'person';
 }
 
+/**
+ * Say which project a command took from this folder rather than from
+ * `--project`: the one last worked on here is easy to mistake for the one just
+ * meant. By name when the server gives it, unless `byName` is false for a
+ * command that must not wait on the lookup. Text mode only: a JSON caller reads
+ * the project id from the result.
+ */
+async function announceRemembered(ctx: Context, projectId: string, byName = true): Promise<void> {
+  if (ctx.opts.output === 'json') return;
+  let name: string | undefined;
+  if (byName && !ctx.opts.dryRun) {
+    try {
+      name = (await ctx.api.project(projectId)).name;
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+    }
+  }
+  const id = terminalSafeLine(projectId);
+  ctx.stderr(
+    `Project: ${name ? `${terminalSafeLine(name)} (${id})` : id}, the one last used in this folder; ` +
+      'pass --project for another.',
+  );
+}
+
 async function current(
   ctx: Context,
   flags: { project?: string; conversation?: string },
+  { announce }: { announce?: 'name' | 'id' } = {},
 ): Promise<{ projectId: string; id: string }> {
-  const projectId = resolveProjectId(flags.project, { env: ctx.deps.env, root: ctx.root });
+  const { projectId, remembered } = resolveProject(flags.project, {
+    env: ctx.deps.env,
+    root: ctx.root,
+  });
   const id = resolveConversationId(flags.conversation, projectId, {
     env: ctx.deps.env,
     root: ctx.root,
   });
+  if (remembered && announce) await announceRemembered(ctx, projectId, announce === 'name');
   return { projectId, id };
 }
 
@@ -533,10 +564,11 @@ export function createPlanCommand(deps: ConversationDeps = {}): Command {
     .action(async (words: string[], flags, command: Command) => {
       const ctx = context(command, deps);
       const deadlineMs = timeoutMs(ctx, flags);
-      const projectId = resolveProjectId(flags.project as string | undefined, {
+      const { projectId, remembered } = resolveProject(flags.project as string | undefined, {
         env: ctx.deps.env,
         root: ctx.root,
       });
+      if (remembered) await announceRemembered(ctx, projectId);
       const {
         attachments,
         brief,
@@ -600,7 +632,7 @@ export function createReplyCommand(deps: ConversationDeps = {}): Command {
     .action(async (words: string[], flags, command: Command) => {
       const ctx = context(command, deps);
       const deadlineMs = timeoutMs(ctx, flags);
-      const { projectId, id } = await current(ctx, flags);
+      const { projectId, id } = await current(ctx, flags, { announce: 'name' });
       const { attachments, notes } = readAttachments(
         ctx,
         (flags.file as string[] | undefined) ?? [],
@@ -718,7 +750,7 @@ export function createApplyCommand(deps: ConversationDeps = {}): Command {
       const ctx = context(command, deps);
       const deadlineMs = timeoutMs(ctx, flags);
       const startedAt = (deps.now ?? Date.now)();
-      const { projectId, id } = await current(ctx, flags);
+      const { projectId, id } = await current(ctx, flags, { announce: 'name' });
       const now = await ctx.api.get(projectId, id);
       // A card shown here that no longer waits goes to the server, which says how it was decided.
       const card = cardToDecide(ctx, now, flags.card as string | undefined);
@@ -731,6 +763,8 @@ export function createApplyCommand(deps: ConversationDeps = {}): Command {
       }
       const answers = answersOn(now, card, flags.answer as string[] | undefined);
       const environment = environmentOn(now, card, flags.env as string | undefined);
+      // Read before applying: the card is gone once it is decided.
+      const explored = now.proposal?.id === card ? now.proposal.plan?.environment : undefined;
       const secret = await secretFor(ctx, now, card, flags.secretStdin === true);
       const applied = await ctx.api.apply(projectId, id, {
         card,
@@ -772,10 +806,15 @@ export function createApplyCommand(deps: ConversationDeps = {}): Command {
       const saved = applied.tests ?? [];
       const run: NextStep[] = saved.length
         ? [
-            {
-              command: `testsprite run ${saved.join(' ')} --wait`,
-              why: 'run what it saved; add --local <port> for an app on this machine',
-            },
+            explored
+              ? {
+                  command: `testsprite run ${saved.join(' ')}${explored.isDefault ? '' : ` --env ${quoteEnvironmentName(explored.name)}`} --wait`,
+                  why: `run what it saved on ${terminalSafeLine(explored.name)}, where it explored them; a local environment opens its tunnel`,
+                }
+              : {
+                  command: `testsprite run ${saved.join(' ')} --wait`,
+                  why: 'run what it saved; a local environment opens its tunnel (--env <name> when it is not the default)',
+                },
           ]
         : [];
       await finishTurn(
@@ -950,7 +989,7 @@ export function createRejectCommand(deps: ConversationDeps = {}): Command {
     .action(async (words: string[], flags, command: Command) => {
       const ctx = context(command, deps);
       const deadlineMs = timeoutMs(ctx, flags);
-      const { projectId, id } = await current(ctx, flags);
+      const { projectId, id } = await current(ctx, flags, { announce: 'name' });
       const now = await ctx.api.get(projectId, id);
       const card = cardToDecide(ctx, now, flags.card as string | undefined);
       if (!card) {
@@ -972,7 +1011,7 @@ export function createStopCommand(deps: ConversationDeps = {}): Command {
   addTarget(cmd);
   return cmd.addHelpText('after', GLOBAL_OPTS_HINT).action(async (flags, command: Command) => {
     const ctx = context(command, deps);
-    const { projectId, id } = await current(ctx, flags);
+    const { projectId, id } = await current(ctx, flags, { announce: 'id' });
     const { stopped } = await ctx.api.stop(projectId, id);
     ctx.out.print({ stopped: id, ...(stopped === false ? { nothingToStop: true } : {}) }, () =>
       stopped === false
@@ -997,7 +1036,7 @@ export function createDiscardCommand(deps: ConversationDeps = {}): Command {
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (flags, command: Command) => {
       const ctx = context(command, deps);
-      const { projectId, id } = await current(ctx, flags);
+      const { projectId, id } = await current(ctx, flags, { announce: 'name' });
       const { released } = await ctx.api.discard(projectId, id);
       ctx.out.print({ discarded: id, released }, () =>
         released.length

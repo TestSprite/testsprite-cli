@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeProfile } from '../lib/credentials.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { Git } from '../lib/conversation/change.js';
+import { rememberConversation } from '../lib/conversation/context.js';
 import type { Conversation } from '../lib/conversation/types.js';
 import { resultLine } from '../../test/helpers/result-list.js';
 import { runListing } from '../../test/helpers/project-run.js';
@@ -197,6 +198,86 @@ describe('testsprite plan', () => {
   });
 });
 
+describe('a project taken from this folder', () => {
+  const NOTICE = 'the one last used in this folder; pass --project for another.';
+  const planRoutes = (extra: Record<string, (body: unknown) => unknown> = {}) => ({
+    'POST /projects/p1/conversations': () => ({ id: 'c1', url: 'https://portal/c1', model: 'm' }),
+    'POST /projects/p1/conversations/c1/messages': () => ({ seq: 1 }),
+    'GET /projects/p1/conversations/c1': () => conversation(),
+    ...extra,
+  });
+
+  beforeEach(() => rememberConversation(deps.cwd!, 'p1', 'c0'));
+
+  it('plan names it, by name when the server gives one', async () => {
+    const { fetchImpl } = backend(planRoutes({ 'GET /projects/p1': () => ({ name: 'Shop' }) }));
+    await run(['plan', 'x'], fetchImpl);
+    expect(stderr).toContain(`Project: Shop (p1), ${NOTICE}`);
+  });
+
+  it('plan names it by id when its name cannot be read', async () => {
+    const { fetchImpl } = backend(planRoutes());
+    await run(['plan', 'x'], fetchImpl);
+    expect(stderr).toContain(`Project: p1, ${NOTICE}`);
+  });
+
+  it('says nothing when --project or TESTSPRITE_PROJECT_ID names it, or under --output json', async () => {
+    const { calls, fetchImpl } = backend(
+      planRoutes({ 'GET /projects/p1': () => ({ name: 'Shop' }) }),
+    );
+    await run(['plan', 'x', '--project', 'p1'], fetchImpl);
+    deps.env = { TESTSPRITE_PROJECT_ID: 'p1' };
+    await run(['plan', 'x'], fetchImpl);
+    deps.env = {};
+    await run(['--output', 'json', 'plan', 'x'], fetchImpl);
+    expect(stderr.some(line => line.includes(NOTICE))).toBe(false);
+    expect(calls.some(c => c.path === '/projects/p1')).toBe(false);
+  });
+
+  it('apply names it before deciding the card; status, which only reads, does not', async () => {
+    let reads = 0;
+    const { fetchImpl } = backend({
+      'GET /projects/p1': () => ({ name: 'Shop' }),
+      'GET /projects/p1/conversations/c0': () =>
+        reads++ === 0 ? conversation({ state: 'proposed', proposal: PLAN }) : conversation(),
+      'POST /projects/p1/conversations/c0/apply': () => ({
+        applied: '1 new test',
+        ok: true,
+        saved: [],
+        failed: [],
+        tests: ['k11'],
+      }),
+    });
+    await run(['status'], fetchImpl);
+    expect(stderr.some(line => line.includes(NOTICE))).toBe(false);
+    await run(['apply'], fetchImpl);
+    expect(stderr).toContain(`Project: Shop (p1), ${NOTICE}`);
+  });
+
+  it('stop names it by id and sends the stop without waiting on a name lookup', async () => {
+    const { calls, fetchImpl } = backend({
+      'GET /projects/p1': () => ({ name: 'Shop' }),
+      'POST /projects/p1/conversations/c0/stop': () => ({ stopped: true }),
+    });
+    await run(['stop'], fetchImpl);
+    expect(stderr).toContain(`Project: p1, ${NOTICE}`);
+    expect(calls.map(c => `${c.method} ${c.path}`)).toEqual([
+      'POST /projects/p1/conversations/c0/stop',
+    ]);
+  });
+
+  it('keeps the notice on one line whatever the name holds', async () => {
+    const { fetchImpl } = backend(
+      planRoutes({ 'GET /projects/p1': () => ({ name: 'Shop\nsecond line' }) }),
+    );
+    await run(['plan', 'x'], fetchImpl);
+    const notice = stderr.filter(line => line.includes(NOTICE));
+    expect(notice).toHaveLength(1);
+    expect(notice[0]).toContain('(p1), the one last used in this folder');
+    expect(notice[0]).not.toContain('\n');
+  });
+});
+
 describe('testsprite apply', () => {
   it('applies only what is named, then follows the agent', async () => {
     let reads = 0;
@@ -222,6 +303,48 @@ describe('testsprite apply', () => {
     expect(stdout.join('\n')).toContain('The agent replied.');
     expect(stdout.join('\n')).toContain('testsprite run k11 --wait');
   });
+
+  it.each([
+    [
+      { id: 'env-2', name: 'local', isDefault: false },
+      "testsprite run k11 --env 'local' --wait",
+      'on local, where it explored them',
+    ],
+    [
+      { id: 'env-1', name: 'local', isDefault: true },
+      'testsprite run k11 --wait',
+      'on local, where it explored them',
+    ],
+    [undefined, 'testsprite run k11 --wait', '(--env <name> when it is not the default)'],
+  ])(
+    'runs what it saved on the environment the card says it was explored on (%o)',
+    async (environment, command, why) => {
+      let reads = 0;
+      const { fetchImpl } = backend({
+        'GET /projects/p1/conversations/c1': () =>
+          reads++ === 0
+            ? conversation({
+                state: 'proposed',
+                proposal: {
+                  ...PLAN!,
+                  plan: { ...PLAN!.plan!, ...(environment ? { environment } : {}) },
+                },
+              })
+            : conversation(),
+        'POST /projects/p1/conversations/c1/apply': () => ({
+          applied: '1 new test',
+          ok: true,
+          saved: [{ path: '/t.md', detail: 'created CHK-011' }],
+          failed: [],
+          tests: ['k11'],
+        }),
+      });
+      await run(['apply', '--project', 'p1', '--conversation', 'c1'], fetchImpl);
+      const out = stdout.join('\n');
+      expect(out).toContain(command);
+      expect(out).toContain(why);
+    },
+  );
 
   it('waits for a run it started, then hands the results to the agent', async () => {
     let reads = 0;

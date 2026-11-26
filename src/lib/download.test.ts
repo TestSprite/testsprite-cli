@@ -3,17 +3,22 @@
  * `--out` directory the user chose, and every file name composed under it.
  */
 
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { Readable, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   assertNoEscape,
   assertOutDirParentExists,
   pickVideoExtension,
+  refusedDownloadUrl,
   resolveOutDir,
+  stallClock,
   STREAM_URL_MAX_RETRIES,
+  stallTimedSink,
   streamUrlToFile,
 } from './download.js';
 import { ShutdownController } from './interrupt.js';
@@ -348,6 +353,259 @@ describe('streamUrlToFile retry', () => {
     ).rejects.toThrow();
     expect(sleepDelays).toHaveLength(STREAM_URL_MAX_RETRIES - 1);
     expect(sleepDelays.every(d => d > 0)).toBe(true);
+  });
+});
+
+describe('streamUrlToFile link check', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'stream-link-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['http://storage.example.com/a.png', 'only https'],
+    ['file:///etc/passwd', 'only https'],
+    ['not a url', 'not a URL'],
+    ['https://127.0.0.1/a.png', 'local or private address'],
+    ['https://[::1]/a.png', 'local or private address'],
+    ['https://localhost/a.png', 'local or private address'],
+    ['https://storage.localhost./a.png', 'local or private address'],
+    ['https://169.254.169.254/latest/meta-data/', 'local or private address'],
+    ['https://169.254.10.1/a.png', 'local or private address'],
+    ['https://10.0.0.5/a.png', 'local or private address'],
+    ['https://192.168.1.10/a.png', 'local or private address'],
+    ['https://[::ffff:10.0.0.5]/a.png', 'local or private address'],
+  ])('refuses %s before any request', async (url, why) => {
+    const fetchImpl = vi.fn();
+    const err = await streamUrlToFile(url, join(dir, 'out.bin'), fetchImpl as typeof fetch).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    expect((err as Error).message).toMatch(/^Refused to download /);
+    expect((err as Error).message).toContain(why);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path under this test's own mkdtempSync() directory, never user input
+    expect(existsSync(join(dir, 'out.bin'))).toBe(false);
+  });
+
+  it('keeps the signature out of the refusal', async () => {
+    const err = await streamUrlToFile(
+      'http://storage.example.com/a.png?X-Amz-Signature=secret',
+      join(dir, 'out.bin'),
+      vi.fn() as typeof fetch,
+    ).catch((e: unknown) => e);
+    expect(
+      JSON.stringify([(err as Error).message, (err as { details?: unknown }).details]),
+    ).not.toContain('secret');
+  });
+
+  it('never repeats a data: link, which is its own content', async () => {
+    const err = await streamUrlToFile(
+      'data:image/png;base64,SCREENSHOTBYTES',
+      join(dir, 'out.bin'),
+      vi.fn() as typeof fetch,
+    ).catch((e: unknown) => e);
+    expect((err as Error).message).toBe(
+      'Refused to download <data link>: only https links are downloaded.',
+    );
+    expect(JSON.stringify((err as { details?: unknown }).details)).not.toContain('SCREENSHOT');
+  });
+
+  it('judges the host as written: a name is downloaded without being resolved', () => {
+    expect(refusedDownloadUrl('https://bucket.s3.us-east-1.amazonaws.com/a.png?sig=1')).toBe(
+      undefined,
+    );
+    expect(refusedDownloadUrl('https://minio.corp.internal:9000/a.png')).toBe(undefined);
+    expect(refusedDownloadUrl('https://8.8.8.8/a.png')).toBe(undefined);
+  });
+});
+
+describe('streamUrlToFile stall timeout', () => {
+  const noSleep = () => Promise.resolve();
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'stream-stall-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A fetch that answers only when its signal aborts, as a silent server does. */
+  const silent = () =>
+    vi.fn(
+      (_url: Parameters<typeof fetch>[0], init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init!.signal!.addEventListener('abort', () => reject(new Error('aborted')), {
+            once: true,
+          });
+        }),
+    );
+
+  it('gives up on a link that never answers, without retrying it', async () => {
+    const fetchImpl = silent();
+    const err = await streamUrlToFile(
+      'https://storage.example.com/video.webm?X-Amz-Signature=secret',
+      join(dir, 'out.bin'),
+      fetchImpl as typeof fetch,
+      { sleep: noSleep, stallTimeoutMs: 20 },
+    ).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    expect((err as Error).message).toBe(
+      'Download of https://storage.example.com/video.webm stalled: no data for 0s.',
+    );
+    expect((err as { nextAction?: string }).nextAction).toContain('--request-timeout');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up on a body that stops arriving part-way', async () => {
+    const fetchImpl = vi.fn(async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('first chunk'));
+          init!.signal!.addEventListener('abort', () => controller.error(new Error('aborted')), {
+            once: true,
+          });
+        },
+      });
+      return new Response(body);
+    });
+    const err = await streamUrlToFile(
+      'https://storage.example.com/video.webm',
+      join(dir, 'out.bin'),
+      fetchImpl as typeof fetch,
+      { sleep: noSleep, stallTimeoutMs: 20 },
+    ).catch((e: unknown) => e);
+    expect((err as Error).message).toContain('stalled: no data for');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts the wait for the response and the wait for its first chunk separately', async () => {
+    // 200 ms to answer and 200 ms more to the first chunk: 400 ms in all,
+    // each wait inside the 300 ms limit.
+    const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    const fetchImpl = vi.fn(async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      await wait(200);
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // As fetch does: an aborted request fails its body.
+          init!.signal!.addEventListener('abort', () => controller.error(new Error('aborted')), {
+            once: true,
+          });
+        },
+        async pull(controller) {
+          if (sent) return controller.close();
+          await wait(200);
+          controller.enqueue(new TextEncoder().encode('late but alive'));
+          sent = true;
+        },
+      });
+      return new Response(body);
+    });
+    const dest = join(dir, 'out.bin');
+    await streamUrlToFile('https://storage.example.com/a.png', dest, fetchImpl as typeof fetch, {
+      sleep: noSleep,
+      stallTimeoutMs: 300,
+    });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path under this test's own mkdtempSync() directory, never user input
+    expect(readFileSync(dest, 'utf8')).toBe('late but alive');
+  });
+
+  it('gives up on a response without a stream whose bytes never arrive', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          body: null,
+          arrayBuffer: () => new Promise<ArrayBuffer>(() => undefined),
+        }) as unknown as Response,
+    );
+    const err = await streamUrlToFile(
+      'https://storage.example.com/a.png',
+      join(dir, 'out.bin'),
+      fetchImpl as typeof fetch,
+      { sleep: noSleep, stallTimeoutMs: 20 },
+    ).catch((e: unknown) => e);
+    expect((err as Error).message).toContain('stalled: no data for');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path under this test's own mkdtempSync() directory, never user input
+    expect(existsSync(join(dir, 'out.bin'))).toBe(false);
+  });
+
+  it('does not count the time a slow disk takes as time the link was silent', async () => {
+    // Every chunk is ready at once; the disk takes 80 ms over each, four
+    // times the 20 ms limit.
+    const written: string[] = [];
+    const slowDisk = new Writable({
+      write(chunk: Uint8Array, _encoding, callback) {
+        setTimeout(() => {
+          written.push(new TextDecoder().decode(chunk));
+          callback();
+        }, 80);
+      },
+    });
+    const clock = stallClock(20);
+    clock.arm();
+    await pipeline(
+      Readable.from(['a', 'b', 'c'].map(t => Buffer.from(t))),
+      stallTimedSink(slowDisk, clock),
+    );
+    expect(written).toEqual(['a', 'b', 'c']);
+    expect(clock.signal.aborted).toBe(false);
+  });
+
+  it('a disk that fails is that error, and nothing more is written to it', async () => {
+    const writes: string[] = [];
+    const fullDisk = new Writable({
+      write(chunk: Uint8Array, _encoding, callback) {
+        writes.push(new TextDecoder().decode(chunk));
+        callback(Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }));
+      },
+    });
+    const clock = stallClock(20);
+    clock.arm();
+    await expect(
+      pipeline(
+        Readable.from(['a', 'b', 'c'].map(t => Buffer.from(t))),
+        stallTimedSink(fullDisk, clock),
+      ),
+    ).rejects.toMatchObject({ code: 'ENOSPC' });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    expect(writes).toEqual(['a']);
+    expect(clock.signal.aborted).toBe(false);
+  });
+
+  it('does not cap a download that keeps arriving for longer than the timeout', async () => {
+    // Four chunks 150 ms apart take 450 ms in all, past the 300 ms stall limit.
+    const fetchImpl = vi.fn(async () => {
+      let sent = 0;
+      const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (sent > 0) await new Promise(resolve => setTimeout(resolve, 150));
+          controller.enqueue(new TextEncoder().encode(`chunk${sent};`));
+          if (++sent === 4) controller.close();
+        },
+      });
+      return new Response(body);
+    });
+    const dest = join(dir, 'out.bin');
+    const started = Date.now();
+    await streamUrlToFile(
+      'https://storage.example.com/video.webm',
+      dest,
+      fetchImpl as typeof fetch,
+      {
+        sleep: noSleep,
+        stallTimeoutMs: 300,
+      },
+    );
+    expect(Date.now() - started).toBeGreaterThan(300);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path under this test's own mkdtempSync() directory, never user input
+    expect(readFileSync(dest, 'utf8')).toBe('chunk0;chunk1;chunk2;chunk3;');
   });
 });
 

@@ -11,11 +11,11 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('native local project launches', () => {
+describe('native project launches on a local environment', () => {
   it('sends 60 named tests in one project request, owns one run, and closes one tunnel', async () => {
     const tests = cases(60);
     const h = fixture(tests);
-    await h.run([...tests.map(test => test.id), '--local', '5173']);
+    await h.run([...tests.map(test => test.id)]);
     expect(h.launches()).toHaveLength(1);
     expect(h.launches()[0]!.body).toMatchObject({
       testIds: tests.map(test => test.id),
@@ -34,27 +34,9 @@ describe('native local project launches', () => {
       { id: 'a', projectId: 'P', type: 'frontend' },
       { id: 'b', projectId: 'Q', type: 'frontend' },
     ]);
-    await h.run([
-      'a',
-      'b',
-      '--local',
-      '5173',
-      '--max-concurrency',
-      '7',
-      '--idempotency-key',
-      'same-key',
-    ]);
+    await h.run(['a', 'b', '--max-concurrency', '7', '--idempotency-key', 'same-key']);
     const first = h.launches().map(call => ({ key: call.key, body: call.body }));
-    await h.run([
-      'a',
-      'b',
-      '--local',
-      '5173',
-      '--max-concurrency',
-      '7',
-      '--idempotency-key',
-      'same-key',
-    ]);
+    await h.run(['a', 'b', '--max-concurrency', '7', '--idempotency-key', 'same-key']);
     expect(
       h
         .launches()
@@ -124,7 +106,7 @@ describe('native local project launches', () => {
   );
   it('deduplicates named IDs in first occurrence order', async () => {
     const h = fixture(cases(2));
-    await h.run(['test-1', 'test-0', 'test-1', '--local', '5173']);
+    await h.run(['test-1', 'test-0', 'test-1']);
     expect(h.launches()[0]!.body?.testIds).toEqual(['test-1', 'test-0']);
   });
   it('opens one automatic tunnel for a saved loopback environment', async () => {
@@ -183,7 +165,7 @@ describe('native local project launches', () => {
             : undefined,
       },
     );
-    await expect(h.run(['a', 'b', '--local', '5173'])).rejects.toMatchObject({
+    await expect(h.run(['a', 'b'])).rejects.toMatchObject({
       code: 'AUTH_FORBIDDEN',
       message: 'No project Q',
       nextAction: 'Use permitted project',
@@ -194,46 +176,28 @@ describe('native local project launches', () => {
     });
     expect(h.calls.filter(call => call.url.pathname.endsWith('/cancel'))).toHaveLength(1);
   });
-  it('rejects explicitly named backend cases before opening a local tunnel', async () => {
-    const h = fixture([
-      { id: 'a', projectId: 'P', type: 'frontend' },
-      { id: 'b', projectId: 'P', type: 'backend' },
-    ]);
-    await expect(h.run(['a', 'b', '--local', '5173'])).rejects.toMatchObject({ exitCode: 5 });
-    expect(h.calls.some(call => call.method === 'POST')).toBe(false);
-  });
   it('all-local filters frontend cases and retains backend skip diagnostics', async () => {
     const h = fixture([
       { id: 'a', projectId: 'P', type: 'frontend' },
       { id: 'b', projectId: 'P', type: 'backend' },
     ]);
-    await h.run(['--project', 'P', '--local', '5173']);
+    await h.run(['--project', 'P']);
     expect(h.launches()[0]!.body?.testIds).toEqual(['a']);
     expect(h.output()).toMatchObject({
       skipped: [{ testId: 'b', reason: 'backend-test' }],
       summary: { passed: 1, skipped: 1 },
     });
   });
-  it.each([false, true])(
-    'all-backend local selection dispatches nothing, allow-empty=%s',
-    async allowEmpty => {
-      const h = fixture([{ id: 'b', projectId: 'P', type: 'backend' }]);
-      const pending = h.run([
-        '--project',
-        'P',
-        '--local',
-        '5173',
-        ...(allowEmpty ? ['--allow-empty'] : []),
-      ]);
-      if (allowEmpty) await pending;
-      else await expect(pending).rejects.toMatchObject({ exitCode: 5 });
-      expect(h.calls.some(call => call.method === 'POST')).toBe(false);
-    },
-  );
+  it('a project whose tests are all backend runs without a tunnel', async () => {
+    const h = fixture([{ id: 'b', projectId: 'P', type: 'backend' }]);
+    await h.run(['--project', 'P']);
+    expect(h.launches()[0]!.body).not.toHaveProperty('tunnelClientId');
+    expect(h.calls.some(call => call.url.pathname.endsWith('/tunnel'))).toBe(false);
+  });
   it('records the server limit without inventing the deleted dispatcher peak', async () => {
     takeTelemetryExtras();
     const h = fixture(cases(2));
-    await h.run(['test-0', 'test-1', '--local', '5173']);
+    await h.run(['test-0', 'test-1']);
     const extras = takeTelemetryExtras();
     expect(extras).toMatchObject({ local: true, localConcurrencyLimit: 5 });
     expect(extras).not.toHaveProperty('localPeakInFlight');

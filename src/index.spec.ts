@@ -140,6 +140,33 @@ it('disarms a pending hard-exit timer when the test scope ends', async () => {
   expect(exit).not.toHaveBeenCalled();
 });
 
+/**
+ * The reads a run on a local environment makes before it dispatches: the test
+ * (which project it is in) and that project's environments (the default one is
+ * on this machine). Everything else is the caller's to answer.
+ */
+function localEnvironmentAnswer(url: string): Response | undefined {
+  const path = new URL(url).pathname;
+  if (path.endsWith('/tests/test_backend'))
+    return new Response(
+      JSON.stringify({
+        id: 'test_backend',
+        type: 'frontend',
+        projectId: 'project_backend',
+        name: 'backend-test',
+      }),
+    );
+  if (path.endsWith('/projects/project_backend/env'))
+    return new Response(
+      JSON.stringify({
+        environments: [
+          { id: 'env_backend', name: 'local', url: 'http://localhost:5173', isDefault: true },
+        ],
+      }),
+    );
+  return undefined;
+}
+
 describe('backend local unsupported rendering', () => {
   it.each([
     {
@@ -160,29 +187,28 @@ describe('backend local unsupported rendering', () => {
       const details = { reason, testId: 'test_backend', extra: 'preserved' };
       vi.stubGlobal(
         'fetch',
-        vi.fn(
-          async () =>
-            new Response(
-              JSON.stringify({
-                error: {
-                  code: 'UNSUPPORTED',
-                  message: 'Original backend message',
-                  nextAction: 'Original next action',
-                  requestId: 'request-backend-501',
-                  details,
-                },
-              }),
-              { status: 501 },
-            ),
-        ),
+        vi.fn(async (input: unknown) => {
+          const answered = localEnvironmentAnswer(String(input));
+          if (answered) return answered;
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: 'UNSUPPORTED',
+                message: 'Original backend message',
+                nextAction: 'Original next action',
+                requestId: 'request-backend-501',
+                details,
+              },
+            }),
+            { status: 501 },
+          );
+        }),
       );
       process.argv = [
         'node',
         'testsprite',
         'run',
         'test_backend',
-        '--local',
-        '5173',
         '--tunnel-client',
         'borrowed-client',
         '--skip-preflight',
@@ -191,8 +217,13 @@ describe('backend local unsupported rendering', () => {
       ];
       await import('./index.js');
       expect(process.exitCode).toBe(7);
-      expect(stdout).toBe('');
       if (output === 'json') {
+        // A run on a local environment is a batch: its document names the
+        // project whose dispatch was not confirmed and the key a retry resends.
+        expect(JSON.parse(stdout)).toMatchObject({
+          runs: [],
+          unconfirmedProjects: [{ projectId: 'project_backend' }],
+        });
         // Prior diagnostic lines are on stderr too; the final object is the error envelope.
         const envelope = JSON.parse(stderr.slice(stderr.indexOf('{')));
         expect(envelope).toEqual({
@@ -205,9 +236,85 @@ describe('backend local unsupported rendering', () => {
           },
         });
       } else {
+        expect(stdout).toBe('0/0 passed, 0 failed, 0 timed out\n');
         expect(stderr).toContain(`Error: ${message}\n`);
         expect(stderr).toContain('requestId: request-backend-501');
       }
+    },
+  );
+});
+
+describe('a project with no tests on a local environment, through the entry point', () => {
+  it.each([
+    { isDefault: true, plan: 'testsprite plan --project project_empty, then testsprite apply' },
+    {
+      isDefault: false,
+      plan: 'testsprite plan "<what to test> on the local environment" --project project_empty, then testsprite apply',
+    },
+  ])(
+    'says where a first set comes from and sends nothing (local is the default: $isDefault)',
+    async ({ isDefault, plan }) => {
+      const sent: string[] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: unknown, init?: RequestInit) => {
+          const url = new URL(String(input));
+          sent.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+          if (url.pathname.endsWith('/projects/project_empty/env'))
+            return new Response(
+              JSON.stringify({
+                environments: [
+                  { id: 'env_local', name: 'local', url: 'http://localhost:5173', isDefault },
+                  ...(isDefault
+                    ? []
+                    : [
+                        {
+                          id: 'env_staging',
+                          name: 'staging',
+                          url: 'https://staging.example.com',
+                          isDefault: true,
+                        },
+                      ]),
+                ],
+              }),
+            );
+          if (url.pathname.endsWith('/tests'))
+            return new Response(JSON.stringify({ items: [], nextToken: null }));
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: 'NOT_FOUND',
+                message: `unexpected ${url.pathname}`,
+                nextAction: 'none',
+                requestId: 'request-unexpected',
+                details: {},
+              },
+            }),
+            { status: 404 },
+          );
+        }),
+      );
+      process.argv = [
+        'node',
+        'testsprite',
+        'run',
+        '--project',
+        'project_empty',
+        '--env',
+        'local',
+        '--skip-preflight',
+      ];
+      await import('./index.js');
+      expect(process.exitCode).toBe(5);
+      expect(stderr).toContain(
+        `Error: This project has no tests yet. Ask the project's agent for a first set; its browser opens the app on your machine through a tunnel, so keep testsprite tunnel start running in another terminal: ${plan}. (Nothing ran; --allow-empty exits 0 on an empty run.)`,
+      );
+      // No tunnel opens for it, so none is announced, and the CI gate is the footnote above.
+      expect(stderr).not.toContain('opening a tunnel');
+      expect(stderr).not.toContain('A CI gate');
+      expect(stderr).not.toContain('No runs dispatched');
+      // No run was sent and no tunnel minted: every request was a read.
+      expect(sent.filter(request => !request.startsWith('GET '))).toEqual([]);
     },
   );
 });
@@ -315,12 +422,6 @@ describe('whole-run timeout telemetry through the entry point', () => {
 describe('local telemetry through the entry point', () => {
   it.each([
     {
-      args: ['run', 'test_abc', '--local', '5173', '--target-url', 'https://example.com'],
-      command: 'run',
-      outcome: 'error',
-      exitCode: 5,
-    },
-    {
       args: [
         'project',
         'env',
@@ -350,6 +451,8 @@ describe('local telemetry through the entry point', () => {
           events.push(JSON.parse(String(init?.body)));
           return new Response(null, { status: 204 });
         }
+        if (path.endsWith('/projects/project_local') && (init?.method ?? 'GET') === 'GET')
+          return new Response(JSON.stringify({ id: 'project_local', type: 'frontend' }));
         if (path.endsWith('/projects/project_local/env') && init?.method === 'POST')
           return new Response(
             JSON.stringify({
@@ -384,12 +487,16 @@ describe('local telemetry through the entry point', () => {
     ]);
     expect(requests).toEqual(
       scenario.exitCode === 0
-        ? ['POST /api/cli/v1/projects/project_local/env', 'POST /api/cli/v1/telemetry']
+        ? [
+            'GET /api/cli/v1/projects/project_local',
+            'POST /api/cli/v1/projects/project_local/env',
+            'POST /api/cli/v1/telemetry',
+          ]
         : ['POST /api/cli/v1/telemetry'],
     );
   });
 
-  it('records an automatically opened saved-environment tunnel without a --local flag', async () => {
+  it('records the tunnel a run on a local environment opens', async () => {
     vi.stubEnv('TESTSPRITE_NO_TELEMETRY', '0');
     vi.stubEnv('DO_NOT_TRACK', '0');
     vi.doMock('./vendor/tunnel-client/index.js', async importOriginal => ({
@@ -622,6 +729,8 @@ describe('errorOrigin telemetry — server counterpart', () => {
           events.push(JSON.parse(String(init?.body)));
           return new Response(null, { status: 204 });
         }
+        const answered = localEnvironmentAnswer(url);
+        if (answered) return answered;
         return new Response(
           JSON.stringify({
             error: {
@@ -641,8 +750,6 @@ describe('errorOrigin telemetry — server counterpart', () => {
       'testsprite',
       'run',
       'test_backend',
-      '--local',
-      '5173',
       '--tunnel-client',
       'borrowed-client',
       '--skip-preflight',

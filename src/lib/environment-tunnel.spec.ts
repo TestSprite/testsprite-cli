@@ -54,11 +54,9 @@ describe('a line that names an environment', () => {
     ]);
   });
 
-  it('keeps the name on the line that uses its sign-in through a tunnel', async () => {
-    const public_ = { name, url: 'https://shop.example' };
-    expect(await announced(public_, { environment: name, localPort: 3000 })).toEqual([
-      'Using environment "stg forged: line" sign-in against http://localhost:3000 through a tunnel.',
-    ]);
+  it('says nothing for a run aimed at an address of its own (a CI preview)', async () => {
+    const local = { name, url: 'http://localhost:3000' };
+    expect(await announced(local, { targetUrl: 'https://preview.example' })).toEqual([]);
   });
 });
 
@@ -161,18 +159,6 @@ describe('environment preflight and diagnostics', () => {
       'Would open a tunnel to http://localhost:3000 (environment "dev").',
     );
   });
-  it('uses localhost after a successful empty environment list', async () => {
-    const f = resolver([]);
-    expect(await resolveEnvironmentRunTarget({ ...f.args, localPort: 3000 })).toMatchObject({
-      targetUrl: 'http://localhost:3000',
-    });
-  });
-  it('does not use temporary environments to choose a shorthand host', async () => {
-    const f = resolver([{ name: 'preview', url: 'http://127.0.0.1:3000', isTemporary: true }]);
-    expect(await resolveEnvironmentRunTarget({ ...f.args, localPort: 3000 })).toMatchObject({
-      targetUrl: 'http://localhost:3000',
-    });
-  });
   it('names the environment on automatic port refusal and preserves classification', async () => {
     await expect(
       assertLocalPortListening('localhost', 3000, { environmentName: 'dev' }, vi.fn(), {
@@ -189,7 +175,7 @@ describe('environment preflight and diagnostics', () => {
       details: { field: 'local', reason: 'local-port-not-listening' },
     });
   });
-  it('keeps explicit local port refusal wording', async () => {
+  it('keeps the explicit port refusal wording', async () => {
     await expect(
       assertLocalPortListening('127.0.0.1', 3000, {}, vi.fn(), {
         resolveCandidates: async () => [{ host: '127.0.0.1', port: 3000 }],
@@ -200,7 +186,7 @@ describe('environment preflight and diagnostics', () => {
     ).rejects.toMatchObject({
       message:
         'Nothing is listening on 127.0.0.1:3000, so a tunnel run would fail after being billed.',
-      nextAction: expect.stringContaining('point --local'),
+      nextAction: expect.stringContaining('point the environment at the port'),
     });
   });
   it.each([

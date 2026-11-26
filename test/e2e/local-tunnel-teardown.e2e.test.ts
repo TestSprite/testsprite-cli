@@ -1,6 +1,6 @@
 /**
- * Local e2e regression test for the `--local` teardown hang: SIGINT (or a
- * `--timeout` expiry) during a `--local` run printed the correct message,
+ * Local e2e regression test for the tunnel teardown hang: SIGINT (or a
+ * `--timeout` expiry) during a run on a local environment printed the correct message,
  * genuinely cancelled the run server-side, and then never exited — the
  * process had to be killed externally.
  *
@@ -172,10 +172,24 @@ beforeAll(async () => {
       return;
     }
 
-    // `--local` reads the test first (a backend test is refused before the
-    // port probe and the mint), so the fake must answer it as a frontend test.
+    // The run reads the test first (which project it is in, and that it is a
+    // frontend test), then the project's environments: the default one is the
+    // app on this machine, which is what opens the tunnel.
     if (method === 'GET' && url === `/api/cli/v1/tests/${TEST_ID}`) {
       respondJson(res, 200, { id: TEST_ID, type: 'frontend', projectId: 'prj-e2e' });
+      return;
+    }
+    if (method === 'GET' && url === '/api/cli/v1/projects/prj-e2e/env') {
+      respondJson(res, 200, {
+        environments: [
+          {
+            id: 'env-e2e',
+            name: 'local',
+            url: `http://127.0.0.1:${localAppPort}`,
+            isDefault: true,
+          },
+        ],
+      });
       return;
     }
 
@@ -325,20 +339,16 @@ function spawnLocalRun(extraArgs: string[]): {
   stdout: () => string;
   stderr: () => string;
 } {
-  const child = spawn(
-    process.execPath,
-    [BIN_PATH, 'run', TEST_ID, '--local', String(localAppPort), ...extraArgs],
-    {
-      env: {
-        ...process.env,
-        TESTSPRITE_API_KEY: 'sk-user-e2e-local-teardown',
-        TESTSPRITE_API_URL: baseUrl,
-        TESTSPRITE_NO_SKILL_WARNING: '1',
-        TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
+  const child = spawn(process.execPath, [BIN_PATH, 'run', TEST_ID, ...extraArgs], {
+    env: {
+      ...process.env,
+      TESTSPRITE_API_KEY: 'sk-user-e2e-local-teardown',
+      TESTSPRITE_API_URL: baseUrl,
+      TESTSPRITE_NO_SKILL_WARNING: '1',
+      TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
     },
-  );
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
@@ -354,7 +364,7 @@ function spawnLocalRun(extraArgs: string[]): {
 }
 
 describe.skipIf(isWindows)('local-tunnel teardown e2e — the process must exit on its own', () => {
-  it('SIGINT during a --local run: exits naturally (no signal, code 130) after the cancel + tunnel-delete land', async () => {
+  it('SIGINT during a run on a local environment: exits naturally (no signal, code 130) after the cancel + tunnel-delete land', async () => {
     const { child, result } = spawnLocalRun(['--timeout', '120']);
 
     // Wait for the EXACT shape of the original bug: the control socket is
@@ -442,7 +452,7 @@ describe.skipIf(isWindows)('local-tunnel teardown e2e — the process must exit 
     expect(outcome.stderr).not.toContain('could not delete the tunnel credential');
   }, 20_000);
 
-  it('--timeout expiry during a --local run: exits naturally (no signal, code 7) after the cancel + tunnel-delete land', async () => {
+  it('--timeout expiry during a run on a local environment: exits naturally (no signal, code 7) after the cancel + tunnel-delete land', async () => {
     const { result } = spawnLocalRun(['--timeout', '1']);
 
     // No signal sent here — --timeout 1 elapsing while the run poll hangs

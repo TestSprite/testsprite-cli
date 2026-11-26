@@ -5,7 +5,9 @@ import { describe, expect, it } from 'vitest';
 import {
   rememberCard,
   rememberConversation,
+  rememberProject,
   resolveConversationId,
+  resolveProject,
   resolveProjectId,
   shownCard,
 } from './context.js';
@@ -26,6 +28,45 @@ describe('resolveProjectId', () => {
     expect(() => resolveProjectId(undefined, { root: folder(), env: {} })).toThrow(
       /--project <id>/,
     );
+  });
+});
+
+describe('resolveProject', () => {
+  it('says the project came from this folder only when neither the flag nor the environment named one', () => {
+    const root = folder();
+    rememberConversation(root, 'p-remembered', 'c1');
+    const env = { TESTSPRITE_PROJECT_ID: 'p-env' };
+    expect(resolveProject('p-flag', { root, env })).toEqual({
+      projectId: 'p-flag',
+      remembered: false,
+    });
+    expect(resolveProject(undefined, { root, env })).toEqual({
+      projectId: 'p-env',
+      remembered: false,
+    });
+    expect(resolveProject(undefined, { root, env: {} })).toEqual({
+      projectId: 'p-remembered',
+      remembered: true,
+    });
+  });
+});
+
+describe('rememberProject', () => {
+  it("makes a project this folder's, keeping the conversations and cards it remembers", () => {
+    const root = folder();
+    rememberConversation(root, 'p-old', 'c-old');
+    rememberCard(root, 'c-old', 'card-1');
+    rememberProject(root, 'p-new');
+    expect(resolveProject(undefined, { root, env: {} })).toEqual({
+      projectId: 'p-new',
+      remembered: true,
+    });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtempSync folder, never user input.
+    expect(JSON.parse(readFileSync(join(root, '.testsprite', 'agent.json'), 'utf8'))).toEqual({
+      projectId: 'p-new',
+      conversations: { 'p-old': 'c-old' },
+      cards: { 'c-old': 'card-1' },
+    });
   });
 });
 

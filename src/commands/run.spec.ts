@@ -91,10 +91,13 @@ describe('single root run selection', () => {
     ['--testlist', '   '],
     ['--project', 'project_1', '--testlist', 'list-1'],
     ['a', '--filter', 'name'],
-    ...['--env', '--target-url', '--local', '--local-host', '--tunnel-client', '--filter'].map(
-      flag => ['--testlist', 'list-1', flag, 'value'],
-    ),
-    ...['--no-cancel-on-interrupt', '--skip-dependencies', '--allow-empty'].map(flag => [
+    ...['--env', '--tunnel-client', '--filter'].map(flag => [
+      '--testlist',
+      'list-1',
+      flag,
+      'value',
+    ]),
+    ...['--no-cancel-on-interrupt', '--skip-dependencies'].map(flag => [
       '--testlist',
       'list-1',
       flag,
@@ -198,6 +201,8 @@ describe('root list and lifecycle adapters', () => {
         '--testlist',
         'list-1',
         '--no-wait',
+        // The harness's list starts nothing; without this the launch is exit 5.
+        '--allow-empty',
       ]);
       const posts = h.calls.filter(call => call.method === 'POST');
       expect(posts).toHaveLength(1);

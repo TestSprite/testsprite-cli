@@ -74,6 +74,11 @@ function makeFetch(
   }) as typeof globalThis.fetch;
 }
 
+/** The requests that change something: a local address is first checked against the project's type. */
+function writes(calls: Call[]): Call[] {
+  return calls.filter(call => call.method !== 'GET');
+}
+
 function makeCreds(apiKey = 'sk-user-test', apiUrl = 'http://localhost:13504') {
   const dir = mkdtempSync(join(tmpdir(), 'cli-proj-env-'));
   const credentialsPath = join(dir, 'credentials');
@@ -953,11 +958,11 @@ describe('runEnvCreate', () => {
     [{ signIn: 'otp', otpChannel: ['push'] }, '--otp-channel'],
     [
       { signIn: 'otp', local: '5173' },
-      '--sign-in otp and --sign-in manual are not available for --local environments',
+      '--sign-in otp and --sign-in manual are not available for local environments',
     ],
     [
       { signIn: 'manual', local: '5173' },
-      '--sign-in otp and --sign-in manual are not available for --local environments',
+      '--sign-in otp and --sign-in manual are not available for local environments',
     ],
   ])(
     'rejects invalid sign-in create flags %j before request and file read',
@@ -1205,6 +1210,39 @@ describe('runEnvCreate', () => {
     expect(call!.headers['idempotency-key']).toMatch(/^cli-proj-env-create-/);
   });
 
+  it('a local address tells the user to start the tunnel before plan, in text mode only', async () => {
+    const { credentialsPath } = makeCreds();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const deps = {
+      credentialsPath,
+      localPortProbeDeps: { connect: vi.fn(async () => {}) },
+      fetchImpl: makeFetch([], () => ({
+        body: { environment: env({ name: 'local-dev', url: LOCAL_URL }), created: true },
+      })),
+      stdout: (line: string) => stdout.push(line),
+      stderr: (line: string) => stderr.push(line),
+    };
+    const opts = {
+      ...COMMON,
+      output: 'text' as const,
+      projectId: PROJECT_ID,
+      name: 'local-dev',
+      local: '5173',
+    };
+    await runEnvCreate(opts, deps);
+    expect(stderr).toContain(
+      'This app is on your machine: before `testsprite plan`, run `testsprite tunnel start` in another terminal so the agent can open it (`testsprite run` opens its own tunnel).',
+    );
+    expect(stdout.join('\n')).not.toContain('tunnel start');
+    stderr.length = 0;
+    await runEnvCreate({ ...opts, output: 'json' }, deps);
+    expect(stderr.join('\n')).not.toContain('tunnel start');
+    stderr.length = 0;
+    await runEnvCreate({ ...opts, local: undefined, url: 'https://staging.example.com' }, deps);
+    expect(stderr.join('\n')).not.toContain('tunnel start');
+  });
+
   it('--local <port> builds the loopback URL, probes the port once, and sends the marker', async () => {
     // An app on your own machine is named by its port. The CLI builds `http://127.0.0.1:<port>` and sends
     // `originMode: 'local'` — the marker is what authorizes storing a loopback
@@ -1235,7 +1273,9 @@ describe('runEnvCreate', () => {
       },
     );
     expect(connect).toHaveBeenCalledWith('127.0.0.1', 5173, 2000);
-    expect(calls[0]!.body).toEqual({
+    expect(calls[0]!.method).toBe('GET');
+    expect(calls[0]!.url).toMatch(new RegExp(`/projects/${PROJECT_ID}$`));
+    expect(writes(calls)[0]!.body).toEqual({
       name: 'local-dev',
       url: LOCAL_URL,
       originMode: 'local',
@@ -1270,7 +1310,7 @@ describe('runEnvCreate', () => {
         stderr: () => {},
       },
     );
-    expect(calls[0]!.body).toMatchObject({ url, originMode: 'local' });
+    expect(writes(calls)[0]!.body).toMatchObject({ url, originMode: 'local' });
   });
 
   it.each(['http://localhost:5173', 'http://127.0.0.1:5173/', 'http://[::1]:5173'])(
@@ -1292,7 +1332,7 @@ describe('runEnvCreate', () => {
         { ...COMMON, projectId: PROJECT_ID, name: 'local-dev', url, skipPreflight: true },
         deps,
       );
-      expect(calls.map(call => call.body)).toEqual([
+      expect(writes(calls).map(call => call.body)).toEqual([
         { name: 'local-dev', url, originMode: 'local' },
         { url, originMode: 'local' },
       ]);
@@ -1332,7 +1372,7 @@ describe('runEnvCreate', () => {
     expect(connect).not.toHaveBeenCalled();
   });
 
-  it('refuses a dead --local port before any request; --skip-preflight dials nothing', async () => {
+  it('refuses a dead --local port before sending the environment; --skip-preflight dials nothing', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
     const connect = vi.fn(async () => {
@@ -1350,7 +1390,10 @@ describe('runEnvCreate', () => {
     expect((error as ApiError).message).toBe(
       'Nothing is listening on http://localhost:5173. Start your app first, or pass --skip-preflight.',
     );
-    expect(calls).toEqual([]);
+    expect((error as ApiError).nextAction).toBe(
+      'Verify --local names the port your app listens on.',
+    );
+    expect(writes(calls)).toEqual([]);
 
     connect.mockClear();
     await runEnvCreate(
@@ -1366,7 +1409,90 @@ describe('runEnvCreate', () => {
       },
     );
     expect(connect).not.toHaveBeenCalled();
-    expect(calls[0]!.body).toMatchObject({ url: LOCAL_URL, originMode: 'local' });
+    expect(writes(calls)[0]!.body).toMatchObject({ url: LOCAL_URL, originMode: 'local' });
+  });
+
+  it('a dead port given with --url names --url', async () => {
+    const { credentialsPath } = makeCreds();
+    const error = await runEnvCreate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'local-dev', url: 'http://localhost:8001' },
+      {
+        credentialsPath,
+        localPortProbeDeps: {
+          connect: vi.fn(async () => {
+            throw new Error('ECONNREFUSED');
+          }),
+        },
+        fetchImpl: makeFetch([], () => ({ body: { id: PROJECT_ID, type: 'frontend' } })),
+        stdout: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect((error as ApiError).nextAction).toBe('Verify --url names the port your app listens on.');
+    expect((error as ApiError).details).toMatchObject({ field: 'url' });
+  });
+
+  it.each([
+    [{ url: 'http://localhost:8000' }, 'url'],
+    [{ local: '8000' }, 'local'],
+  ])(
+    'refuses %j on a backend project before probing the port or sending the environment',
+    async (flags, field) => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const connect = vi.fn(async () => {});
+      const deps = {
+        credentialsPath,
+        localPortProbeDeps: { connect },
+        fetchImpl: makeFetch(calls, () => ({ body: { id: PROJECT_ID, type: 'backend' } })),
+        stdout: () => {},
+        stderr: () => {},
+      };
+      const errors = [
+        await runEnvCreate(
+          { ...COMMON, projectId: PROJECT_ID, name: 'local', ...flags },
+          deps,
+        ).catch(e => e as ApiError),
+        await runEnvUpdate(
+          { ...COMMON, projectId: PROJECT_ID, name: 'default', ...flags },
+          deps,
+        ).catch(e => e as ApiError),
+      ];
+      for (const error of errors) {
+        expect(error).toBeInstanceOf(ApiError);
+        expect((error as ApiError).exitCode).toBe(5);
+        expect((error as ApiError).nextAction).toBe(
+          "A backend project's environment must point at a publicly deployed API; local environments are for frontend projects only.",
+        );
+        expect((error as ApiError).details).toMatchObject({
+          field,
+          reason: 'backend-local-environment',
+        });
+      }
+      expect(connect).not.toHaveBeenCalled();
+      expect(calls.map(call => call.method)).toEqual(['GET', 'GET']);
+    },
+  );
+
+  it('a key that cannot read the project leaves a local address to the port check and the server', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const connect = vi.fn(async () => {});
+    await runEnvCreate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'local-dev', local: '5173' },
+      {
+        credentialsPath,
+        localPortProbeDeps: { connect },
+        fetchImpl: makeFetch(calls, call =>
+          call.method === 'GET'
+            ? errorEnvelope('FORBIDDEN', 403)
+            : { body: { environment: env({ name: 'local-dev', url: LOCAL_URL }), created: true } },
+        ),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(connect).toHaveBeenCalledOnce();
+    expect(writes(calls)[0]!.body).toMatchObject({ url: LOCAL_URL, originMode: 'local' });
   });
 
   it.each(['http://10.0.0.5', 'http://192.168.1.10', 'http://169.254.169.254', 'ftp://127.0.0.1'])(
@@ -1409,7 +1535,7 @@ describe('runEnvCreate', () => {
         stderr: () => {},
       },
     );
-    expect((calls[0]!.body as { password: string }).password).toBe(SECRET);
+    expect((writes(calls)[0]!.body as { password: string }).password).toBe(SECRET);
   });
 
   it('never prints the password — text or JSON', async () => {
@@ -1553,7 +1679,7 @@ describe('runEnvCreate', () => {
         stderr: () => {},
       },
     );
-    expect(calls[0]!.body).toMatchObject({ url: LOCAL_URL, setDefault: true });
+    expect(writes(calls)[0]!.body).toMatchObject({ url: LOCAL_URL, setDefault: true });
   });
 
   it('refuses --password together with --password-file', async () => {
@@ -1860,7 +1986,7 @@ describe('runEnvUpdate', () => {
       },
     );
     expect(connect).toHaveBeenCalledWith('127.0.0.1', 5173, 2000);
-    expect(calls[0]!.body).toEqual({ url: LOCAL_URL, originMode: 'local' });
+    expect(writes(calls)[0]!.body).toEqual({ url: LOCAL_URL, originMode: 'local' });
 
     const rawUrl = 'http://127.0.0.1:5173/';
     await runEnvUpdate(
@@ -1872,7 +1998,7 @@ describe('runEnvUpdate', () => {
         stderr: () => {},
       },
     );
-    expect(calls[1]?.body).toEqual({ url: rawUrl, originMode: 'local' });
+    expect(writes(calls)[1]?.body).toEqual({ url: rawUrl, originMode: 'local' });
 
     // There is no way to clear a URL: an environment always has an address.
     await expect(

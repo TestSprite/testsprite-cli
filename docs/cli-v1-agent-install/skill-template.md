@@ -34,15 +34,14 @@ deploy the preview/staging environment). Create a named environment for its
 public URL once, then select it with `--env <name>` on runs. Running earlier
 verifies the previous build, not your change.
 
-For a change that is only running locally, don't wait for a deployment: run
-`testsprite run <test-id> --local <port>` instead. It tunnels this
+For a change that is only running locally, don't wait for a deployment: save the
+app on this machine as an environment (`testsprite project env create <projectId> --name local --url http://localhost:<port>`)
+and run on it with `testsprite run <test-id> --env local`. The run tunnels this
 machine's own loopback address (`localhost` / `127.0.0.1` / `::1` — not a LAN
 or RFC1918 address, and not a general local-network escape hatch) to the test
 runner. It is for frontend tests only (a backend test reaches its API over HTTP from
 the runner, so run it normally against a deployed environment). Existing API keys work for local runs; no replacement key is
-needed. `--local <port>` selects or creates the
-project's `local-<port>` environment. With `--env <name> --local <port>`, that
-named environment must also be local (`project env list <projectId>` shows names).
+needed. Check the name with `testsprite project env list <projectId>`.
 
 If the user explicitly named a tool (the CLI or the MCP), honor that choice
 regardless of which one the change's reachability would otherwise suggest.
@@ -110,18 +109,18 @@ ask the agent for tests, and run the ids `apply` saved:
 
 ```bash
 testsprite project create --type frontend --name "<repo name>"
-testsprite project env create <projectId> --name local --local <port>
+testsprite project env create <projectId> --name local --url http://localhost:<port>
 testsprite plan "<what you built>" --diff --project <projectId> --output json
 testsprite apply --output json
-testsprite run <id> <id> --local <port> --local-host <host> --output json
+testsprite run <id> <id> --env local --output json
 ```
 
-Keep the app listening and use the same `--local-host` for creation and follow-up
-runs. It selects both the probe and stored URL host: `localhost`, `127.0.0.1`
-(default), or `::1`; omit it in both commands to use the default.
+Keep the app listening: a run on the `local` environment opens a tunnel from this
+machine, and the agent explores the app through one too — when it asks for a
+tunnel, run `testsprite tunnel start` in another terminal and
+`testsprite reply "The tunnel is running."`.
 The port probe fails with exit 5 if nothing listens (`--skip-preflight`
-bypasses it). The agent's browser can't open an app on this machine, so it works
-from your change (`--diff`) and the project's other environments.
+bypasses it).
 The Portal shows local environments without a Run action. Create a public
 environment for deployed apps and select it with `--env <name>`.
 
@@ -170,8 +169,9 @@ testsprite run <test-id...> --wait --output json   # the ids apply saved, in "ap
 - Exit 7: the agent is still working; `testsprite status --wait` follows it.
   Exit 13: the agent isn't enabled for this account; tell the user and stop —
   the CLI has no other way to write tests.
-- For an app only on this machine, the agent works from your change and the
-  project's other environments; run what it saved with `--local <port>`.
+- For an app only on this machine, the agent explores it through a tunnel: when it
+  asks for one, run `testsprite tunnel start` in another terminal and reply. Run
+  what it saved with `--env <name>`.
 - When you open the pull request, put `prSummary` from the `apply` output in its
   description, so reviewers see the tests that now guard the change.
 
@@ -215,7 +215,7 @@ Drifted steps are healed during a run; a wrong expectation needs the agent.
 For a deployed target, create its environment once, then use `--env <name>`
 after that deployment contains the change. Omit `--env` for Default; an unknown
 name fails with available names and never falls back. For a local change,
-use `testsprite run <test-id> --local <port>` (frontend only); it implies
+run on the local environment, `testsprite run <test-id> --env <name>` (frontend only); it implies
 waiting and defaults to 1200 seconds.
 
 ```bash
@@ -261,13 +261,11 @@ Key behaviors:
 - Environment `--url` takes a public http/https URL or a loopback http origin
   with an explicit port (frontend only); private and link-local addresses are
   refused. Running against a loopback environment opens a tunnel automatically
-  and waits, like `--local <port>`. `--env <name> --local <port>` sends that
-  environment's sign-in to your local app; the server applies it or refuses
-  before dispatch.
+  and waits. `run` takes no `--target-url`: a run's address is its environment's.
 - `--wait` reads execution status until terminal and handles its own backoff — don't wrap it
   in a retry loop.
-- `--local` implies `--wait`, with a default timeout of 1200 seconds per test (ordinary
-  waits default to 600). Run several local frontend tests in ONE command (`run <id> <id> … --local <port>`) instead of starting one process per test. `run --project <id> --local <port>` runs frontend tests and reports backend tests as skipped. They start one run per project (up to 5000 named test IDs per request) through one tunnel; `--max-concurrency` sets the server dispatch limit per execution, default 5 and maximum 15. Each execution is waited on independently; this limit never queues polling. There are
+- A tunnel run implies `--wait`, with a default timeout of 1200 seconds per test (ordinary
+  waits default to 600). Run several local frontend tests in ONE command (`run <id> <id> … --env <name>`) instead of starting one process per test. `run --project <id> --env <name>` runs frontend tests and reports backend tests as skipped. They start one run per project (up to 5000 named test IDs per request) through one tunnel; `--max-concurrency` sets the server dispatch limit per execution, default 5 and maximum 15. Each execution is waited on independently; this limit never queues polling. There are
   5 live tunnel bindings per user; `tunnel_binding_limit` is exit 11 and is not
   auto-retried. Reuse a live tunnel with `--tunnel-client` or stop an unused one.
   On a tunnel-limit error, run `testsprite tunnel list`, then `testsprite tunnel stop <id>`
@@ -293,13 +291,12 @@ Key behaviors:
   A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
 - Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout
   or unsupported. An owned local timeout is inconclusive: start a **new**
-  `testsprite run <test-id> --local <port> --timeout 1800`, keeping the same
-  `--local-host <host>` if used; do not suggest `run wait` for that closed tunnel. Resume **ordinary or adopted-tunnel**
+  `testsprite run <test-id> --env <name> --timeout 1800`; do not suggest `run wait` for that closed tunnel. Resume **ordinary or adopted-tunnel**
   waits with `testsprite run wait <run-id>` only while the target is reachable
   (and the adopted tunnel's owner remains alive).
 - Exit `13` (`FEATURE_GATED`) and exit `12` (`INSUFFICIENT_CREDITS`) are not retriable: show the user the server's message and the link from `nextAction` or JSON `links`, then stop.
-- A local environment has a loopback URL and needs `--local <port>` from that
-  machine. A bare CLI run selecting it, explicitly or as Default, is refused
+- A local environment has a loopback URL; a CLI run selecting it, explicitly or
+  as Default, opens a tunnel from that machine. A run started elsewhere is refused
   before dispatch without charge (`tunnel-required`, exit 6). The Portal shows
   local environments but offers no Run; backend Portal requests are refused
   without charge. Schedules and test lists targeting them get a free BLOCKED

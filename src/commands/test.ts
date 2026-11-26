@@ -88,13 +88,6 @@ import { isProxyAgentActive } from '../lib/proxy.js';
 import type { CliProjectEnvListResponse } from './project-env.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { assertTargetUrlReachable } from '../lib/target-url-preflight.js';
-import {
-  DEFAULT_LOCAL_HOST,
-  LOOPBACK_HOSTS,
-  normalizeLocalHost,
-  parseLocalPort,
-  type LoopbackHost,
-} from '../lib/local-target.js';
 import { TunnelLostError, type TunnelClientHandle } from '../lib/tunnel-session.js';
 import { type TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
@@ -197,7 +190,7 @@ export interface TestDeps {
    */
   shutdown?: ShutdownHandle;
   /**
-   * Tunnel-client factory for `run --local`. Defaults
+   * Tunnel-client factory for a run on a local environment. Defaults
    * to the vendored `TunnelClient`; tests inject a fake so the command's
    * contract can be exercised without a real control plane — same pattern as
    * `sleep` / `fetchImpl` / `shutdown`.
@@ -211,7 +204,7 @@ function shutdownOf(deps: TestDeps): ShutdownHandle {
 }
 
 /**
- * How a `--local` run's wait ended while the run was still non-terminal.
+ * How a tunnel run's wait ended while the run was still non-terminal.
  * `tunnel-lost` is the one that is not a detach at all — it is the tunnel
  * dying under a run that is otherwise fine.
  */
@@ -227,8 +220,6 @@ export interface TunnelDetach {
   /** The launch the result belongs to (wire name); absent on an older backend. */
   runId?: string;
   testId: string;
-  localPort: number;
-  localHost: LoopbackHost;
   automatic?: boolean;
   environment?: string;
   reason: TunnelDetachReason;
@@ -259,10 +250,6 @@ function tunnelRerunCommand(detach: TunnelDetach): string {
   return (
     `testsprite run ${terminalSafeLine(detach.testId)}` +
     (detach.environment ? ` --env ${quoteEnvironmentName(detach.environment)}` : '') +
-    (detach.automatic
-      ? ''
-      : ` --local ${detach.localPort}` +
-        (detach.localHost !== DEFAULT_LOCAL_HOST ? ` --local-host ${detach.localHost}` : '')) +
     (detach.reason === 'timeout' ? ' --timeout 1800' : '')
   );
 }
@@ -673,10 +660,9 @@ interface RunTestRunOptions extends CommonOptions {
   knownTest?: RunTargetTest;
   noWait?: boolean;
   testId: string;
-  targetUrl?: string;
   /** BE only: run just the named test without expanding the producer/teardown closure. */
   skipDependencies?: boolean;
-  /** Skip the pre-charge --target-url reachability preflight (zero network calls). */
+  /** Skip a local environment's port check before its tunnel opens (zero network calls). */
   skipPreflight?: boolean;
   wait: boolean;
   timeoutSeconds: number;
@@ -697,18 +683,6 @@ interface RunTestRunOptions extends CommonOptions {
   /** --summary-file: also write the reduced machine summary JSON to this path. */
   summaryFile?: string;
   /**
-   * `--local <port>` — run against an app on THIS machine, reached through a
-   * TestSprite tunnel. Implies `--wait` (the tunnel's lifetime is this
-   * process's lifetime) and is mutually exclusive with `--target-url`.
-   */
-  localPort?: number;
-  /**
-   * `--local-host` — which loopback spelling to name in the run's target URL.
-   * Already normalised and validated by the command wiring; the accepted set
-   * is `lib/local-target.ts::LOOPBACK_HOSTS`, which mirrors the server's.
-   */
-  localHost?: LoopbackHost;
-  /**
    * `--tunnel-client <id>` — attach to a tunnel someone else already started
    * (`testsprite tunnel start`) instead of minting one. The client id is a
    * non-secret handle; the secret never leaves the process that minted it,
@@ -724,11 +698,10 @@ interface RunTestRunOptions extends CommonOptions {
    */
   cancelOnInterrupt?: boolean;
   /**
-   * `--env <name>` — the project environment whose credentials, auto-auth and
-   * OTP settings this run uses. Composes with `--local` / `--target-url` (those
-   * choose WHERE the browser goes; this chooses WHOSE login it uses). Absent →
-   * the project's default environment, byte-identical to today. Feature-gated
-   * per workspace: checked client-side before anything is minted or billed.
+   * `--env <name>` — the project environment this run uses: its address,
+   * credentials, auto-auth and OTP settings. Absent → the project's default
+   * environment. Feature-gated per workspace: checked client-side before
+   * anything is minted or billed.
    */
   environment?: string;
 }
@@ -1429,7 +1402,7 @@ async function finishZeroDispatchBatch(params: {
    * a caller relying on the environment variable.
    */
   projectId?: string;
-  /** Set by `run --project --local`, the one batch path that knows the app is local. */
+  /** Set by a project run on a local environment, the one batch path that knows the app is local. */
   local?: LocalHint;
 }): Promise<void> {
   const {
@@ -1506,11 +1479,14 @@ async function finishZeroDispatchBatch(params: {
     return;
   }
   // The pointer rides inside the message so it prints AFTER "Error:", in
-  // reading order — a CLIError has no nextAction slot of its own.
+  // reading order — a CLIError has no nextAction slot of its own. A project
+  // with no tests leads with where a first set comes from; the gate is a
+  // footnote there.
   throw new CLIError(
-    `No tests were dispatched — ${reason}. A CI gate that passes on zero tests is unsafe; ` +
-      `pass --allow-empty to exit 0 intentionally.` +
-      (nextStep !== undefined ? ` ${nextStep}` : ''),
+    nextStep !== undefined
+      ? `${nextStep}. (Nothing ran; --allow-empty exits 0 on an empty run.)`
+      : `No tests were dispatched — ${reason}. A CI gate that passes on zero tests is unsafe; ` +
+          `pass --allow-empty to exit 0 intentionally.`,
     5,
   );
 }
@@ -1551,8 +1527,6 @@ export interface ProjectLaunchOutput {
 /** Launch once per project; the server owns membership expansion and pacing. */
 export async function runTestRunAll(
   opts: RunTestRunAllOptions & {
-    localPort?: number;
-    localHost?: LoopbackHost;
     tunnelClientId?: string;
     resolvedTarget?: ResolvedRunTarget;
     single?: boolean;
@@ -1564,23 +1538,19 @@ export async function runTestRunAll(
   if (opts.wait || opts.report === undefined)
     assertJUnitReportOptions({ ...opts, batchPath: true });
   const environment = normalizeEnvironmentName(opts.environment);
+  // Only `ci run` passes a target: a preview the cloud runner must reach. A
+  // loopback one is refused below, with the rest of its outputs.
   try {
     if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl))
       assertNotLocal(opts.targetUrl, {
         field: 'target-url',
-        helpCommand: 'testsprite run',
+        helpCommand: 'testsprite ci run',
         hintContext: 'runtime',
       });
   } catch (err) {
-    if (opts.ci) refuseCiLoopbackTarget(deps, err);
-    throw err;
+    refuseCiLoopbackTarget(deps, err);
   }
-  if (
-    !opts.wait &&
-    opts.localPort === undefined &&
-    !opts.targetUrl &&
-    (opts.ghOutput || opts.summaryFile)
-  )
+  if (!opts.wait && !opts.targetUrl && (opts.ghOutput || opts.summaryFile))
     throw localValidationError('wait', '--gh-output and --summary-file require --wait');
   const stderr = terminalSafeWriter(deps.stderr);
   const shutdown = shutdownOf(deps);
@@ -1590,13 +1560,7 @@ export async function runTestRunAll(
     opts.maxConcurrency > 100
   )
     throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
-  if (opts.localPort !== undefined && opts.targetUrl !== undefined)
-    throw localValidationError('local', '--local and --target-url are mutually exclusive');
-  if (
-    opts.ci &&
-    (opts.localPort !== undefined || (opts.targetUrl && parseLoopbackTargetUrl(opts.targetUrl)))
-  )
-    refuseCiLoopbackTarget(deps);
+  if (opts.targetUrl && parseLoopbackTargetUrl(opts.targetUrl)) refuseCiLoopbackTarget(deps);
   const client = makeClient(
     { ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs(opts) },
     opts.dryRun ? { ...deps, fetchImpl: undefined } : deps,
@@ -1624,11 +1588,6 @@ export async function runTestRunAll(
           ]),
         )
       : await resolveTestProjects(client, ids, knownTests);
-    if (opts.localPort !== undefined && ids.some(id => knownTests.get(id)?.type === 'backend'))
-      throw localValidationError(
-        'local',
-        `explicit backend tests do not use a tunnel; run without --local: testsprite run ${ids.join(' ')}`,
-      );
     for (const id of ids) {
       const projectId = projectIdByTestId.get(id);
       if (!projectId)
@@ -1641,8 +1600,8 @@ export async function runTestRunAll(
     const projectId = resolveProjectId(opts.projectId, deps);
     requireProjectId(projectId);
     opts = { ...opts, projectId };
-    if (!opts.dryRun && (opts.nameFilter || opts.localPort !== undefined)) {
-      let tests = await resolveAllProjectTests({
+    if (!opts.dryRun && opts.nameFilter) {
+      const tests = await resolveAllProjectTests({
         client,
         projectId,
         nameFilter: opts.nameFilter,
@@ -1650,12 +1609,6 @@ export async function runTestRunAll(
       });
       for (const test of tests)
         knownTests.set(test.id, { type: test.type, projectId: test.projectId ?? projectId });
-      if (opts.localPort !== undefined) {
-        for (const test of tests)
-          if (test.type === 'backend')
-            skippedSelection.push({ testId: test.id, reason: 'backend-test' });
-        tests = tests.filter(test => test.type !== 'backend');
-      }
       ids = tests.map(test => test.id);
       if (ids.length === 0 && opts.ci) {
         const summary: CiSummary = {
@@ -1715,12 +1668,7 @@ export async function runTestRunAll(
       );
   }
   const backendProjects = new Set<string>();
-  if (
-    opts.targetUrl &&
-    !opts.previewName &&
-    !parseLoopbackTargetUrl(opts.targetUrl) &&
-    !opts.dryRun
-  ) {
+  if (opts.targetUrl && !opts.previewName && !opts.dryRun) {
     for (const [projectId, selection] of projects) {
       let type: string | undefined =
         selection?.length &&
@@ -1742,30 +1690,36 @@ export async function runTestRunAll(
     }
   }
   const targets = new Map<string, ResolvedRunTarget>();
+  // What resolving a project's local environment says ("opening a tunnel"),
+  // held until the project is known to keep its tunnel: one with no tests, or
+  // only backend tests, drops it below.
+  const tunnelNotes = new Map<string, string[]>();
   if (!opts.environmentResolutionComplete) {
     for (const [projectId, selection] of projects) {
       const firstId =
         selection?.find(id => knownTests.get(id)?.type === 'frontend') ?? selection?.[0];
+      const notes: string[] = [];
       const target =
         opts.resolvedTarget ??
         (await resolveEnvironmentRunTarget({
-          client: opts.dryRun && opts.localPort !== undefined ? client : discoveryClient,
+          client: discoveryClient,
           projectId,
           dryRun: opts.dryRun,
           testId: opts.dryRun ? undefined : firstId,
           knownTest: firstId ? opts.knownTests?.get(firstId) : undefined,
           skipTestLookup: !firstId,
           environment,
-          localPort: opts.localPort,
-          localHost: opts.localHost,
           targetUrl: opts.targetUrl,
           tunnelClientId: opts.tunnelClientId,
           noWait: opts.noWait,
           cache: deps.environmentCache,
           verbose: opts.verbose || opts.debug,
-          stderr: opts.ci ? () => {} : stderr,
+          stderr: opts.ci ? () => {} : line => notes.push(line),
         }));
-      if (target) targets.set(projectId, target);
+      if (target) {
+        targets.set(projectId, target);
+        tunnelNotes.set(projectId, notes);
+      } else for (const line of notes) stderr(line);
     }
   }
   if (targets.size && opts.ci) refuseCiLoopbackTarget(deps);
@@ -1775,13 +1729,37 @@ export async function runTestRunAll(
       const tests = await resolveAllProjectTests({ client, projectId, stderr });
       for (const test of tests)
         knownTests.set(test.id, { type: test.type, projectId: test.projectId ?? projectId });
+      if (tests.length === 0) {
+        // Nothing to run: say where a first set comes from, through the tunnel,
+        // rather than send a run that the server refuses for want of one.
+        const target = targets.get(projectId)!;
+        await finishZeroDispatchBatch({
+          reason: 'project has no tests',
+          skipped: [],
+          allowEmpty: opts.allowEmpty === true,
+          opts,
+          deps,
+          stderrFn: stderr,
+          emptyProject: true,
+          projectId,
+          local: {
+            ...(target.environmentName !== undefined
+              ? { environment: target.environmentName }
+              : {}),
+            ...(target.environmentIsDefault !== undefined
+              ? { isDefault: target.environmentIsDefault }
+              : {}),
+          },
+        });
+        return { runs: [] };
+      }
       if (tests.every(test => test.type === 'backend')) {
         targets.delete(projectId);
         continue;
       }
       selection = tests.map(test => test.id);
     }
-    if (!selection || opts.localPort !== undefined) continue;
+    if (!selection) continue;
     const kept = selection.filter(id => knownTests.get(id)?.type !== 'backend');
     if (kept.length > 5000)
       throw localValidationError(
@@ -1796,6 +1774,8 @@ export async function runTestRunAll(
       targets.delete(projectId);
     }
   }
+  for (const [projectId, notes] of tunnelNotes)
+    if (targets.has(projectId)) for (const line of notes) stderr(line);
   if (opts.timeoutIsDefault)
     opts = {
       ...opts,
@@ -1808,10 +1788,10 @@ export async function runTestRunAll(
   if (!wait && (opts.ghOutput || opts.summaryFile))
     throw localValidationError('wait', '--gh-output and --summary-file require --wait');
   if (!targets.size) assertNoTunnelOptions(opts);
-  if (opts.targetUrl && !parseLoopbackTargetUrl(opts.targetUrl)) {
+  if (opts.targetUrl) {
     assertNotLocal(opts.targetUrl, {
       field: 'target-url',
-      helpCommand: 'testsprite run',
+      helpCommand: 'testsprite ci run',
       hintContext: 'runtime',
     });
     if (!opts.dryRun)
@@ -1961,7 +1941,7 @@ export async function runTestRunAll(
         const body = bodyFor(projectId, selection, tunnel);
         if (opts.targetUrl && body.targetUrl === undefined && !opts.previewName)
           stderr(
-            '[advisory] --target-url is not applied to a single backend run; backend code uses its selected environment. Use ci run --env <name> --target-url <url> in a pull request preview to clone that environment.',
+            "[advisory] --target-url is not applied to a backend project outside a pull request; its tests use the selected environment's URL. In a pull request, ci run --env <name> --target-url <url> clones that environment at the preview.",
           );
         const key =
           projects.size === 1 ? idempotencyKey : suffixedIdempotencyKey(idempotencyKey, projectId);
@@ -2152,8 +2132,6 @@ export async function runTestRunAll(
           runId: launched.runId,
           resultId: outcome?.results[0]?.resultId,
           testId: opts.single ? ids![0]! : `--project ${launched.projectId}`,
-          localPort: target.port,
-          localHost: target.host,
           automatic: target.automatic,
           environment,
           ownerGone,
@@ -2353,7 +2331,6 @@ export async function runTestRunAll(
 
 interface RunTestRunLocalBatchOptions extends CommonOptions {
   wait?: boolean;
-  targetUrl?: string;
   noWait?: boolean;
   concurrencyIsDefault?: boolean;
   resolvedTarget?: ResolvedRunTarget;
@@ -2361,8 +2338,6 @@ interface RunTestRunLocalBatchOptions extends CommonOptions {
   all: boolean;
   projectId?: string;
   nameFilter?: string;
-  localPort?: number;
-  localHost?: LoopbackHost;
   skipPreflight: boolean;
   tunnelClientId?: string;
   cancelOnInterrupt: boolean;
@@ -2422,19 +2397,8 @@ export async function runTestRunLocalBatch(
   );
 }
 
-/**
- * `--skip-preflight` help text for `run` with a `--target-url`
- * override. States the honest limitation up front: this CLI
- * probes from wherever it runs, not from the Lambda that executes the
- * test, so the probe is a heuristic, not a guarantee — hence the full
- * opt-out.
- */
 const SKIP_PREFLIGHT_HELP =
-  'skip the pre-charge reachability probe of the target URL (it runs from this machine, not the ' +
-  'cloud, so it can be wrong, e.g. behind an IP allowlist)';
-
-const TARGET_URL_HELP =
-  "frontend tests only: run against this URL, using the environment for its origin (else a temporary one deleted after the run); with --env, that environment's settings; loopback URLs open a tunnel";
+  "skip the check that a local environment's app is listening before its tunnel opens";
 
 export function createTestCommand(deps: TestDeps = {}): Command {
   const test = new Command('test').description('List and inspect tests');
@@ -2518,7 +2482,7 @@ export function createRunCommand(deps: TestDeps = {}): Command {
         ' 10  transport/network failure (UNAVAILABLE). If it printed a runId with status\n' +
         '     running, that run is still executing: check it with testsprite run wait\n' +
         '     <run-id> (running this command again triggers and bills a new run).\n' +
-        '     With --local or a local environment, the tunnel closed with this command\n' +
+        '     With a local environment, the tunnel closed with this command\n' +
         '     and run wait cannot reopen it: follow the printed next step. If its\n' +
         '     cancellation was skipped, the run can still finish, but steps that need\n' +
         '     your machine can fail. Otherwise retry the command\n' +
@@ -2534,22 +2498,10 @@ export function createRunCommand(deps: TestDeps = {}): Command {
         'Stop a detached run with: testsprite run cancel <run-id>\n' +
         'Dev servers can take a minute per page through a tunnel; prefer a built server (npm run build, then start).',
     )
-    .option('--target-url <url>', TARGET_URL_HELP)
     .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
-      '--local <port>',
-      'run against an app on THIS machine through a TestSprite tunnel (the runner opens ' +
-        'http://localhost:<port>). Implies --wait. Frontend tests only; several ids or --project start one ' +
-        'run per project through one tunnel (see --max-concurrency). A dead port is refused before anything is billed.',
-    )
-    .option(
-      '--local-host <host>',
-      `with --local, loopback address in the target URL: ${LOOPBACK_HOSTS.join(', ')} ` +
-        `(default: saved matching host, else ${DEFAULT_LOCAL_HOST}). Use localhost if your app only answers on that name, ::1 for IPv6-only.`,
-    )
-    .option(
       '--tunnel-client <id>',
-      'for a loopback environment or --local, attach to a tunnel already running under `testsprite tunnel start` ' +
+      'for a local environment, attach to a tunnel already running under `testsprite tunnel start` ' +
         '(use the id it prints) instead of opening one; that process keeps the tunnel open afterwards.',
     )
     .option(
@@ -2608,7 +2560,7 @@ export function createRunCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--allow-empty',
-      'with a project or multi-ID batch: exit 0 when ZERO test cases are dispatched (default: exit 5, so an empty run is not a CI false-green)',
+      'with a project, a test list or a multi-ID batch: exit 0 when ZERO test cases are dispatched (default: exit 5, so an empty run is not a CI false-green)',
     )
     .option(
       '--skip-dependencies',
@@ -2620,7 +2572,7 @@ export function createRunCommand(deps: TestDeps = {}): Command {
       '\nExamples:\n' +
         '  testsprite run --project <id>                all test cases in the project, in wave order\n' +
         '  testsprite run <id> <id> <id>                      several test cases in one run (one request per project; at most 5000 named IDs per project)\n' +
-        '  testsprite run <id> <id> --local 3000             several local test cases, one tunnel\n' +
+        '  testsprite run <id> <id> --env local               several test cases on a local environment, one tunnel\n' +
         '  testsprite run --project <id> --env staging                all test cases in the project, run in staging\n' +
         '  testsprite run --project <id> --filter <substr> --wait --report junit --report-file ./results.xml\n' +
         '  testsprite run --testlist <list-id> --wait             all saved list cases, using pinned environments\n' +
@@ -2628,7 +2580,7 @@ export function createRunCommand(deps: TestDeps = {}): Command {
         '  testsprite run wait <run-id...> --timeout 600         resume without starting a new run\n' +
         '  testsprite run cancel <run-id...>                    cancel whole executions\n' +
         '\nList mode: concurrency defaults to 10 (1-50), or 5 through a tunnel (1-10); timeout defaults to 600 even through a tunnel.\n' +
-        'List environments come from saved project mappings; --env, --target-url, --local and other project-only launch flags are refused.\n' +
+        'List environments come from saved project mappings; --env and other project-only launch flags are refused.\n' +
         '\nQueueing and limits:\n' +
         '  - Each request starts one run; its results show queued until they start,\n' +
         '    as in the Portal.\n' +
@@ -2671,14 +2623,10 @@ export function createRunCommand(deps: TestDeps = {}): Command {
       if (explicitList) {
         for (const name of [
           'env',
-          'targetUrl',
-          'local',
-          'localHost',
           'tunnelClient',
           'cancelOnInterrupt',
           'skipDependencies',
           'filter',
-          'allowEmpty',
         ]) {
           if (command.getOptionValueSource(name) === 'cli') {
             const flag = command.options.find(option => option.attributeName() === name)!.long!;
@@ -2704,35 +2652,20 @@ export function createRunCommand(deps: TestDeps = {}): Command {
           'provide test IDs, --testlist <id>, or --project <id> (or set TESTSPRITE_PROJECT_ID)',
         );
       const nameFilter = parseNameFilter(cmdOpts.filter);
-      const stderrFn = terminalSafeWriter(deps.stderr);
       if (nameFilter !== undefined && !isAll) {
         throw localValidationError(
           'filter',
           '--filter only applies to a whole-project run; use --project <id> or TESTSPRITE_PROJECT_ID without test IDs',
         );
       }
-      // --local resolution. Every one of these refuses BEFORE any network
-      // call, which is the contract `--local` is sold on: a mistake in the
+      // Every refusal here happens BEFORE any network call: a mistake in the
       // invocation must never reach a run row, a credit spend, or a minted
       // tunnel credential.
-      const localPort = cmdOpts.local !== undefined ? parseLocalPort(cmdOpts.local) : undefined;
-      const usingLocal = localPort !== undefined;
-      const effectiveWait =
-        usingLocal ||
-        (cmdOpts.targetUrl !== undefined &&
-          parseLoopbackTargetUrl(cmdOpts.targetUrl) !== undefined) ||
-        cmdOpts.wait === true;
+      const effectiveWait = cmdOpts.wait === true;
       const canAutoWait =
         !resolveCommonOptions(command, deps.env).dryRun &&
         !(command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false);
-      const explicitLoopbackTarget =
-        cmdOpts.targetUrl !== undefined && parseLoopbackTargetUrl(cmdOpts.targetUrl) !== undefined;
-      if (
-        !usingLocal &&
-        !explicitLoopbackTarget &&
-        ((command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false) ||
-          cmdOpts.targetUrl !== undefined)
-      ) {
+      if (command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false) {
         assertNoTunnelOptions({
           tunnelClientId: cmdOpts.tunnelClient,
           cancelOnInterrupt: cmdOpts.cancelOnInterrupt,
@@ -2740,47 +2673,9 @@ export function createRunCommand(deps: TestDeps = {}): Command {
       }
       const maxConcurrency =
         cmdOpts.maxConcurrency === undefined
-          ? usingLocal
-            ? DEFAULT_TUNNEL_RUN_CONCURRENCY
-            : DEFAULT_BATCH_RUN_CONCURRENCY
+          ? DEFAULT_BATCH_RUN_CONCURRENCY
           : Number(cmdOpts.maxConcurrency);
-      if (usingLocal) {
-        tunnelRunConcurrency({
-          maxConcurrency,
-          concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
-        });
-      }
       const testIds = [...new Set(testIdArgs)];
-      if (usingLocal) {
-        const seen = new Set<string>();
-        for (const id of testIdArgs) {
-          if (seen.has(id)) stderrFn(`[advisory] ignoring duplicate test id ${id}`);
-          seen.add(id);
-        }
-      }
-      if (usingLocal && cmdOpts.targetUrl !== undefined && cmdOpts.targetUrl !== '') {
-        throw localValidationError(
-          'local',
-          '--local and --target-url are mutually exclusive: --local runs against your own ' +
-            'machine through a tunnel, --target-url runs against an address the test runner can ' +
-            'already reach. Pass one',
-        );
-      }
-      // A host override is meaningful only for the port shorthand. Silently ignoring
-      // them would leave the caller believing something is in effect that is
-      // not — the same rule --filter and the JUnit flags already follow.
-      if (!usingLocal && cmdOpts.localHost !== undefined) {
-        throw localValidationError(
-          'local-host',
-          '--local-host only applies with --local (it names the loopback address the tunnel run ' +
-            'targets). Add --local <port>, or remove --local-host',
-        );
-      }
-
-      const localHost =
-        usingLocal && cmdOpts.localHost !== undefined
-          ? normalizeLocalHost(cmdOpts.localHost)
-          : undefined;
 
       const report = parseJUnitReportFormat(cmdOpts.report);
       assertJUnitReportOptions({
@@ -2813,23 +2708,9 @@ export function createRunCommand(deps: TestDeps = {}): Command {
         summaryFile: cmdOpts.summaryFile,
       });
 
-      if (isAll && !usingLocal && cmdOpts.tunnelClient === undefined) {
+      if (isAll && cmdOpts.tunnelClient === undefined) {
         // Project path: wave-ordered fresh batch run.
         requireProjectId(projectId, 'pass --project <id> or set TESTSPRITE_PROJECT_ID');
-        // A batch target URL applies to frontend tests in the batch.
-        // Server-side it rides the same per-run override field a single fresh
-        // FE run uses, so FE cases honor it; a BE case's `VAR_{url}` resolves
-        // to the run's environment URL, so it follows the target only when the
-        // run's environment is at that address (a pull request's clone, or no
-        // --env), which the advisory after dispatch states from the server's
-        // answer rather than leaving the caller to infer. An empty value is
-        // the flag with no argument — still a mistake, still rejected.
-        if (cmdOpts.targetUrl !== undefined && cmdOpts.targetUrl === '') {
-          throw localValidationError(
-            'target-url',
-            '--target-url needs a URL (e.g. --target-url https://pr-42.preview.example.com).',
-          );
-        }
         await runTestRunAll(
           {
             ...resolveCommonOptions(command, deps.env),
@@ -2852,9 +2733,6 @@ export function createRunCommand(deps: TestDeps = {}): Command {
             summaryFile: cmdOpts.summaryFile,
             allowEmpty: cmdOpts.allowEmpty === true,
             environment: cmdOpts.env,
-            ...(cmdOpts.targetUrl !== undefined && cmdOpts.targetUrl !== ''
-              ? { targetUrl: cmdOpts.targetUrl }
-              : {}),
             skipPreflight: cmdOpts.skipPreflight === true,
             ...(cmdOpts.skipDependencies === true ? { skipDependencies: true } : {}),
           },
@@ -2863,27 +2741,7 @@ export function createRunCommand(deps: TestDeps = {}): Command {
         return;
       }
 
-      // `--local` implies `--wait`: for a self-minted tunnel the tunnel's
-      // lifetime is this process's lifetime, so returning early would doom the
-      // run it just started. Announced rather than assumed — a caller who did
-      // not type --wait should learn why the command is now blocking.
-      //
-      // The reason splits on how the tunnel was obtained. An adopted one
-      // (--tunnel-client) outlives this process, so "the tunnel closes when
-      // this command exits" is simply false there, and it is the sentence a
-      // reader would act on: told that, someone deciding whether to background
-      // this command concludes the wrong thing about their own tunnel.
       const commonOpts = resolveCommonOptions(command, deps.env);
-      if (usingLocal && cmdOpts.wait !== true && commonOpts.output !== 'json') {
-        const adopted = cmdOpts.tunnelClient !== undefined;
-        terminalSafeWriter(deps.stderr)(
-          adopted
-            ? '[advisory] --local implies --wait: the run is followed to a verdict rather than ' +
-                'detached. The tunnel you attached to stays open — this command does not close it.'
-            : '[advisory] --local implies --wait: the tunnel closes when this command exits, so ' +
-                'the run is followed to a verdict rather than detached.',
-        );
-      }
 
       if (isAll || testIds.length > 1) {
         await runTestRunLocalBatch(
@@ -2894,9 +2752,6 @@ export function createRunCommand(deps: TestDeps = {}): Command {
             all: isAll,
             projectId,
             nameFilter,
-            localPort,
-            localHost,
-            targetUrl: cmdOpts.targetUrl,
             noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
             concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
             timeoutIsDefault: cmdOpts.timeout === undefined,
@@ -2928,18 +2783,12 @@ export function createRunCommand(deps: TestDeps = {}): Command {
         {
           ...commonOpts,
           testId: testIds[0]!,
-          targetUrl: cmdOpts.targetUrl,
           skipPreflight: cmdOpts.skipPreflight === true,
-          ...(localPort !== undefined ? { localPort } : {}),
-          ...(localHost !== undefined ? { localHost } : {}),
           ...(cmdOpts.tunnelClient !== undefined ? { tunnelClientId: cmdOpts.tunnelClient } : {}),
           cancelOnInterrupt: cmdOpts.cancelOnInterrupt !== false,
           wait: effectiveWait,
           noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
-          timeoutSeconds:
-            usingLocal && cmdOpts.timeout === undefined
-              ? DEFAULT_LOCAL_RUN_TIMEOUT_SECONDS
-              : parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           // B2(c): tell runTestRun whether --timeout was explicitly provided.
           timeoutIsDefault: cmdOpts.timeout === undefined,
           idempotencyKey: cmdOpts.idempotencyKey,
@@ -3012,7 +2861,6 @@ export function createRunWaitCommand(deps: TestDeps = {}): Command {
 }
 
 interface RunFlagOpts {
-  targetUrl?: string;
   skipPreflight?: boolean;
   wait?: boolean;
   timeout?: string;
@@ -3030,9 +2878,7 @@ interface RunFlagOpts {
   summaryFile?: string;
   /** Exit 0 instead of failing when the batch dispatches zero tests. */
   allowEmpty?: boolean;
-  /** `--local <port>` and its three companions. */
-  local?: string;
-  localHost?: string;
+  /** `--tunnel-client <id>`: a tunnel `testsprite tunnel start` holds open. */
   tunnelClient?: string;
   /** Commander's `--no-` negation: `true` unless `--no-cancel-on-interrupt` was passed. */
   cancelOnInterrupt?: boolean;

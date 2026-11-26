@@ -121,7 +121,7 @@ describe('removedCommandPointer', () => {
 
 describe('removedOptionPointer', () => {
   const ENV_CREATE =
-    'set it on an environment: testsprite project env create <project-id> --name default --url <url> (or --local <port>), which takes the sign-in flags';
+    'set it on an environment: testsprite project env create <project-id> --name default --url <url>, which takes the sign-in flags';
   const ENV_UPDATE =
     'set it on an environment: testsprite project env update <project-id> <name> with the same flag';
   const NO_RESULT =

@@ -528,7 +528,7 @@ export class HttpClient {
   }
 
   /**
-   * POST /api/cli/v1/tunnel — mint a tunnel client for `run --local`.
+   * POST /api/cli/v1/tunnel — mint a tunnel client for a run on a local environment.
    *
    * The ONLY response on this surface that carries a secret. Deliberately NOT
    * sent with an `Idempotency-Key`: the interceptor persists the response body
@@ -1430,8 +1430,8 @@ function nonApiResponseError(response: Response, requestId: string, url: string)
     requestId,
     {
       nextAction:
-        'A proxy, firewall or captive portal probably answered. Check HTTPS_PROXY and ' +
-        `--endpoint-url / TESTSPRITE_API_URL, or ask your network admin to allow ${new URL(url).host}, then retry.`,
+        'A proxy, firewall or captive portal probably answered. Check HTTPS_PROXY, ' +
+        `or ask your network admin to allow ${new URL(url).host}, then retry.`,
       details: { httpStatus: response.status, contentType },
     },
   );
@@ -1471,8 +1471,8 @@ export function malformedResponseError(
         `This usually means the endpoint is not the TestSprite API — a proxy, captive portal, or ` +
         `login page can return HTML with a success status.`,
       nextAction:
-        'Check that --endpoint-url / TESTSPRITE_API_URL points at the TestSprite API ' +
-        '(default https://api.testsprite.com), then retry.',
+        'Check HTTPS_PROXY and that nothing on this network answers in place of the ' +
+        'TestSprite API, then retry.',
       requestId,
       details: {
         httpStatus: response.status,

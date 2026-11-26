@@ -28,12 +28,12 @@
 import * as net from 'node:net';
 import { ApiError } from './errors.js';
 
-// `--local-host` accepts EXACTLY `localhost`, `127.0.0.1`, `::1` (mirroring
+// A local environment's host is EXACTLY `localhost`, `127.0.0.1` or `::1` (mirroring
 // the server's `isLoopbackString`) — not "anything loopback-shaped". This
 // hint is only honest for those three literal hosts (`0.0.0.0` and `::`
 // join them below because binding to the unspecified address also answers
-// on `127.0.0.1`/`::1`, so `--local`'s default dial reaches it) — NOT for
-// the rest of `127.0.0.0/8`, which `--local` cannot dial by name at all. See
+// on `127.0.0.1`/`::1`, so the tunnel's default dial reaches it) — NOT for
+// the rest of `127.0.0.0/8`, which the tunnel cannot dial by name at all. See
 // `'loopback-other'` below for that distinction.
 const LOCAL_DEV_RUNTIME_HINT =
   "This looks like a local-dev target. Save `--url http://localhost:<port>` on an environment, then run `testsprite run <test-id> --env <name>` — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope).";
@@ -70,13 +70,13 @@ const DEFAULT_TARGET_URL_CALLER: TargetUrlCaller = {
 // the caller's own machine in general (a LAN or VPN address usually answers)
 // — what is actually true, and all this hint claims, is that TestSprite's
 // execution modes cannot target them: `--target-url` refuses them outright,
-// and `--local`'s tunnel only ever dials `localhost` / `127.0.0.1` / `::1`
+// and a local environment's tunnel only ever dials `localhost` / `127.0.0.1` / `::1`
 // on THIS machine, never a LAN/VPC address. Embedded IPv4 addresses inherit
 // this hint only after their decoded IPv4 address lands in this class.
 const PRIVATE_NETWORK_HINT =
   'This is a private/reserved network address (private, link-local, multicast, or metadata). ' +
-  'TestSprite cannot use it as --target-url, and --local cannot tunnel it either — --local only ' +
-  'reaches localhost, 127.0.0.1, or ::1 on this machine.';
+  "TestSprite cannot use it as --target-url, and a local environment's tunnel cannot reach it either — " +
+  'a tunnel only reaches localhost, 127.0.0.1, or ::1 on this machine.';
 
 /**
  * Throws a local `VALIDATION_ERROR` (exit 5) when `rawUrl` is a
@@ -113,7 +113,7 @@ export function assertNotLocal(
 
   // 'localhost' is a name, not an IP literal, so it sits outside
   // `disallowedIpReason` below (which classifies IPv4/IPv6 address forms).
-  // It is also always loopback — the same class `--local` can reach.
+  // It is also always loopback — the same class a tunnel can reach.
   if (host === 'localhost') {
     throw localTargetError(
       field,
@@ -168,19 +168,19 @@ function hintFor(
  * verbatim in the rejection message — unchanged wording, not a new
  * classification) plus a `hintKind` telling `assertNotLocal` which hint, if
  * any, is honest to attach:
- *  - `'loopback'` — exactly the host set `--local-host` accepts
+ *  - `'loopback'` — exactly the host set a local environment accepts
  *    (`localhost`, `127.0.0.1`, `::1`) plus the two unspecified addresses
- *    (`0.0.0.0`, `::`), which `--local`'s default dial also reaches because
- *    binding to "all interfaces" includes the loopback one; hint `--local`.
+ *    (`0.0.0.0`, `::`), which the tunnel's default dial also reaches because
+ *    binding to "all interfaces" includes the loopback one; hint the tunnel.
  *  - `'loopback-other'` — the REST of `127.0.0.0/8` (e.g. `127.0.0.2`). This
  *    is loopback-range and unreachable from outside the machine, same as
- *    `'loopback'` above, but `--local-host` cannot dial it by name — an app
+ *    `'loopback'` above, but the tunnel cannot dial it by name — an app
  *    bound only to `127.0.0.2` does not answer on `127.0.0.1`. Hinting
- *    `--local` here would recommend a command that cannot reach the address
+ *    the tunnel here would recommend a command that cannot reach the address
  *    it was just told about, so this gets no hint (a caller who reads the
- *    reason can rebind their dev server onto `127.0.0.1` and get `--local`
+ *    reason can rebind their dev server onto `127.0.0.1` and get the tunnel
  *    to work, but that's their call to make, not a claim this code asserts).
- *  - `'private'` — `--local` can never reach this class even in principle;
+ *  - `'private'` — a tunnel can never reach this class even in principle;
  *    hint that plainly, with no tunnel suggestion.
  *  - `'undecided'` — the address genuinely cannot be decoded safely (currently
  *    RFC 8215's `/48` NAT64 local-use range, whose embedded bit position differs
@@ -235,7 +235,7 @@ function disallowedIpv4Reason(address: string): DisallowedIpClassification | und
     return { reason: UNSPECIFIED_ADDRESS_REASON, hintKind: 'loopback' };
   }
 
-  // Only the literal 127.0.0.1 is in `--local-host`'s exact accepted set.
+  // Only the literal 127.0.0.1 is in the loopback host set a tunnel dials.
   if (ipv4LoopbackBlocklist.check(address, 'ipv4')) {
     return {
       reason: 'loopback addresses are not allowed',

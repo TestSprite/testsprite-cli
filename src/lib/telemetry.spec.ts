@@ -324,7 +324,7 @@ describe('buildTelemetryEvent', () => {
     expect(event.errorOrigin).toBe('server');
   });
 
-  it('emits local: true for a --local invocation', () => {
+  it('emits local: true for a run through a tunnel', () => {
     const event = buildTelemetryEvent(
       { command: 'run', outcome: 'success', exitCode: 0, durationMs: 1, local: true },
       {},
@@ -401,7 +401,7 @@ describe('recordOutcome', () => {
     expect(body).not.toHaveProperty('endpointUrl');
   });
 
-  it('POST body carries local: true for a --local invocation', async () => {
+  it('POST body carries local: true for a run through a tunnel', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(okResponse());
     await recordOutcome(
       { ...base, local: true },
@@ -412,7 +412,7 @@ describe('recordOutcome', () => {
     expect(body.local).toBe(true);
   });
 
-  it('POST body has no local key for an ordinary (non --local) invocation', async () => {
+  it('POST body has no local key for an ordinary invocation', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(okResponse());
     await recordOutcome(base, { env: {}, credentialsPath: writeCreds(true), fetchImpl });
     const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
@@ -420,7 +420,7 @@ describe('recordOutcome', () => {
     expect(body).not.toHaveProperty('local');
   });
 
-  // The whole point of this field: a --local invocation that never reached
+  // The whole point of this field: a local attempt that never reached
   // the network (a client-side, pre-mint refusal) must still report
   // local: true — those are exactly the attempts a backend-side
   // mint/attach event can never see.

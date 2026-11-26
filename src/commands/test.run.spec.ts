@@ -21,7 +21,6 @@ import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js'
 import { ShutdownController } from '../lib/interrupt.js';
 import { buildInterruptEnvelope } from '../lib/render-error.js';
 import type { RunResponse } from '../lib/runs.types.js';
-import { takeTelemetryExtras } from '../lib/telemetry.js';
 import { runTestRun, runTestRunAll } from './test.js';
 
 // ---------------------------------------------------------------------------
@@ -145,14 +144,14 @@ describe('createRunCommand — run + wait subcommands exposed', () => {
     expect(names).toContain('wait');
   });
 
-  it('run subcommand has --wait, --timeout, --target-url, --idempotency-key flags', async () => {
+  it('run subcommand has --wait, --timeout, --idempotency-key flags and no --target-url', async () => {
     const { createRunCommand } = await import('./test.js');
     const test = createRunCommand();
     const run = test;
     const flagNames = run.options.map(o => o.long);
     expect(flagNames).toContain('--wait');
     expect(flagNames).toContain('--timeout');
-    expect(flagNames).toContain('--target-url');
+    expect(flagNames).not.toContain('--target-url');
     expect(flagNames).toContain('--idempotency-key');
   });
 
@@ -358,61 +357,6 @@ describe('runTestRun — no-wait (fire and return)', () => {
     expect(parsed).not.toHaveProperty('accepted');
     expect(parsed).not.toHaveProperty('resultId');
     expect(stdout.join('')).not.toContain('executionId');
-  });
-});
-
-describe('supported target URL command behavior', () => {
-  async function commandHarness(type: 'frontend' | 'backend', output: 'text' | 'json' = 'text') {
-    const targetUrl = 'https://staging.example.com';
-    const h = projectHarness({
-      launch: projectRun({ targetUrl }),
-      answer: url =>
-        url.pathname.endsWith('/tests/test_xyz')
-          ? new Response(JSON.stringify({ id: 'test_xyz', projectId: 'project_1', type }))
-          : undefined,
-    });
-    const { createRunCommand } = await import('./test.js');
-    const command = createRunCommand(h.deps).option('--output <mode>');
-    await command.parseAsync(
-      ['test_xyz', '--target-url', targetUrl, '--skip-preflight', '--output', output],
-      { from: 'user' },
-    );
-    return h;
-  }
-  it('forwards the supported target URL without a deprecation warning', async () => {
-    const h = await commandHarness('frontend');
-    expect(h.calls.find(call => call.method === 'POST')?.body).toMatchObject({
-      testIds: ['test_xyz'],
-      targetUrl: 'https://staging.example.com',
-    });
-    expect(h.stderr.join('\n')).not.toContain('--target-url is deprecated');
-  });
-  it.each(['backend', 'frontend'] as const)(
-    'applies the supported target override policy for %s',
-    async type => {
-      const h = await commandHarness(type);
-      expect(h.calls.find(call => call.method === 'POST')?.url.pathname).toBe(
-        '/api/cli/v1/projects/project_1/runs',
-      );
-      expect(h.stderr.join('\n').includes('not applied to a single backend run')).toBe(
-        type === 'backend',
-      );
-      expect(
-        (h.calls.find(call => call.method === 'POST')?.body as Record<string, unknown>).targetUrl,
-      ).toBe(type === 'backend' ? undefined : 'https://staging.example.com');
-    },
-  );
-  it('keeps JSON output parseable and retains the confirmed target URL', async () => {
-    const h = await commandHarness('frontend', 'json');
-    expect(JSON.parse(h.stdout.join(''))).toMatchObject({
-      runs: [{ runId: 'exec_abc', targetUrl: 'https://staging.example.com' }],
-    });
-    expect(h.stderr.join('\n')).not.toContain('--target-url is deprecated');
-  });
-  it('does not mark supported target URL use as legacy telemetry', async () => {
-    takeTelemetryExtras();
-    await commandHarness('frontend');
-    expect(takeTelemetryExtras()).not.toHaveProperty('legacyTargetUrl');
   });
 });
 
@@ -772,62 +716,6 @@ describe('runTestRun — error scenarios', () => {
     expect((err as ApiError).code).toBe('VALIDATION_ERROR');
     expect((err as ApiError).exitCode).toBe(5);
   });
-
-  it('--target-url loopback with a path is rejected before network access', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('network should not be hit');
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'http://localhost:3000/app',
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        stdout: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('--target-url 10.x rejected client-side (RFC1918)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = vi.fn(async () => {
-      throw new Error('should not reach network');
-    });
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'http://10.0.0.1',
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        stdout: () => {},
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -860,17 +748,6 @@ describe('runTestRun — dry-run', () => {
           body: { testIds: ['test_xyz'], maxConcurrency: 5 },
         },
       ],
-    });
-  });
-  it('includes a valid public --target-url in the preview without dispatching', async () => {
-    const h = projectHarness();
-    await runTestRun(
-      { ...heldRunOptions, dryRun: true, targetUrl: 'https://staging.example.com' },
-      h.deps,
-    );
-    expect(h.calls).toEqual([]);
-    expect(JSON.parse(h.stdout.join(''))).toMatchObject({
-      requests: [{ body: { targetUrl: 'https://staging.example.com' } }],
     });
   });
   it('describes whole-run polling when --wait is requested', async () => {
@@ -1163,7 +1040,7 @@ describe('runTestRun — CONFLICT + --wait auto-resume (dogfood round-4)', () =>
 // CONFLICT target-URL verification (codex round-1 finding 3)
 // ---------------------------------------------------------------------------
 
-describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding-3)', () => {
+describe('runTestRun — CONFLICT held-run verification (codex round-1 finding-3)', () => {
   it.each([
     { label: 'different environment', environment: { id: 'env_other', name: 'other' } },
     { label: 'missing environment', environment: undefined },
@@ -1228,7 +1105,6 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
       {
         ...heldRunOptions,
         environment: name,
-        targetUrl: 'https://example.com',
         skipPreflight: true,
       },
       h.deps,
@@ -1241,27 +1117,6 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     const h = heldRunHarness();
     await runTestRun(heldRunOptions, h.deps);
     expect(JSON.parse(h.stdout.join('')).summary).toMatchObject({ total: 1, passed: 1 });
-  });
-  it.each(['https://other.example.com', null])(
-    'rejects a held target %s that does not match the override',
-    async targetUrl => {
-      const h = heldRunHarness({ card: { targetUrl } });
-      await expect(
-        runTestRun(
-          { ...heldRunOptions, targetUrl: 'https://example.com', skipPreflight: true },
-          h.deps,
-        ),
-      ).rejects.toMatchObject(h.error);
-      expect(h.calls.some(call => call.url.pathname.endsWith('/results'))).toBe(false);
-    },
-  );
-  it('joins a held target matching the override', async () => {
-    const h = heldRunHarness();
-    await runTestRun(
-      { ...heldRunOptions, targetUrl: 'https://example.com', skipPreflight: true },
-      h.deps,
-    );
-    expect(JSON.parse(h.stdout.join('')).summary.passed).toBe(1);
   });
   it('preserves a held failure verdict while excluding unrelated results', async () => {
     const h = heldRunHarness({ status: 'FAILED' });

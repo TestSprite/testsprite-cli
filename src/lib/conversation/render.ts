@@ -200,6 +200,12 @@ export function renderProposal(proposal: Proposal, showSteps: boolean): string[]
     if (!showSteps && [...plan.added, ...plan.changed].some(t => t.steps?.length)) {
       lines.push('', '  Add --steps to see each test step by step.');
     }
+    if (plan.environment) {
+      lines.push(
+        '',
+        `  Explored on the ${terminalSafeLine(plan.environment.name)} environment${plan.environment.isDefault ? " (the project's default)" : ''}.`,
+      );
+    }
   }
   for (const change of proposal.changes ?? []) {
     lines.push(

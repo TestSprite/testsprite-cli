@@ -453,6 +453,37 @@ export interface RunTestlistRunOptions extends CommonOptions {
   ghOutput?: boolean;
   /** --summary-file: also write the reduced machine summary JSON to this path. */
   summaryFile?: string;
+  /** --allow-empty: exit 0 when the list dispatches nothing (default: exit 5). */
+  allowEmpty?: boolean;
+}
+
+/**
+ * A list that started nothing and refused nothing (an empty list, or one whose
+ * every case was left out) is exit 5, as on `run --project`: a CI gate that is
+ * green on zero tests is worse than no gate. `--allow-empty` keeps exit 0.
+ * Checked last, so a rate-deferred (7) or unknown (4) case is reported first.
+ */
+function assertDispatched(
+  resp: CliTestListRunResponse,
+  allowEmpty: boolean,
+  stderrFn: (line: string) => void,
+): void {
+  if (resp.accepted.length > 0 || resp.conflicts.length > 0) return;
+  const reason =
+    resp.reason === 'empty_list'
+      ? 'the list is empty'
+      : resp.reason === 'no_matching_cases'
+        ? 'no test in the list matched'
+        : 'the list started no test';
+  if (allowEmpty) {
+    stderrFn(`[run] 0 tests dispatched (${reason}); --allow-empty set — exiting 0.`);
+    return;
+  }
+  throw new CLIError(
+    `No tests were dispatched — ${reason}. A CI gate that passes on zero tests is unsafe; ` +
+      'pass --allow-empty to exit 0 intentionally.',
+    5,
+  );
 }
 
 /**
@@ -759,8 +790,8 @@ async function runTestlistRunCore(opts: RunTestlistRunOptions, deps: TestListDep
   // All-conflict: nothing new dispatched because every targeted case is already
   // in flight → exit 6, for BOTH --wait and non-wait (a --wait over zero accepted
   // would otherwise no-op straight to exit 0). Distinct from the empty/no-match
-  // case (accepted AND conflicts both empty), which is a legitimate success and
-  // flows through the tail below so its CI artifacts are still emitted.
+  // case (accepted AND conflicts both empty), which flows through the tail
+  // below so its CI artifacts are still emitted before `assertDispatched`.
   if (resp.accepted.length === 0 && resp.conflicts.length > 0) {
     const { output, summary } = buildRunOutput(outputOptions);
     out.print({ ...output, ...dispatchMetadata }, () =>
@@ -842,7 +873,7 @@ async function runTestlistRunCore(opts: RunTestlistRunOptions, deps: TestListDep
   }
 
   if (!opts.wait) {
-    // Print what dispatched, or the empty/no-match reason. Exit 0.
+    // Print what dispatched, or the empty/no-match reason.
     const { output } = buildRunOutput(outputOptions);
     const launch = { ...output, ...dispatchMetadata };
     out.print(launch, () =>
@@ -858,6 +889,7 @@ async function runTestlistRunCore(opts: RunTestlistRunOptions, deps: TestListDep
     });
     assertNoDeferred(resp);
     assertNoNotFound(resp);
+    assertDispatched(resp, opts.allowEmpty === true, stderrFn);
     return launch;
   }
 
@@ -963,8 +995,12 @@ async function runTestlistRunCore(opts: RunTestlistRunOptions, deps: TestListDep
     },
     'run',
   );
+  const empty = resp.accepted.length === 0 && resp.conflicts.length === 0;
   const owesExit =
-    failure !== undefined || resp.deferred.length > 0 || (resp.notFound?.length ?? 0) > 0;
+    failure !== undefined ||
+    resp.deferred.length > 0 ||
+    (resp.notFound?.length ?? 0) > 0 ||
+    (empty && opts.allowEmpty !== true);
   if (opts.report === 'junit' && opts.reportFile) {
     const file = opts.reportFile;
     await writeReportOwing(
@@ -994,6 +1030,7 @@ async function runTestlistRunCore(opts: RunTestlistRunOptions, deps: TestListDep
   if (failure) throw failure;
   assertNoDeferred(resp);
   assertNoNotFound(resp);
+  assertDispatched(resp, opts.allowEmpty === true, stderrFn);
   return launch;
 }
 
@@ -1278,6 +1315,7 @@ export async function runTestlistRunFromCommand(
     reportSuiteName?: string;
     ghOutput?: boolean;
     summaryFile?: string;
+    allowEmpty?: boolean;
   }>();
   await runTestlistRun(
     {
@@ -1296,6 +1334,7 @@ export async function runTestlistRunFromCommand(
       reportSuiteName: opts.reportSuiteName,
       ghOutput: opts.ghOutput,
       summaryFile: opts.summaryFile,
+      allowEmpty: opts.allowEmpty === true,
     },
     deps,
   );

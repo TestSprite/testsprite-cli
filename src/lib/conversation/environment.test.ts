@@ -16,20 +16,15 @@ describe('environmentNotes', () => {
     expect(environmentNotes(env({}))).toEqual([]);
   });
 
-  it("says the agent's browser can't open an app on this machine, and how to run there", () => {
-    const [note] = environmentNotes(env({ name: 'local-3000', url: 'http://localhost:3000' }));
-    expect(note).toContain("the agent's browser can't open");
-    expect(note).toContain('--local 3000');
+  it('says nothing for an app on this machine: the agent asks for the tunnel itself', () => {
+    expect(environmentNotes(env({ name: 'local-3000', url: 'http://localhost:3000' }))).toEqual([]);
   });
 
-  it('keeps its own words between a name that opens an escape and a URL that ends one', () => {
-    const notes = environmentNotes(
-      env({ name: 'stg\u001b]', url: 'http://localhost:3000\u0007', authMode: 'manual' }),
-    ).map(note => terminalSafe(note));
-    expect(notes[0]).toContain(
-      'The "stg" environment is on this machine (http://localhost:3000), which',
+  it('keeps its own words after a name that opens an escape', () => {
+    const [note] = environmentNotes(env({ name: 'stg\u001b]', authMode: 'manual' })).map(note =>
+      terminalSafe(note),
     );
-    expect(notes[1]).toContain('The "stg" environment signs in by hand');
+    expect(note).toContain('The "stg" environment signs in by hand');
   });
 
   it('says a single sign-on needs a person in the live browser', () => {

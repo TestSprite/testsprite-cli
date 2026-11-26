@@ -47,12 +47,6 @@ describe('automatic environment project dispatch', () => {
     await h.run(['test-0']);
     expect(h.launches()[0]!.body?.targetUrl).toBe('http://localhost:5173/');
   });
-  it('preserves a public override and does not mint a tunnel', async () => {
-    const h = fixture(cases(1));
-    await h.run(['test-0', '--target-url', 'https://public.example', '--no-wait']);
-    expect(h.launches()[0]!.body?.targetUrl).toBe('https://public.example');
-    expect(h.stops()).toBe(0);
-  });
   it('preserves raw tunnel scope refusal without launching tests', async () => {
     const raw = {
       code: 'AUTH_FORBIDDEN',

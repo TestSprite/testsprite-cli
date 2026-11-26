@@ -1,4 +1,3 @@
-import { loopbackHost } from '../local-target.js';
 import { terminalSafeLine } from '../terminal-text.js';
 
 /** An environment as `GET /projects/{id}/env` lists it, as far as a plan needs it. */
@@ -13,26 +12,15 @@ export interface PlanEnvironment {
 
 /**
  * What the caller should know before the agent starts on this environment:
- * what its browser can't reach and what only a person can do there. Said up
- * front so nobody learns it from a run that went half way.
+ * what only a person can do there. Said up front so nobody learns it from a
+ * run that went half way. An environment on this machine needs no note: the
+ * agent asks for the tunnel itself when it finds none.
  */
 export function environmentNotes(environment: PlanEnvironment): string[] {
-  // Each note is one line naming the server's name and URL: each stays on it,
-  // so neither can start a line or take the words between them.
+  // Each note is one line naming the server's name: it stays on the line, so
+  // it can neither start one nor take the words after it.
   const name = terminalSafeLine(environment.name);
   const notes: string[] = [];
-  let local: { port: string } | null = null;
-  try {
-    const url = new URL(environment.url);
-    if (loopbackHost(url.hostname) !== undefined) local = { port: url.port };
-  } catch {
-    local = null;
-  }
-  if (local) {
-    notes.push(
-      `The "${name}" environment is on this machine (${terminalSafeLine(environment.url)}), which the agent's browser can't open: it works from your change and the project's files. Run what it saves here with \`testsprite run <test-id...> --local ${local.port || '<port>'}\`.`,
-    );
-  }
   if (environment.authMode === 'manual') {
     notes.push(
       `The "${name}" environment signs in by hand (single sign-on). The agent can't reuse that sign-in yet: it covers what it reaches without signing in, and a person can sign in once in the conversation's live browser.`,

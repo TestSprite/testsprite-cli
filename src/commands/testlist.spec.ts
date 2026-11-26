@@ -964,12 +964,47 @@ describe('native test-list run contracts', () => {
     expect(h.stderr.join('\n')).toContain('::error');
     expect(takeTelemetryExtras()).toMatchObject({ accepted: 1, failed: 1 });
   });
-  it('empty list still emits a zero summary', async () => {
+  it.each([true, false])(
+    'an empty list is exit 5 after its zero summary is printed (wait=%s)',
+    async wait => {
+      const h = nativeList({
+        response: { accepted: [], conflicts: [], deferred: [], reason: 'empty_list' },
+      });
+      const error = await runTestlistRun({ ...runBase, wait, noWait: !wait }, h.deps).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      expect(error).toMatchObject({
+        exitCode: 5,
+        message: expect.stringMatching(/the list is empty.*--allow-empty/),
+      });
+      expect(h.output()).toMatchObject({ runs: [], results: [], reason: 'empty_list' });
+      if (wait) expect(h.output().summary.total).toBe(0);
+    },
+  );
+  it.each([true, false])('--allow-empty keeps an empty list at exit 0 (wait=%s)', async wait => {
     const h = nativeList({
       response: { accepted: [], conflicts: [], deferred: [], reason: 'empty_list' },
     });
-    await runTestlistRun({ ...runBase, wait: true }, h.deps);
-    expect(h.output().summary.total).toBe(0);
+    await runTestlistRun({ ...runBase, wait, noWait: !wait, allowEmpty: true }, h.deps);
+    expect(h.stderr.join('\n')).toContain('0 tests dispatched (the list is empty); --allow-empty');
+  });
+  it('a selection that matches nothing in the list is exit 5 too', async () => {
+    const h = nativeList({
+      response: { accepted: [], conflicts: [], deferred: [], reason: 'no_matching_cases' },
+    });
+    await expect(runTestlistRun({ ...runBase, wait: true }, h.deps)).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining('no test in the list matched'),
+    });
+  });
+  it('a case the list does not hold is still exit 4, ahead of the empty gate', async () => {
+    const h = nativeList({
+      response: { accepted: [], conflicts: [], deferred: [], notFound: ['case-x'] },
+    });
+    await expect(runTestlistRun({ ...runBase, wait: true }, h.deps)).rejects.toMatchObject({
+      exitCode: 4,
+    });
   });
   it('dry-run dispatches nothing and writes no report', async () => {
     const h = nativeList();

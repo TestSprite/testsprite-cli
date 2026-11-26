@@ -316,15 +316,12 @@ export async function runConfigure(
     // Augment the message with the endpoint context so text-mode users still
     // see which host rejected the key.
     if (err instanceof ApiError) {
-      err.message = `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`;
+      err.message = `API key rejected by ${apiUrl}: ${message}`;
       throw err;
     }
     // Anything else (truly unexpected throws like a TypeError from a
     // misconfigured fetchImpl). Exit 3 (auth family).
-    throw new CLIError(
-      `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`,
-      3,
-    );
+    throw new CLIError(`API key rejected by ${apiUrl}: ${message}`, 3);
   }
 
   let persisted = true;

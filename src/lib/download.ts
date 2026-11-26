@@ -6,14 +6,15 @@
 
 import { createWriteStream, type Stats } from 'node:fs';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
-import type { Writable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { ApiError, InterruptError, TransportError, localValidationError } from './errors.js';
-import type { FetchImpl } from './http.js';
+import { REQUEST_TIMEOUT_DEFAULT_MS, type FetchImpl } from './http.js';
 import { globalShutdown, type ShutdownHandle } from './interrupt.js';
 import { defaultSleep, sleepUnlessInterrupted } from './poll-support.js';
+import { disallowedIpReason } from './target-url.js';
 
 /** Max fetch attempts for each presigned URL (initial + retries). */
 export const STREAM_URL_MAX_RETRIES = 3;
@@ -171,6 +172,14 @@ export function assertNoEscape(baseDir: string, segment: string): string {
  * retried up to STREAM_URL_MAX_RETRIES times with a fixed delay, well
  * inside a signed link's lifetime. A file whose last attempt broke off
  * mid-stream is left as far as it got: the caller removes it.
+ *
+ * Only an `https` link to a host that is not a literal local or private
+ * address is fetched; any other link is refused before a request is made.
+ *
+ * `stallTimeoutMs` bounds each wait for data: for the response to start, and
+ * between two chunks of its body. It does not bound the whole download, so a
+ * large file that keeps arriving is never cut off. A stalled download is not
+ * retried.
  */
 export async function streamUrlToFile(
   url: string,
@@ -180,13 +189,83 @@ export async function streamUrlToFile(
     sleep?: (ms: number) => Promise<void>;
     shutdownSignal?: AbortSignal;
     shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
+    stallTimeoutMs?: number;
   },
 ): Promise<void> {
+  const refusal = refusedDownloadUrl(url);
+  if (refusal !== undefined) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'UNAVAILABLE',
+        message: `Refused to download ${redactArtifactUrlForDetails(url)}: ${refusal}.`,
+        nextAction:
+          'Evidence is downloaded only from https storage links. If this result came from the TestSprite API, report it.',
+        requestId: 'local',
+        details: { artifactUrl: redactArtifactUrlForDetails(url) },
+      },
+    });
+  }
   const shutdownSignal = deps?.shutdownSignal ?? globalShutdown.signal;
   const shutdown = deps?.shutdown ?? globalShutdown;
   return shutdown.runCriticalOperation(() =>
-    streamUrlToFileTracked(url, filePath, fetchImpl, deps?.sleep ?? defaultSleep, shutdownSignal),
+    streamUrlToFileTracked(
+      url,
+      filePath,
+      fetchImpl,
+      deps?.sleep ?? defaultSleep,
+      shutdownSignal,
+      deps?.stallTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS,
+    ),
   );
+}
+
+/**
+ * Why a link is not downloaded, or `undefined` when it may be. The host is
+ * judged as written: a name is not resolved, so a proxy or a private storage
+ * endpoint reached by name keeps working.
+ */
+export function refusedDownloadUrl(url: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return 'it is not a URL';
+  }
+  if (parsed.protocol !== 'https:') return 'only https links are downloaded';
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  const local =
+    host === 'localhost' || host.endsWith('.localhost') || disallowedIpReason(host) !== undefined;
+  return local ? 'it points at a local or private address' : undefined;
+}
+
+/** A download that stopped receiving data. Never retried. */
+class DownloadStalledError extends TransportError {
+  constructor(artifactUrl: string, stallTimeoutMs: number) {
+    super(
+      `Download of ${artifactUrl} stalled: no data for ${Math.round(stallTimeoutMs / 1000)}s.`,
+      'local',
+      {
+        nextAction:
+          'Re-run the command. Use --request-timeout <seconds> or TESTSPRITE_REQUEST_TIMEOUT_MS to wait longer for a slow link.',
+      },
+    );
+  }
+}
+
+/** One attempt's stall clock: `signal` aborts when `arm` is not called again in time. */
+export function stallClock(stallTimeoutMs: number): {
+  signal: AbortSignal;
+  arm: () => void;
+  stop: () => void;
+} {
+  const stalled = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const stop = (): void => clearTimeout(timer);
+  const arm = (): void => {
+    stop();
+    timer = setTimeout(() => stalled.abort(), stallTimeoutMs);
+  };
+  return { signal: stalled.signal, arm, stop };
 }
 
 async function streamUrlToFileTracked(
@@ -195,102 +274,189 @@ async function streamUrlToFileTracked(
   fetchImpl: FetchImpl,
   sleepFn: (ms: number) => Promise<void>,
   shutdownSignal: AbortSignal,
+  stallTimeoutMs: number,
 ): Promise<void> {
   const artifactUrl = redactArtifactUrlForDetails(url);
   for (let attempt = 1; attempt <= STREAM_URL_MAX_RETRIES; attempt++) {
     if (shutdownSignal.aborted) throw shutdownSignal.reason;
-    let response: Response;
+    const clock = stallClock(stallTimeoutMs);
     try {
-      response = await fetchImpl(url, { redirect: 'error', signal: shutdownSignal });
+      const done = await streamAttempt(
+        url,
+        filePath,
+        fetchImpl,
+        sleepFn,
+        shutdownSignal,
+        clock,
+        artifactUrl,
+        attempt,
+      );
+      if (done) return;
     } catch (err) {
-      if (err instanceof InterruptError || shutdownSignal.aborted)
-        throw shutdownSignal.reason ?? err;
-      const message = err instanceof Error ? err.message : String(err);
-      if (attempt < STREAM_URL_MAX_RETRIES) {
-        await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
-        continue;
+      if (clock.signal.aborted && !shutdownSignal.aborted) {
+        throw new DownloadStalledError(artifactUrl, stallTimeoutMs);
       }
-      throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
+      throw err;
+    } finally {
+      clock.stop();
     }
-    if (shutdownSignal.aborted) throw shutdownSignal.reason;
-    if (!response.ok) {
-      // Non-2xx: the URL itself is bad (expired, unauthorized, not found).
-      // Retrying the same URL won't help — surface immediately.
-      throw ApiError.fromEnvelope({
-        error: {
-          code: 'UNAVAILABLE',
-          message: `Failed to download presigned URL (HTTP ${response.status}).`,
-          nextAction:
-            'Signed links expire. Re-run `testsprite result get <result-id> --out <dir>`: each read signs new ones.',
-          requestId: 'local',
-          details: { status: response.status, artifactUrl },
-        },
+  }
+}
+
+/**
+ * A sink that writes each chunk to `file` with the stall clock stopped, and
+ * starts it again once the write is done: the clock runs only while the next
+ * chunk is awaited, so time the disk takes is not time the link was silent.
+ * A failed write is the stream's error, and no further write is started.
+ */
+export function stallTimedSink(file: Writable, clock: ReturnType<typeof stallClock>): Writable {
+  const sink = new Writable({
+    write(chunk: Uint8Array, _encoding, callback) {
+      clock.stop();
+      file.write(chunk, err => {
+        if (!err) clock.arm();
+        callback(err);
       });
+    },
+    final(callback) {
+      clock.stop();
+      file.end(callback);
+    },
+    destroy(err, callback) {
+      clock.stop();
+      file.destroy();
+      callback(err);
+    },
+  });
+  // A failure outside a write (the file could not be opened) ends the download too.
+  file.on('error', err => sink.destroy(err));
+  return sink;
+}
+
+/** `work`, unless `stalled` aborts first. */
+function orStalled<T>(work: Promise<T>, stalled: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onStall = (): void => reject(new Error('stalled'));
+    stalled.addEventListener('abort', onStall, { once: true });
+    work.then(resolve, reject).finally(() => stalled.removeEventListener('abort', onStall));
+  });
+}
+
+/** One attempt: true when the file is written, false when the next attempt is due. */
+async function streamAttempt(
+  url: string,
+  filePath: string,
+  fetchImpl: FetchImpl,
+  sleepFn: (ms: number) => Promise<void>,
+  shutdownSignal: AbortSignal,
+  clock: ReturnType<typeof stallClock>,
+  artifactUrl: string,
+  attempt: number,
+): Promise<boolean> {
+  let response: Response;
+  clock.arm();
+  try {
+    response = await fetchImpl(url, {
+      redirect: 'error',
+      signal: AbortSignal.any([shutdownSignal, clock.signal]),
+    });
+  } catch (err) {
+    if (err instanceof InterruptError || shutdownSignal.aborted) throw shutdownSignal.reason ?? err;
+    if (clock.signal.aborted) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    if (attempt < STREAM_URL_MAX_RETRIES) {
+      await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
+      return false;
     }
-    if (!response.body) {
-      // Some test runtimes / fetch polyfills don't expose `body` as a
-      // ReadableStream. Fall back to a buffered write — same correctness,
-      // just no streaming benefit. Even a multi-MB video buffers fully in
-      // a tolerable amount of memory.
-      try {
-        const buffer = Buffer.from(await response.arrayBuffer());
-        // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path its caller composed under the --out directory.
-        await writeFile(filePath, buffer);
-        if (shutdownSignal.aborted) {
-          // eslint-disable-next-line security/detect-non-literal-fs-filename -- the partial file this download just wrote.
-          await rm(filePath, { force: true }).catch(() => undefined);
-          throw shutdownSignal.reason;
-        }
-        return;
-      } catch (err) {
-        if (err instanceof InterruptError || shutdownSignal.aborted) {
-          // eslint-disable-next-line security/detect-non-literal-fs-filename -- the partial file this download just wrote.
-          await rm(filePath, { force: true }).catch(() => undefined);
-          throw shutdownSignal.reason ?? err;
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        if (attempt < STREAM_URL_MAX_RETRIES) {
-          await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
-          continue;
-        }
-        throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
-      }
-    }
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- the directory of a file under the --out directory the user chose.
-    await mkdir(dirname(filePath), { recursive: true });
-    // `response.body` is a Web ReadableStream. Node's `pipeline` accepts
-    // it via `Readable.fromWeb` (Node >= 18). Wrap in a try so any error
-    // from the stream propagates as a TransportError, preserving the
-    // exit-code contract. `pipeline` destroys both streams on error, so
-    // a new WriteStream on retry starts clean.
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path its caller composed under the --out directory.
-    const fileSink = createWriteStream(filePath);
+    throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
+  }
+  // The response has started: that wait is over, and the body's waits are its own.
+  clock.stop();
+  if (shutdownSignal.aborted) throw shutdownSignal.reason;
+  if (!response.ok) {
+    // Non-2xx: the URL itself is bad (expired, unauthorized, not found).
+    // Retrying the same URL won't help — surface immediately.
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'UNAVAILABLE',
+        message: `Failed to download presigned URL (HTTP ${response.status}).`,
+        nextAction:
+          'Signed links expire. Re-run `testsprite result get <result-id> --out <dir>`: each read signs new ones.',
+        requestId: 'local',
+        details: { status: response.status, artifactUrl },
+      },
+    });
+  }
+  if (!response.body) {
+    // Some test runtimes / fetch polyfills don't expose `body` as a
+    // ReadableStream. Fall back to a buffered write — same correctness,
+    // just no streaming benefit. Even a multi-MB video buffers fully in
+    // a tolerable amount of memory.
     try {
-      const webBody = response.body as unknown as NodeReadableStream<Uint8Array>;
-      const { Readable } = await import('node:stream');
-      const nodeStream = Readable.fromWeb(webBody);
-      await pipeline(nodeStream, fileSink as unknown as Writable);
-      if (shutdownSignal.aborted) throw shutdownSignal.reason;
-      return;
+      clock.arm();
+      const buffer = Buffer.from(await orStalled(response.arrayBuffer(), clock.signal));
+      clock.stop();
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path its caller composed under the --out directory.
+      await writeFile(filePath, buffer);
+      if (shutdownSignal.aborted) {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- the partial file this download just wrote.
+        await rm(filePath, { force: true }).catch(() => undefined);
+        throw shutdownSignal.reason;
+      }
+      return true;
     } catch (err) {
       if (err instanceof InterruptError || shutdownSignal.aborted) {
         // eslint-disable-next-line security/detect-non-literal-fs-filename -- the partial file this download just wrote.
         await rm(filePath, { force: true }).catch(() => undefined);
         throw shutdownSignal.reason ?? err;
       }
+      if (clock.signal.aborted) throw err;
       const message = err instanceof Error ? err.message : String(err);
       if (attempt < STREAM_URL_MAX_RETRIES) {
         await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
-        continue;
+        return false;
       }
-      throw new TransportError(`Failed mid-download of ${artifactUrl}: ${message}`);
+      throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
     }
+  }
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- the directory of a file under the --out directory the user chose.
+  await mkdir(dirname(filePath), { recursive: true });
+  // `response.body` is a Web ReadableStream. Node's `pipeline` accepts
+  // it via `Readable.fromWeb` (Node >= 18). Wrap in a try so any error
+  // from the stream propagates as a TransportError, preserving the
+  // exit-code contract. `pipeline` destroys both streams on error, so
+  // a new WriteStream on retry starts clean.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path its caller composed under the --out directory.
+  const fileSink = createWriteStream(filePath);
+  try {
+    const webBody = response.body as unknown as NodeReadableStream<Uint8Array>;
+    clock.arm();
+    await pipeline(Readable.fromWeb(webBody), stallTimedSink(fileSink, clock));
+    if (shutdownSignal.aborted) throw shutdownSignal.reason;
+    return true;
+  } catch (err) {
+    if (err instanceof InterruptError || shutdownSignal.aborted) {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- the partial file this download just wrote.
+      await rm(filePath, { force: true }).catch(() => undefined);
+      throw shutdownSignal.reason ?? err;
+    }
+    if (clock.signal.aborted) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    if (attempt < STREAM_URL_MAX_RETRIES) {
+      await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
+      return false;
+    }
+    throw new TransportError(`Failed mid-download of ${artifactUrl}: ${message}`);
   }
 }
 
 function redactArtifactUrlForDetails(url: string): string {
   try {
     const parsed = new URL(url);
+    // A `data:` link is its own content, and a `file:` one a local path.
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return `<${parsed.protocol.slice(0, -1)} link>`;
+    }
     return `${parsed.origin}${parsed.pathname}`;
   } catch {
     return '<invalid-url>';

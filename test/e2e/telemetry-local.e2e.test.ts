@@ -1,9 +1,8 @@
 import { projectRun, runListing } from '../helpers/project-run.js';
 import { resultLine } from '../helpers/result-list.js';
 /**
- * Explicit --local commands report local=true even when refused before opening
- * a tunnel. Saved loopback environments also report local=true after the
- * automatic tunnel opens. Exercise the built entrypoint and its HTTP beacon.
+ * A run on a saved local environment reports local=true once its tunnel opens;
+ * an ordinary run has no local key. Exercise the built entrypoint and its HTTP beacon.
  * Run one file with vitest.e2e.config.ts after building the CLI.
  */
 
@@ -210,29 +209,9 @@ async function waitForTelemetryBody(): Promise<Record<string, unknown>> {
 }
 
 describe('telemetry — local field', () => {
-  it('records local for a refused --local command that opened no tunnel', async () => {
-    const result = await runCli([
-      'run',
-      'some-test-id',
-      '--local',
-      '5173',
-      '--target-url',
-      'https://example.com',
-      '--endpoint-url',
-      baseUrl,
-    ]);
-    expect(result.status).toBe(5);
-    const body = await waitForTelemetryBody();
-    expect(body.command).toBe('run');
-    expect(body.outcome).toBe('error');
-    expect(body.errorCode).toBe('VALIDATION_ERROR');
-    expect(body.local).toBe(true);
-    expect(requests).toEqual(['POST /api/cli/v1/telemetry']);
-  });
-
-  it('omits the local key for an ordinary (non --local) invocation', async () => {
-    // <test-id> + --project is a different, --local-free mutual-exclusion
-    // refusal (positional vs. --project) — same exit code, no --local anywhere.
+  it('omits the local key for an ordinary invocation', async () => {
+    // <test-id> + --project is a mutual-exclusion refusal (positional vs.
+    // --project) that never looks at an environment, so no tunnel anywhere.
     const result = await runCli([
       'run',
       'some-test-id',
@@ -249,7 +228,7 @@ describe('telemetry — local field', () => {
     expect(body).not.toHaveProperty('local');
   });
 
-  it('records local for an automatic tunnel without a --local flag', async () => {
+  it('records local for the tunnel a run on a local environment opens', async () => {
     const result = await runCli([
       'run',
       'test_auto',

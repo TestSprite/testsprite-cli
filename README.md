@@ -99,13 +99,14 @@ After deploying a fix, run the affected test again with `testsprite run "$TEST_I
 
 ## Testing an environment on your machine
 
-Start your frontend app on port 3000. To run the project's saved tests against the app on this machine, supply the port. The CLI opens a tunnel and waits for the cloud runner.
+Start your frontend app on port 3000 and save it as the project's environment. A run on that environment opens a tunnel from this machine and waits for the cloud runner.
 
 ```bash
-testsprite run --project "$PROJECT_ID" --local 3000
+testsprite project env create "$PROJECT_ID" --name local --url http://localhost:3000
+testsprite run --project "$PROJECT_ID" --env local
 ```
 
-For a local-only project, you can save the port as its first environment with `testsprite project env create "$PROJECT_ID" --name local --local 3000`. Give the project's agent a Git diff or a spec so it can propose tests without browsing localhost. Review and apply the test plan, then run with `--env local`. An ordinary Ctrl-C detaches a public run. With a tunnel this command opened, Ctrl-C cancels unfinished work by default and closes the tunnel. [Local frontend testing and tunnels](./DOCUMENTATION.md#local-frontend-testing-and-tunnels)
+The project's agent explores the app through the same kind of tunnel: ask it with `testsprite plan`, and when it asks for a tunnel, run `testsprite tunnel start` in another terminal and `testsprite reply "The tunnel is running."`. Review and apply the test plan, then run with `--env local`. An ordinary Ctrl-C detaches a public run. With a tunnel this command opened, Ctrl-C cancels unfinished work by default and closes the tunnel. [Local frontend testing and tunnels](./DOCUMENTATION.md#local-frontend-testing-and-tunnels)
 
 ## Commands
 

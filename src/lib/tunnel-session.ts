@@ -1,5 +1,5 @@
 /**
- * Lifecycle of one `--local` tunnel: mint → connect → (run) → tear down.
+ * Lifecycle of one local-environment tunnel: mint → connect → (run) → tear down.
  *
  * The credential handling is the point of this module, so it is stated once
  * here rather than repeated at every line that touches it. The secret returned
@@ -370,7 +370,7 @@ export async function openTunnelSession(
       ...(minted.tunnelTlsAddr !== undefined ? { tunnelTlsAddr: minted.tunnelTlsAddr } : {}),
       dataPlaneRetryDeadlineMs: DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS,
       logLevel: options.logLevel ?? 'error',
-      // Never opened up. The point of `--local` is the caller's own loopback;
+      // Never opened up. The point of the tunnel is the caller's own loopback;
       // a run that pivots into the rest of their network is the failure this
       // rail exists to stop. Loopback and public targets are unaffected.
       allowPrivateNetworkTarget: false,

@@ -219,6 +219,22 @@ describe('writeEvidence', () => {
     });
   });
 
+  it('a link to a local address is not fetched; the other files are still written', async () => {
+    const fetchImpl = storage();
+    const steps = [
+      RESULT.steps[0]!,
+      { ...RESULT.steps[1]!, screenshotSignedUrl: 'http://169.254.169.254/latest/meta-data/' },
+    ];
+    const out = await writeEvidence({ ...RESULT, steps }, { dir, fetchImpl });
+    expect(out.failed).toEqual([
+      { file: 'steps/002.png', reason: expect.stringContaining('only https links') },
+    ]);
+    expect(out.written).toContain('steps/002.html');
+    expect(fetchImpl.mock.calls.map(([input]) => String(input))).not.toContain(
+      'http://169.254.169.254/latest/meta-data/',
+    );
+  });
+
   it("a rerun whose files fail keeps each one's earlier copy, and result.json points at it", async () => {
     await writeEvidence(RESULT, { dir, fetchImpl: storage() });
     const earlierVideo = read('video.webm');

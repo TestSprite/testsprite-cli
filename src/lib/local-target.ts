@@ -1,5 +1,5 @@
 /**
- * `--local <port>` argument handling and the pre-charge port probe.
+ * Loopback target handling (`project env create --local <port>` / `--url`) and the pre-charge port probe.
  *
  * Separate from `target-url-preflight.ts` on purpose, even though both answer
  * "is the thing I am about to bill a run against actually there". They probe
@@ -9,7 +9,7 @@
  *     with `fetch()` (proxy dispatcher and all) is the closest local analogue,
  *     and an ambiguous result downgrades to a warning because the CLI is not
  *     the machine that will do the fetching.
- *   - `--local <port>` is dialled by the vendored tunnel client running *in
+ *   - a local environment's address is dialled by the vendored tunnel client running *in
  *     this very process*, with `net.connect`, against the candidate set
  *     {@link resolveDialCandidates} produces. So the probe uses that same
  *     function and the same kind of socket. A pass means at least one TCP
@@ -140,7 +140,7 @@ export interface StoredLocalTarget {
   port: number;
 }
 
-/** Parse a loopback origin that the stored-target API and tunnel can reach. */
+/** Parse a loopback URL the stored-target API and tunnel can reach: host, port and, if any, the app's entry path. */
 export function parseLoopbackTargetUrl(
   raw: string,
   field = 'target-url',
@@ -154,13 +154,13 @@ export function parseLoopbackTargetUrl(
   const host = loopbackHost(parsed.hostname);
   if (host === undefined) return undefined;
   // Read the explicit port from the input: URL.port drops the default :80.
-  const match = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\]):([0-9]+)\/?$/.exec(raw);
+  const match = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\]):([0-9]+)(?:\/[^?#]*)?$/.exec(raw);
   const port = match === null ? 0 : Number(match[2]);
   if (match === null || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw localValidationError(
       field,
-      'loopback URLs must use http://localhost:<port>, http://127.0.0.1:<port>, or http://[::1]:<port>, with a port between 1 and 65535 and no path ' +
-        '(an optional trailing / is allowed), query, fragment, or credentials',
+      'loopback URLs must use http://localhost:<port>, http://127.0.0.1:<port>, or http://[::1]:<port>, with a port between 1 and 65535; ' +
+        "a path may follow (the app's entry page), a query, fragment or credentials may not",
     );
   }
   return { host, port };
@@ -213,21 +213,22 @@ function flagPairError(message: string): ApiError {
  */
 export async function assertStoredLocalTargetListening(
   target: StoredLocalTarget,
-  opts: { skipPreflight?: boolean },
+  opts: { skipPreflight?: boolean; local?: string },
   deps: LocalPortProbeDeps = {},
 ): Promise<void> {
   if (opts.skipPreflight) return;
   const outcome = await probeLocalPort(target.host, target.port, deps);
   if (outcome.verdict === 'refuse') {
     const targetUrl = buildLocalTargetUrl(target.host, target.port);
+    const flag = opts.local !== undefined ? 'local' : 'url';
     throw ApiError.fromEnvelope({
       error: {
         code: 'VALIDATION_ERROR',
         message: `Nothing is listening on ${targetUrl}. Start your app first, or pass --skip-preflight.`,
-        nextAction: 'Verify --local and --local-host match the app you want to test.',
+        nextAction: `Verify --${flag} names the port your app listens on.`,
         requestId: 'local',
         details: {
-          field: 'local',
+          field: flag,
           reason: 'local-port-not-listening',
           host: target.host,
           port: target.port,
@@ -332,7 +333,7 @@ const SKIP_HINT = 'Skip this check with --skip-preflight.';
  * measured 1,003 blocked-with-URL CLI runs, 55.5% of the third-party-tunnel
  * ones blocked, every one of them charged, because the run row and its credit
  * spend happen before the Lambda ever discovers the target is dead. A dev
- * server that is not running is the single most likely `--local` mistake, and
+ * server that is not running is the single most likely local-environment mistake, and
  * this is the only place it can be caught for free.
  *
  * `skipPreflight: true` is a pure no-op with ZERO connection attempts.
@@ -358,7 +359,7 @@ export async function assertLocalPortListening(
         nextAction:
           opts.environmentName !== undefined
             ? `Start your app on ${host}:${port} (environment "${opts.environmentName}") or run with --skip-preflight.`
-            : `Start your app on port ${port} first, or point --local at the port it is actually ` +
+            : `Start your app on port ${port} first, or point the environment at the port it is actually ` +
               `serving. ${SKIP_HINT}`,
         requestId: 'local',
         details: {

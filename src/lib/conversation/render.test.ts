@@ -84,6 +84,18 @@ describe('renderProposal', () => {
     ]);
   });
 
+  it('names the environment a plan was explored on', () => {
+    const explored = (environment: { id: string; name: string; isDefault: boolean }) =>
+      renderProposal({ ...plan, plan: { ...plan.plan!, environment } }, false).join('\n');
+    expect(explored({ id: 'e2', name: 'local', isDefault: false })).toContain(
+      '  Explored on the local environment.',
+    );
+    expect(explored({ id: 'e1', name: 'staging', isDefault: true })).toContain(
+      "  Explored on the staging environment (the project's default).",
+    );
+    expect(renderProposal(plan, false).join('\n')).not.toContain('Explored on');
+  });
+
   it('says a secret is typed by a person or piped in, never passed as a flag', () => {
     const lines = renderProposal(
       {

@@ -967,7 +967,7 @@ export async function runEnvCreate(
   if (localTarget === undefined && (opts.url === undefined || opts.url.trim().length === 0)) {
     throw localValidationError(
       '--url is required: it names the address runs against this environment open. ' +
-        'For an app on this machine, pass --url http://localhost:<port> or --local <port>, then run it ' +
+        'For a web app on this machine, pass --url http://localhost:<port>, then run it ' +
         'with `run <id> --env <name>`; the CLI opens a tunnel automatically.',
     );
   }
@@ -985,7 +985,7 @@ export async function runEnvCreate(
   validateSignInFlags(signIn, opts, true);
   if (localTarget && (signIn === 'otp' || signIn === 'manual')) {
     throw signInValidationError(
-      '--sign-in otp and --sign-in manual are not available for --local environments (runs through the tunnel sign in inline); use --sign-in public or account.',
+      '--sign-in otp and --sign-in manual are not available for local environments (runs through the tunnel sign in inline); use --sign-in public or account.',
       'local-environment-sign-in-unsupported',
     );
   }
@@ -1038,7 +1038,9 @@ export async function runEnvCreate(
     return sample;
   }
 
+  const client = makeClient(opts, deps);
   if (localTarget) {
+    await assertLocalEnvironmentAllowed(client, opts);
     await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
   }
 
@@ -1058,7 +1060,6 @@ export async function runEnvCreate(
   Object.assign(body, resolveApiAuthBody(opts));
 
   const idempotencyKey = mintIdempotencyKey('create', opts, stderr);
-  const client = makeClient(opts, deps);
   if (variables !== undefined)
     await assertEnvironmentWriteSupport(client, opts.projectId, name, '--var');
   const res = await client.post<CliProjectEnvCreateResponse>(envPath(opts.projectId), {
@@ -1082,7 +1083,48 @@ export async function runEnvCreate(
     );
   if (opts.output === 'text' && signIn === 'otp')
     stderr(`OTP selected: see the provisioned inbox/phone ${inPortal(res.environment)}.`);
+  // Said once, when the address is stored: the agent can only open an app on
+  // this machine through a tunnel the user starts, and `plan` has no flag for it.
+  if (opts.output === 'text' && localTarget) stderr(LOCAL_ENVIRONMENT_HINT);
   return res;
+}
+
+const LOCAL_ENVIRONMENT_HINT =
+  'This app is on your machine: before `testsprite plan`, run `testsprite tunnel start` in another terminal so the agent can open it (`testsprite run` opens its own tunnel).';
+
+/**
+ * A local environment is a web app the tunnel reaches; a backend project's
+ * tests never use one. Asked before the port check, so the answer does not
+ * depend on whether anything listens there. A key that cannot read the
+ * project keeps the old path: the server refuses it too.
+ */
+async function assertLocalEnvironmentAllowed(
+  client: HttpClient,
+  opts: { projectId: string; local?: string },
+): Promise<void> {
+  let type: string | undefined;
+  try {
+    ({ type } = await client.get<{ type?: string }>(
+      `/projects/${encodeURIComponent(opts.projectId)}`,
+    ));
+  } catch (err) {
+    if (err instanceof ApiError && err.httpStatus === 403) return;
+    throw err;
+  }
+  if (type !== 'backend') return;
+  throw ApiError.fromEnvelope({
+    error: {
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request.',
+      nextAction:
+        "A backend project's environment must point at a publicly deployed API; local environments are for frontend projects only.",
+      requestId: 'local',
+      details: {
+        field: opts.local !== undefined ? 'local' : 'url',
+        reason: 'backend-local-environment',
+      },
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,7 +1230,9 @@ export async function runEnvUpdate(
     return sample;
   }
 
+  const client = makeClient(opts, deps);
   if (localTarget) {
+    await assertLocalEnvironmentAllowed(client, opts);
     await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
   }
 
@@ -1204,7 +1248,6 @@ export async function runEnvUpdate(
   Object.assign(body, resolveApiAuthBody(opts));
 
   const idempotencyKey = mintIdempotencyKey('update', opts, stderr);
-  const client = makeClient(opts, deps);
   if (variables !== undefined || opts.clearCredentials) {
     await assertEnvironmentWriteSupport(
       client,
@@ -1253,6 +1296,7 @@ export async function runEnvUpdate(
     stderr(
       `This environment signs in with an SSO session captured on its previous address; if the site changed, log in again ${inPortal(res.environment, 'Log in')}.`,
     );
+  if (opts.output === 'text' && localTarget) stderr(LOCAL_ENVIRONMENT_HINT);
   return res;
 }
 
@@ -1444,7 +1488,7 @@ const UPDATE_EXIT_CODE_NOTE =
   '  3  auth error\n' +
   '  4  project (or environment) not found\n' +
   '  5  validation error\n' +
-  '  6  conflict (name already exists) / precondition (credentials or --local on an SSO or OTP environment; change its sign-in in the Portal)';
+  '  6  conflict (name already exists) / precondition (credentials or a local address on an SSO or OTP environment; change its sign-in in the Portal)';
 const CREATE_EXIT_CODE_NOTE =
   '\nExit codes:\n' +
   '  0  success\n' +
@@ -1466,8 +1510,8 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     )
     .addHelpText(
       'after',
-      '\nFor an app that only runs on this machine, create or update the environment with\n' +
-        '`--url http://localhost:<port>` or `--local <port>`; `run <id> --env <name>` opens a tunnel automatically.',
+      '\nFor a web app that only runs on this machine (frontend projects), create or update the environment\n' +
+        'with `--url http://localhost:<port>`; `run <id> --env <name>` opens a tunnel automatically.',
     );
 
   env
@@ -1492,7 +1536,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     .command('create <project-id>')
     .summary('Create an environment')
     .description(
-      'Create an environment (--name and one of --url / --local are required).' +
+      'Create an environment (--name and --url are required; --local <port> is shorthand for --url http://localhost:<port>).' +
         CREATE_EXIT_CODE_NOTE,
     )
     .option('--name <name>', 'environment name, unique within the project (required)')

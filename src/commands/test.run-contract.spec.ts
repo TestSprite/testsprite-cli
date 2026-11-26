@@ -498,9 +498,9 @@ describe('project target override capability', () => {
       expect(h.calls).toEqual(['GET /api/cli/v1/projects/p1', 'POST /api/cli/v1/projects/p1/runs']);
       expect(body).not.toHaveProperty('testIds');
       expect(body?.targetUrl).toBe(type === 'frontend' ? 'https://preview.example.com' : undefined);
-      expect(h.stderr.join('\n').includes('backend code uses its selected environment')).toBe(
-        type === 'backend',
-      );
+      expect(
+        h.stderr.join('\n').includes('not applied to a backend project outside a pull request'),
+      ).toBe(type === 'backend');
     },
   );
   it('preserves project type authorization errors before any launch', async () => {

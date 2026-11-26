@@ -40,7 +40,7 @@ Options:
                   destroyed.
   -h, --help      display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -54,7 +54,7 @@ List the agent targets and skills this CLI can install and where each lands
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -105,7 +105,7 @@ Exit codes:
   7   still working at --timeout; follow it with \`testsprite status --wait\`
   13  the agent is not enabled for this account
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -172,7 +172,7 @@ Options:
                        omitted)
   -h, --help           display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -263,7 +263,7 @@ too; outside one, with --env, they use that environment's own URL. PR comments a
 yet supported.
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -283,7 +283,7 @@ Options:
                        folder)
   -h, --help           display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -326,7 +326,7 @@ Exit codes:
   7   still working at --timeout; follow it with \`testsprite status --wait\`
   13  the agent is not enabled for this account
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -372,7 +372,7 @@ Options:
                                minted per invocation.
   -h, --help                   display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -380,7 +380,7 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > project env create 1`] = `
 "Usage: testsprite project env create [options] <project-id>
 
-Create an environment (--name and one of --url / --local are required).
+Create an environment (--name and --url are required; --local <port> is shorthand for --url http://localhost:<port>).
 Exit codes:
   0  success
   3  auth error
@@ -457,7 +457,7 @@ needs which header is decided in the Portal.
 For Basic auth, supply username:password or its base64 encoding.
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -471,7 +471,7 @@ Exit codes:
   3  auth error
   4  project (or environment) not found
   5  validation error
-  6  conflict (name already exists) / precondition (credentials or --local on an SSO or OTP environment; change its sign-in in the Portal)
+  6  conflict (name already exists) / precondition (credentials or a local address on an SSO or OTP environment; change its sign-in in the Portal)
 
 Options:
   --url <url>                new address runs open (public http/https, or a
@@ -525,7 +525,7 @@ needs which header is decided in the Portal.
 For Basic auth, supply username:password or its base64 encoding.
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -538,7 +538,7 @@ Get a project by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -566,7 +566,7 @@ Options:
   --no-header               suppress the text table header row
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -590,7 +590,7 @@ Options:
                                minted per invocation.
   -h, --help                   display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -626,7 +626,7 @@ Exit codes:
   7   still working at --timeout; follow it with \`testsprite status --wait\`
   13  the agent is not enabled for this account
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -662,7 +662,7 @@ Exit codes:
   7   still working at --timeout; follow it with \`testsprite status --wait\`
   13  the agent is not enabled for this account
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -711,7 +711,7 @@ Options:
                  (every step when none failed)
   -h, --help     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -742,7 +742,7 @@ Options:
   --limit <n>       with --test: how many results (1-100, default 20)
   -h, --help        display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -764,7 +764,7 @@ Exit codes:
  10  transport/network failure (UNAVAILABLE). If it printed a runId with status
      running, that run is still executing: check it with testsprite run wait
      <run-id> (running this command again triggers and bills a new run).
-     With --local or a local environment, the tunnel closed with this command
+     With a local environment, the tunnel closed with this command
      and run wait cannot reopen it: follow the printed next step. If its
      cancellation was skipped, the run can still finish, but steps that need
      your machine can fail. Otherwise retry the command
@@ -784,32 +784,13 @@ Stop a detached run with: testsprite run cancel <run-id>
 Dev servers can take a minute per page through a tunnel; prefer a built server (npm run build, then start).
 
 Options:
-  --target-url <url>          frontend tests only: run against this URL, using
-                              the environment for its origin (else a temporary
-                              one deleted after the run); with --env, that
-                              environment's settings; loopback URLs open a
-                              tunnel
-  --skip-preflight            skip the pre-charge reachability probe of the
-                              target URL (it runs from this machine, not the
-                              cloud, so it can be wrong, e.g. behind an IP
-                              allowlist) (default: false)
-  --local <port>              run against an app on THIS machine through a
-                              TestSprite tunnel (the runner opens
-                              http://localhost:<port>). Implies --wait.
-                              Frontend tests only; several ids or --project
-                              start one run per project through one tunnel (see
-                              --max-concurrency). A dead port is refused before
-                              anything is billed.
-  --local-host <host>         with --local, loopback address in the target URL:
-                              localhost, 127.0.0.1, ::1 (default: saved
-                              matching host, else localhost). Use localhost if
-                              your app only answers on that name, ::1 for
-                              IPv6-only.
-  --tunnel-client <id>        for a loopback environment or --local, attach to
-                              a tunnel already running under \`testsprite tunnel
-                              start\` (use the id it prints) instead of opening
-                              one; that process keeps the tunnel open
-                              afterwards.
+  --skip-preflight            skip the check that a local environment's app is
+                              listening before its tunnel opens (default:
+                              false)
+  --tunnel-client <id>        for a local environment, attach to a tunnel
+                              already running under \`testsprite tunnel start\`
+                              (use the id it prints) instead of opening one;
+                              that process keeps the tunnel open afterwards.
   --no-cancel-on-interrupt    with a tunnel, do not auto-cancel runs when an
                               owned tunnel closes or a borrowed tunnel's owner
                               disappears
@@ -856,9 +837,10 @@ Options:
   --summary-file <path>       with --wait: also write summary JSON {total,
                               passed, failed, blocked?, cancelled?, errors?,
                               skipped, timedOut, results[]} to this file
-  --allow-empty               with a project or multi-ID batch: exit 0 when
-                              ZERO test cases are dispatched (default: exit 5,
-                              so an empty run is not a CI false-green)
+  --allow-empty               with a project, a test list or a multi-ID batch:
+                              exit 0 when ZERO test cases are dispatched
+                              (default: exit 5, so an empty run is not a CI
+                              false-green)
   --skip-dependencies         Backend test cases only: run without the test
                               cases they depend on (default: false)
   -h, --help                  display help for command
@@ -873,7 +855,7 @@ Commands:
 Examples:
   testsprite run --project <id>                all test cases in the project, in wave order
   testsprite run <id> <id> <id>                      several test cases in one run (one request per project; at most 5000 named IDs per project)
-  testsprite run <id> <id> --local 3000             several local test cases, one tunnel
+  testsprite run <id> <id> --env local               several test cases on a local environment, one tunnel
   testsprite run --project <id> --env staging                all test cases in the project, run in staging
   testsprite run --project <id> --filter <substr> --wait --report junit --report-file ./results.xml
   testsprite run --testlist <list-id> --wait             all saved list cases, using pinned environments
@@ -882,7 +864,7 @@ Examples:
   testsprite run cancel <run-id...>                    cancel whole executions
 
 List mode: concurrency defaults to 10 (1-50), or 5 through a tunnel (1-10); timeout defaults to 600 even through a tunnel.
-List environments come from saved project mappings; --env, --target-url, --local and other project-only launch flags are refused.
+List environments come from saved project mappings; --env and other project-only launch flags are refused.
 
 Queueing and limits:
   - Each request starts one run; its results show queued until they start,
@@ -892,7 +874,7 @@ Queueing and limits:
   - Server rate limits retain their error details and Retry-After policy.
   - --max-concurrency is a server limit per execution, never a shared client budget.
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -930,7 +912,7 @@ Arguments:
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -965,7 +947,7 @@ Options:
   --timeout <s>  shared seconds to wait for executions (1–3600, default 600)
   -h, --help     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -993,7 +975,7 @@ Exit codes:
   7   still working at --timeout; follow it with \`testsprite status --wait\`
   13  the agent is not enabled for this account
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1008,7 +990,7 @@ Options:
                        folder)
   -h, --help           display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1036,7 +1018,7 @@ Get a test by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1061,7 +1043,7 @@ Options:
   --no-header               suppress the text table header row
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1095,7 +1077,7 @@ Options:
   --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
   -h, --help               display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1112,7 +1094,7 @@ Options:
   --idempotency-key <key>        caller-supplied idempotency key (1-256 chars)
   -h, --help                     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1128,7 +1110,7 @@ Options:
   --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
   -h, --help               display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1141,7 +1123,7 @@ Get a test list with its cases
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1156,7 +1138,7 @@ Options:
   --no-header       suppress the text table header row
   -h, --help        display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1170,7 +1152,7 @@ Options:
   --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
   -h, --help               display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1188,7 +1170,7 @@ Options:
   --idempotency-key <key>        caller-supplied idempotency key (1-256 chars)
   -h, --help                     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1202,7 +1184,6 @@ Options:
   -V, --version                 output the version number
   --output <mode>               Output format (json|text) (default: "text")
   --profile <name>              Configuration profile to use
-  --endpoint-url <url>          API base URL (a full http(s) URL)
   --verbose                     Log HTTP retry / backoff / polling transitions
                                 to stderr (lighter than --debug)
   --debug                       Print HTTP method/path, request id, latency,
@@ -1257,8 +1238,8 @@ Commands:
 
 Environment:
   TESTSPRITE_API_KEY (overrides stored credentials), TESTSPRITE_NO_UPDATE_NOTIFIER (disables
-  the version check); TESTSPRITE_API_URL, TESTSPRITE_PROFILE and TESTSPRITE_REQUEST_TIMEOUT_MS
-  (milliseconds) mirror --endpoint-url, --profile and --request-timeout.
+  the version check); TESTSPRITE_PROFILE and TESTSPRITE_REQUEST_TIMEOUT_MS (milliseconds)
+  mirror --profile and --request-timeout.
 "
 `;
 
@@ -1285,7 +1266,6 @@ daemon, because its credential is never written to disk.
 Examples:
   testsprite tunnel start    # hold a tunnel open (Ctrl-C to stop)
   testsprite run <test-id> --env <name> --tunnel-client <client-id>
-  testsprite run <test-id> --local 3000 --tunnel-client <client-id>
   testsprite tunnel stop --all --confirm
 
 "
@@ -1308,7 +1288,7 @@ Exit codes:
  10  could not reach TestSprite
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1337,7 +1317,7 @@ Exit codes:
  11  rate limited, or too many tunnels are already open for this account
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1361,7 +1341,7 @@ Exit codes:
  10  could not reach TestSprite to ask
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1392,7 +1372,7 @@ Exit codes:
  10  could not reach TestSprite
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;

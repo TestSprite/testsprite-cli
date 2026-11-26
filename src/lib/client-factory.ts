@@ -189,8 +189,8 @@ function clampRequestTimeout(ms: number): number {
  * retry-and-backoff cycle.
  *
  * The value can originate from `--endpoint-url`, `TESTSPRITE_API_URL`, or the
- * credentials file `api_url`, so the message names all three rather than
- * assuming the flag.
+ * credentials file `api_url`. The message names none of them: they are for
+ * TestSprite's own use and no user-facing text mentions them.
  */
 export function assertValidEndpointUrl(rawUrl: string): void {
   let parsed: URL;
@@ -199,8 +199,7 @@ export function assertValidEndpointUrl(rawUrl: string): void {
   } catch {
     throw localValidationError(
       'endpoint-url',
-      `"${rawUrl}" is not a valid URL — provide an http(s) URL (e.g. https://api.testsprite.com) ` +
-        `via --endpoint-url, TESTSPRITE_API_URL, or the credentials file`,
+      `"${rawUrl}" is not a valid URL — provide an http(s) URL (e.g. https://api.testsprite.com)`,
       undefined,
       'field',
     );

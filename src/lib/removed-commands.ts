@@ -98,7 +98,7 @@ export function removedCommandPointer(groupPath: string, name: string): string |
 }
 
 const ENV_CREATE =
-  'set it on an environment: testsprite project env create <project-id> --name default --url <url> (or --local <port>), which takes the sign-in flags';
+  'set it on an environment: testsprite project env create <project-id> --name default --url <url>, which takes the sign-in flags';
 const ENV_UPDATE =
   'set it on an environment: testsprite project env update <project-id> <name> with the same flag';
 const NO_RESULT_ON_A_CASE =
@@ -112,6 +112,22 @@ const ENVIRONMENT_OPTIONS = [
   '--password-file',
   '--skip-preflight',
 ];
+
+const LOCAL_ENVIRONMENT =
+  'the address lives on the environment: testsprite project env create <project-id> --name local --url http://localhost:<port>, then testsprite run <test-id...> --env local (no flag when it is the default) opens the tunnel';
+
+/** The options removed in 0.18.0, by the command that took them, and what replaced them. */
+const REMOVED_OPTIONS_0_18 = new Map<string, string>([
+  ['run --local', LOCAL_ENVIRONMENT],
+  [
+    'run --local-host',
+    'the host lives on the environment: testsprite project env create <project-id> --name local --url http://127.0.0.1:<port> (or http://[::1]:<port>)',
+  ],
+  [
+    'run --target-url',
+    "a run's address is its environment's: testsprite project env create <project-id> --name <name> --url <url>, then testsprite run <test-id...> --env <name>; for a pull request preview, testsprite ci run --env <name> --target-url <url>",
+  ],
+]);
 
 /** Each removed option, by the command that took it, and what replaced it. */
 const REMOVED_OPTIONS = new Map<string, string>([
@@ -159,6 +175,8 @@ export function removedOptionPointer(commandPath: string, message: string): stri
   if (option === undefined) return undefined;
   const notOnRun = commandPath === 'run' ? NOT_ON_RUN.get(option) : undefined;
   if (notOnRun !== undefined) return `\`run\` takes no \`${option}\`; ${notOnRun}`;
+  const recent = REMOVED_OPTIONS_0_18.get(`${commandPath} ${option}`);
+  if (recent !== undefined) return `\`${commandPath} ${option}\` was removed in 0.18.0; ${recent}`;
   const replacement = REMOVED_OPTIONS.get(`${commandPath} ${option}`);
   return replacement === undefined
     ? undefined

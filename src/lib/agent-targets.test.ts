@@ -114,7 +114,7 @@ const STUB_BODY = `# TestSprite Verification Loop
 
 The verification-loop autopilot
 
-testsprite run <test-id> --wait --target-url <url> --timeout 600
+testsprite run <test-id> --wait --env <name> --timeout 600
 
 testsprite result get <result-id> --out ./out/
 `;
@@ -552,16 +552,17 @@ describe('content integrity — local run outcomes', () => {
     }
   });
 
-  it('installed verify skills describe --env with --local as a server-side decision', () => {
+  it('installed verify skills say run takes no --target-url', () => {
     const assets = [
       ['docs template', templateRaw],
       ['own-file skill body', renderForTarget('claude', 'testsprite-verify').content],
     ] as const;
 
     for (const [name, content] of assets) {
-      expect(content, name).toMatch(/--env <name> --local <port>`\s+sends/);
-      expect(content, name).toMatch(/applies it or refuses\s+before dispatch/);
-      expect(content, name).not.toMatch(/fails before a tunnel opens/);
+      expect(content, name).toMatch(
+        /`run` takes no `--target-url`: a run's address is its\s+environment's/,
+      );
+      expect(content, name).not.toMatch(/--target-url` with `--env <name>`/);
     }
   });
 });

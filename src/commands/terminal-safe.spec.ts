@@ -187,6 +187,19 @@ const ENVIRONMENT = {
   updatedAt: '2026-11-01T00:00:00Z',
 };
 
+/** The project's local environment: a run on it opens a tunnel. Its name is typed as --env, so it is plain. */
+const LOCAL_ENVIRONMENT = {
+  id: 'env_2',
+  name: 'local',
+  url: 'http://localhost:5173',
+  isDefault: false,
+  authMode: 'public',
+  hasCredentials: false,
+  username: null,
+  enableOtp: false,
+  updatedAt: '2026-11-01T00:00:00Z',
+};
+
 /** A server value carrying the payload. */
 const poison = (value: string): string => `${value}${ESCAPES}\n${FORGED}`;
 
@@ -336,6 +349,12 @@ async function backend(input: unknown, init: RequestInit = {}): Promise<Response
       lastRunCreated: null,
     });
   }
+  // The tests a batch names: the run reads which project they are in (P, whose
+  // local environment opens the tunnel); the sample's own project is another.
+  if (route === 'GET /tests/T' || route === 'GET /tests/U') {
+    const sample = poisoned(findSample(method, url.toString())!.body()) as object;
+    return json({ ...sample, id: path.slice('/tests/'.length), projectId: 'P', type: 'frontend' });
+  }
   if (route === 'GET /tests/missing') {
     return json(
       {
@@ -364,7 +383,8 @@ async function backend(input: unknown, init: RequestInit = {}): Promise<Response
       },
     });
   }
-  if (route === 'GET /projects/P/env') return json({ environments: [ENVIRONMENT] });
+  if (route === 'GET /projects/P/env')
+    return json({ environments: [ENVIRONMENT, LOCAL_ENVIRONMENT] });
   // The full project card: every field it prints, the id included (a hint
   // names it in a command), carries the payload.
   if (route === 'GET /projects/P') {
@@ -406,6 +426,7 @@ async function backend(input: unknown, init: RequestInit = {}): Promise<Response
       testIds?: string[];
       tunnelClientId?: string;
       targetUrl?: string;
+      environment?: string;
       maxConcurrency?: number;
     };
     return json(
@@ -415,7 +436,11 @@ async function backend(input: unknown, init: RequestInit = {}): Promise<Response
         total: request.testIds?.length ?? 1,
         targetUrl: request.targetUrl ?? `https://shop.example${ESCAPES}\n${FORGED}`,
         dashboardUrl: FAILED_RUN.dashboardUrl ?? undefined,
-        environment: FAILED_RUN.environment ?? null,
+        // The run confirms the environment it was asked for; the local one is plain.
+        environment:
+          request.environment === LOCAL_ENVIRONMENT.name
+            ? { id: LOCAL_ENVIRONMENT.id, name: LOCAL_ENVIRONMENT.name }
+            : (FAILED_RUN.environment ?? null),
         tunnelClientId: request.tunnelClientId,
         maxConcurrency: request.maxConcurrency,
       }),
@@ -617,8 +642,8 @@ const FAMILIES: ReadonlyArray<{
   },
   { family: 'run <id> <id>: the batch rows', args: ['run', 'T', 'U'] },
   {
-    family: 'run <id> <id> --local: the rows and stderr lines of a run through a tunnel',
-    args: ['run', 'T', 'U', '--local', '5173', '--skip-preflight', '--timeout', '30'],
+    family: 'run <id> <id> --env local: the rows and stderr lines of a run through a tunnel',
+    args: ['run', 'T', 'U', '--env', 'local', '--skip-preflight', '--timeout', '30'],
     exit: 1,
     stderrShows: true,
   },
@@ -852,8 +877,10 @@ describe('a target the preflight probes', () => {
     "a preview behind Vercel's login wall is refused (exit 5), and nothing from its redirect is printed (%s)",
     async output => {
       const printed = await cli([
+        'ci',
         'run',
-        'T',
+        '--project',
+        'P',
         '--target-url',
         `http://${PROTECTED_PREVIEW_HOST}`,
         '--output',

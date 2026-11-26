@@ -577,20 +577,10 @@ describe('single root run subprocess contract', () => {
     ]);
   });
 
-  it('previews an unfiltered project from the root without business requests', async () => {
-    const before = requestCount;
+  it('previews an unfiltered project from the root without launching it', async () => {
+    const before = businessRequests.length;
     const result = await runCli(
-      [
-        '--dry-run',
-        '--output',
-        'json',
-        'run',
-        '--project',
-        'project_subproc',
-        '--target-url',
-        'https://example.com',
-        '--skip-preflight',
-      ],
+      ['--dry-run', '--output', 'json', 'run', '--project', 'project_subproc'],
       isolatedEnv(),
     );
     expect(result.exitCode, result.stderr).toBe(0);
@@ -601,7 +591,14 @@ describe('single root run subprocess contract', () => {
     const preview = JSON.parse(result.stdout);
     expect(preview.requests).toHaveLength(1);
     expect(preview.requests[0].body).not.toHaveProperty('testIds');
-    expect(requestCount).toBe(before);
+    // At most the read of the project's environments, which decides whether a tunnel is needed.
+    expect(businessRequests.slice(before)).toEqual(
+      businessRequests
+        .slice(before)
+        .filter(
+          row => row.method === 'GET' && row.url === '/api/cli/v1/projects/project_subproc/env',
+        ),
+    );
   }, 30_000);
 
   it('previews a saved list from the root without business requests', async () => {
@@ -624,19 +621,7 @@ describe('single root run subprocess contract', () => {
     const before = businessRequests.length;
     const bodiesBefore = launchBodies.length;
     const result = await runCli(
-      [
-        '--output',
-        'json',
-        'run',
-        '--project',
-        'project_subproc',
-        '--target-url',
-        'https://example.com',
-        '--skip-preflight',
-        '--wait',
-        '--timeout',
-        '10',
-      ],
+      ['--output', 'json', 'run', '--project', 'project_subproc', '--wait', '--timeout', '10'],
       isolatedEnv(),
     );
     expect(result.exitCode, result.stderr).toBe(0);
@@ -658,10 +643,11 @@ describe('single root run subprocess contract', () => {
     expect(launchBodies.slice(bodiesBefore)).toEqual([
       {
         url: '/api/cli/v1/projects/project_subproc/runs',
-        body: expect.objectContaining({ maxConcurrency: 50, targetUrl: 'https://example.com' }),
+        body: expect.objectContaining({ maxConcurrency: 50 }),
       },
     ]);
     expect(launchBodies[bodiesBefore]!.body).not.toHaveProperty('testIds');
+    expect(launchBodies[bodiesBefore]!.body).not.toHaveProperty('targetUrl');
     const requests = businessRequests.slice(before);
     expect(requests.filter(row => row.method === 'POST')).toEqual([
       { method: 'POST', url: '/api/cli/v1/projects/project_subproc/runs' },
@@ -858,13 +844,10 @@ describe('single root run subprocess contract', () => {
     ['run', '--testlist', '   '],
     ['run', '--testlist', 'list_subproc', '--env', 'staging'],
     ['run', '--testlist', 'list_subproc', '--target-url', 'https://example.com'],
-    ['run', '--testlist', 'list_subproc', '--local', '3000'],
-    ['run', '--testlist', 'list_subproc', '--local-host', 'localhost'],
     ['run', '--testlist', 'list_subproc', '--tunnel-client', 'tunnel_subproc'],
     ['run', '--testlist', 'list_subproc', '--no-cancel-on-interrupt'],
     ['run', '--testlist', 'list_subproc', '--skip-dependencies'],
     ['run', '--testlist', 'list_subproc', '--filter', 'fixture'],
-    ['run', '--testlist', 'list_subproc', '--allow-empty'],
   ])('refuses invalid root selectors/options %j without requests or artifacts', async (...args) => {
     const artifactDir = mkdtempSync(join(tmpHome, 'invalid-run-'));
     const report = join(artifactDir, 'report.xml');

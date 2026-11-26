@@ -101,8 +101,8 @@ export interface TelemetryOutcomeInput extends Partial<WaitTimeoutTelemetry> {
   output?: string;
   dryRun?: boolean;
   /**
-   * True when --local was present, including refusals and borrowed tunnels,
-   * or when this invocation automatically opened a saved-environment tunnel.
+   * True when --local was present (project env create), including refusals,
+   * or when this invocation opened a tunnel to a local environment.
    */
   local?: boolean;
 }
@@ -392,7 +392,7 @@ export function recordTelemetryExtras(partial: TelemetryExtrasInput): void {
   pendingExtras = { ...pendingExtras, ...sanitizeTelemetryExtras(partial) };
 }
 
-/** Extend explicit --local telemetry to commands that automatically open a tunnel. */
+/** Extend explicit --local telemetry to commands that open a tunnel to a local environment. */
 export function recordTelemetryTunnelOpened(opened: boolean): void {
   if (opened) recordTelemetryExtras({ local: true });
 }
@@ -466,7 +466,7 @@ export interface TelemetryEvent extends Partial<WaitTimeoutTelemetry>, Telemetry
   nodeVersion?: string;
   output?: string;
   ci?: boolean;
-  /** Present (always `true`) for --local attempts or automatically opened tunnels. */
+  /** Present (always `true`) for --local attempts or runs that opened a tunnel. */
   local?: boolean;
   /** The validated `TESTSPRITE_CLIENT` tag (e.g. `github-action/v1`); absent when unset/invalid. */
   client?: string;

@@ -4,7 +4,7 @@
  * The check exists for one concrete failure: `run:tunnel` is the first scope
  * ever deliberately excluded from the grandfather grant, so every key minted
  * before it — i.e. most keys in the wild — gets a 403 the first time someone
- * tries `--local`. Finding that out from `doctor` costs nothing; finding it out
+ * runs on a local environment. Finding that out from `doctor` costs nothing; finding it out
  * from a failed run costs a support round-trip.
  *
  * It is a READ (`GET /tunnel/<random-uuid>`, expected 404). Minting to probe

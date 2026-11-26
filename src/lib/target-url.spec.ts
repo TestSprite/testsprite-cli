@@ -557,7 +557,7 @@ describe('assertNotLocal — error details', () => {
   // 127.0.0.2 does not answer on 127.0.0.1, so recommending --local here
   // would tell the user to run a command that cannot reach the address it
   // was just told about. Must NOT get the plain --local hint.
-  it('does NOT hint --local for a non-127.0.0.1 loopback-range address (127.0.0.2)', () => {
+  it('does NOT hint a tunnel for a non-127.0.0.1 loopback-range address (127.0.0.2)', () => {
     try {
       assertNotLocal('http://127.0.0.2');
       throw new Error('expected assertNotLocal to throw');
@@ -576,7 +576,7 @@ describe('assertNotLocal — error details', () => {
   // The hint is ALLOWED to name --local while explaining its exact limits
   // (that is factual, not a suggestion) — what it must never do is recommend
   // RUNNING --local against this address, since --local cannot reach it.
-  it('does NOT recommend running --local for a private RFC1918 address (10.0.0.5), only states its limits', () => {
+  it('does NOT recommend a tunnel for a private RFC1918 address (10.0.0.5), only states its limits', () => {
     try {
       assertNotLocal('http://10.0.0.5');
     } catch (err) {
@@ -609,7 +609,7 @@ describe('assertNotLocal — error details', () => {
       const details = apiErr.details as Record<string, unknown>;
       const hint = details.hint as string;
       expect(hint).toContain('TestSprite cannot use it as --target-url');
-      expect(hint).toContain('--local only');
+      expect(hint).toContain("a local environment's tunnel cannot reach it either");
       expect(hint).not.toContain('cannot be reached from this machine at all');
     }
   });
@@ -705,7 +705,7 @@ describe('disallowedIpReason — called directly, as the DNS path calls it', () 
 
 describe('assertNotLocal — local project creation guidance', () => {
   it.each(['http://localhost:3000', 'http://127.0.0.1:3000', 'http://[::1]:3000'])(
-    'redirects project creation for %s to --local',
+    'redirects project creation for %s to a local environment',
     targetUrl => {
       let error: unknown;
       try {

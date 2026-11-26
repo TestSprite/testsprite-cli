@@ -58,7 +58,13 @@ export interface Proposal {
   summary: string;
   /** The agent's one line on what the change does and why. */
   message?: string;
-  plan?: { added: PlanTest[]; changed: PlanChange[]; removed: Array<{ ref: string }> };
+  plan?: {
+    added: PlanTest[];
+    changed: PlanChange[];
+    removed: Array<{ ref: string }>;
+    /** The environment the agent explored these tests on, when it named one: where to run them. */
+    environment?: RunEnvironment;
+  };
   changes?: Array<{ op: string; name: string; detail?: string }>;
   /** A secret card: the secret a person types to apply it, which goes to this environment. */
   secret?: { environment: string; field: string; header?: string };

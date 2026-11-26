@@ -14,6 +14,8 @@ const one = (projectId: string, id: string) => `${base(projectId)}/${encodeURICo
 const idempotent = () => ({ 'idempotency-key': randomUUID() });
 
 export interface ConversationApi {
+  /** The project's name, for saying which project a command took from the folder. */
+  project(projectId: string): Promise<{ name: string }>;
   environments(projectId: string): Promise<PlanEnvironment[]>;
   start(
     projectId: string,
@@ -81,6 +83,9 @@ export function conversationApi(
   storage: StorageUploadOptions,
 ): ConversationApi {
   return {
+    project: projectId =>
+      client.get<{ name: string }>(`/projects/${encodeURIComponent(projectId)}`),
+
     environments: async projectId =>
       (
         await client.get<{ environments: PlanEnvironment[] }>(

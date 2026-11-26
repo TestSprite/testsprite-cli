@@ -148,10 +148,10 @@ export function classifyFatalTransportFailure(
       cause: hostname,
       message:
         `TLS certificate verification failed for ${host} (${hostname}): the certificate is not ` +
-        'valid for that host. A wrong --endpoint-url / TESTSPRITE_API_URL or corporate TLS ' +
+        'valid for that host. A wrong host or corporate TLS ' +
         "interception is the usual cause; set NODE_EXTRA_CA_CERTS to your organisation's CA " +
         'bundle if your network re-signs TLS.',
-      nextAction: `Check --endpoint-url / TESTSPRITE_API_URL. ${TLS_NEXT_ACTION}`,
+      nextAction: `Check that ${host} is the host you expect. ${TLS_NEXT_ACTION}`,
     };
   }
 

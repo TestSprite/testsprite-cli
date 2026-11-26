@@ -7,6 +7,8 @@ import {
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { resolveProfileName } from '../lib/config.js';
+import { readRepository, runGit, type Git } from '../lib/conversation/change.js';
+import { rememberProject } from '../lib/conversation/context.js';
 import { ApiError } from '../lib/errors.js';
 import { firstSuiteNextSteps } from '../lib/first-suite-hint.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
@@ -108,6 +110,9 @@ export interface ProjectDeps {
   localPortProbeDeps?: LocalPortProbeDeps;
   /** Graceful-detach coordinator; tests inject their own. */
   shutdown?: ShutdownHandle;
+  /** Where `project create` remembers the project it makes: this folder's repository, else the folder. */
+  cwd?: string;
+  git?: Git;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -621,9 +626,10 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       if (type !== 'frontend' && type !== 'backend') {
         throw localValidationError('--type must be frontend or backend');
       }
-      await runCreate(
+      const common = resolveCommonOptions(command, deps.env);
+      const created = await runCreate(
         {
-          ...resolveCommonOptions(command, deps.env),
+          ...common,
           type,
           name: cmdOpts.name,
           instruction: cmdOpts.instruction,
@@ -635,6 +641,10 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
         },
         deps,
       );
+      // The project just made is the one the next agent command here works on
+      // (`plan` without --project), as a plan started here makes its project
+      // this folder's. --dry-run made none.
+      if (!common.dryRun && created.projectId) rememberCreated(created.projectId, deps);
     });
 
   project
@@ -756,6 +766,15 @@ function parseFlag(raw: string | undefined, flagName: string): number | undefine
     });
   }
   return n;
+}
+
+function rememberCreated(projectId: string, deps: ProjectDeps): void {
+  const cwd = deps.cwd ?? process.cwd();
+  try {
+    rememberProject(readRepository(cwd, deps.git ?? runGit)?.root ?? cwd, projectId);
+  } catch {
+    // A folder the CLI can't write to keeps no state; the next command then needs --project.
+  }
 }
 
 function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {

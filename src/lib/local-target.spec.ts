@@ -294,10 +294,16 @@ describe('stored loopback URL targets', () => {
     });
   });
 
+  it('keeps the entry path of a stored loopback URL', () => {
+    expect(parseStoredLocalTarget({ url: 'http://localhost:3000/page' })).toMatchObject({
+      host: 'localhost',
+      port: 3000,
+    });
+  });
+
   it.each([
     'https://localhost:3000',
     'http://localhost',
-    'http://localhost:3000/page',
     'http://localhost:3000/?x=1',
     'http://qa:secret@localhost:3000',
     'http://localhost:3000/#section',
