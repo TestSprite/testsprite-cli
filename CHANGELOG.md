@@ -171,6 +171,7 @@ Writing tests now goes through the project's agent: `plan` asks it for tests and
 
 ### Fixed
 
+- **A proxy variable written without a scheme (`HTTPS_PROXY=proxy.corp:3128`) is now honored.** The CLI used to drop it with a warning, connect directly, and on a proxy-only network fail every command with exit 10 "service unavailable". A bare `host:port` is now read as `http://host:port`, the way curl reads it, for `HTTPS_PROXY`, `HTTP_PROXY` and their lower-case spellings (lower-case first), and `NO_PROXY` is read from the same environment. A value that is not a URL at all still warns and falls back to a direct connection. Thanks @akramcodez (#673).
 - **Interrupted runs and result history** retain the latest observed verdicts. `result list --test <id> --status <list> --limit <n>` requests matching results within the accessible history window.
 
 - **Help for an unknown subcommand of a group is an error.** `testsprite test result --help`, `testsprite help test result` and `testsprite test help result` printed the `test` group's help and exited 0, so a removed command looked like it ran. They exit 5 (`VALIDATION_ERROR`) and name the unknown command, at every level, as `testsprite <typo> --help` already did. So do `testsprite test --help result`, `testsprite test -h result` and `testsprite --help config`: a help flag before the name does not hide it.
